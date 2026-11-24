@@ -2284,6 +2284,37 @@ pub struct MsczContents {
     pub entries: Vec<String>,
 }
 
+/// Maximum uncompressed size (64 MiB) allowed when reading an entry from an
+/// `.mscz` archive. Protects untrusted callers (including web/WASM) against
+/// zip-bomb OOMs.
+pub const MAX_MSCZ_ENTRY_BYTES: u64 = 64 * 1024 * 1024;
+
+/// Read a zip entry into a UTF-8 `String`, refusing entries whose declared or
+/// actual decompressed size exceeds `max_bytes` before allocating unboundedly.
+fn read_bounded_utf8<R: Read>(
+    reader: R,
+    declared_size: u64,
+    name: &str,
+    max_bytes: u64,
+) -> Result<String, String> {
+    if declared_size > max_bytes {
+        return Err(format!(
+            "{name:?} exceeds maximum uncompressed size ({declared_size} > {max_bytes} bytes)"
+        ));
+    }
+    let mut buf = Vec::new();
+    reader
+        .take(max_bytes + 1)
+        .read_to_end(&mut buf)
+        .map_err(|e| format!("cannot read {name:?}: {e}"))?;
+    if buf.len() as u64 > max_bytes {
+        return Err(format!(
+            "{name:?} exceeds maximum uncompressed size ({max_bytes} bytes)"
+        ));
+    }
+    String::from_utf8(buf).map_err(|e| format!("cannot read {name:?}: {e}"))
+}
+
 /// Inspect and extract the root `.mscx` score, optional `.mss` style sheet,
 /// and archive entry list from `.mscz` zip bytes.
 pub fn read_mscz(bytes: &[u8]) -> Result<MsczContents, String> {
@@ -2296,13 +2327,11 @@ pub fn read_mscz(bytes: &[u8]) -> Result<MsczContents, String> {
     }
 
     let container = {
-        let mut f = zip
+        let f = zip
             .by_name("META-INF/container.xml")
             .map_err(|_| "missing META-INF/container.xml".to_string())?;
-        let mut s = String::new();
-        f.read_to_string(&mut s)
-            .map_err(|e| format!("cannot read META-INF/container.xml: {e}"))?;
-        s
+        let sz = f.size();
+        read_bounded_utf8(f, sz, "META-INF/container.xml", MAX_MSCZ_ENTRY_BYTES)?
     };
 
     let mut rootfiles: Vec<String> = Vec::new();
@@ -2324,13 +2353,11 @@ pub fn read_mscz(bytes: &[u8]) -> Result<MsczContents, String> {
         .ok_or_else(|| format!("container.xml has no .mscx rootfile (found {rootfiles:?})"))?;
 
     let mscx = {
-        let mut f = zip
+        let f = zip
             .by_name(&root_mscx_path)
             .map_err(|_| format!("rootfile {root_mscx_path:?} missing from zip"))?;
-        let mut s = String::new();
-        f.read_to_string(&mut s)
-            .map_err(|e| format!("cannot read {root_mscx_path:?}: {e}"))?;
-        s
+        let sz = f.size();
+        read_bounded_utf8(f, sz, &root_mscx_path, MAX_MSCZ_ENTRY_BYTES)?
     };
 
     let style_path = rootfiles
@@ -2346,11 +2373,9 @@ pub fn read_mscz(bytes: &[u8]) -> Result<MsczContents, String> {
 
     let style_mss = match style_path {
         Some(path) => match zip.by_name(&path) {
-            Ok(mut f) => {
-                let mut s = String::new();
-                f.read_to_string(&mut s)
-                    .map_err(|e| format!("cannot read {path:?}: {e}"))?;
-                Some(s)
+            Ok(f) => {
+                let sz = f.size();
+                Some(read_bounded_utf8(f, sz, &path, MAX_MSCZ_ENTRY_BYTES)?)
             }
             Err(_) => None,
         },
@@ -2588,7 +2613,7 @@ pub fn validate_musicxml(xml: &str) -> Vec<Issue> {
         ));
         return out;
     }
-    let mut expected = beats * divisions * 4 / beat_type;
+    let mut expected = beats.saturating_mul(divisions).saturating_mul(4) / beat_type;
     let mut pos = 0;
     let mut mnum = 0;
     let mut note_count = 0;
@@ -2609,7 +2634,7 @@ pub fn validate_musicxml(xml: &str) -> Vec<Issue> {
         if let Some((md, _)) = read_tag_value(body, 0, "divisions") {
             if md > 0 {
                 divisions = md;
-                expected = beats * divisions * 4 / beat_type;
+                expected = beats.saturating_mul(divisions).saturating_mul(4) / beat_type;
             } else {
                 out.push(error(
                     "xml-divisions",
@@ -2624,7 +2649,7 @@ pub fn validate_musicxml(xml: &str) -> Vec<Issue> {
             if mb > 0 && mbt > 0 {
                 beats = mb;
                 beat_type = mbt;
-                expected = beats * divisions * 4 / beat_type;
+                expected = beats.saturating_mul(divisions).saturating_mul(4) / beat_type;
             }
         }
         let mut t = 0i64;
@@ -2668,7 +2693,7 @@ pub fn validate_musicxml(xml: &str) -> Vec<Issue> {
                 if let Some((md, next)) = read_tag_value(body, k, "divisions") {
                     if md > 0 {
                         divisions = md;
-                        expected = beats * divisions * 4 / beat_type;
+                        expected = beats.saturating_mul(divisions).saturating_mul(4) / beat_type;
                     }
                     k = next;
                 } else {
@@ -2685,11 +2710,11 @@ pub fn validate_musicxml(xml: &str) -> Vec<Issue> {
                                 format!("measure {mnum}: non-positive duration {v}"),
                             ));
                         } else if ctx == 2 {
-                            t -= v;
+                            t = t.saturating_sub(v);
                         } else if ctx == 1 && chord_tone {
                             // Chord tone: shares onset, no time advance.
                         } else {
-                            t += v;
+                            t = t.saturating_add(v);
                         }
                         k = next;
                     }
@@ -2780,16 +2805,12 @@ pub fn validate_mscz(data: &[u8]) -> Vec<Issue> {
         }
     };
     let container = match zip.by_name("META-INF/container.xml") {
-        Ok(mut f) => {
-            use std::io::Read;
-            let mut s = String::new();
-            match f.read_to_string(&mut s) {
-                Ok(_) => s,
+        Ok(f) => {
+            let sz = f.size();
+            match read_bounded_utf8(f, sz, "META-INF/container.xml", MAX_MSCZ_ENTRY_BYTES) {
+                Ok(s) => s,
                 Err(e) => {
-                    out.push(error(
-                        "mscz-container",
-                        format!("cannot read container.xml: {e}"),
-                    ));
+                    out.push(error("mscz-container", e));
                     String::new()
                 }
             }
@@ -2822,11 +2843,18 @@ pub fn validate_mscz(data: &[u8]) -> Vec<Issue> {
         } else {
             let mscx_target = rootfiles.iter().find(|p| p.ends_with(".mscx")).cloned();
             for rf in &rootfiles {
-                if zip.by_name(rf).is_err() {
-                    out.push(error(
+                match zip.by_name(rf) {
+                    Err(_) => out.push(error(
                         "mscz-score",
                         format!("container points at {rf:?} but it is not in the zip"),
-                    ));
+                    )),
+                    Ok(f) if rf.ends_with(".mss") => {
+                        let sz = f.size();
+                        if let Err(e) = read_bounded_utf8(f, sz, rf, MAX_MSCZ_ENTRY_BYTES) {
+                            out.push(error("mscz-style", e));
+                        }
+                    }
+                    Ok(_) => {}
                 }
             }
             match mscx_target {
@@ -2835,23 +2863,25 @@ pub fn validate_mscz(data: &[u8]) -> Vec<Issue> {
                     format!("container.xml has no .mscx rootfile (found {rootfiles:?})"),
                 )),
                 Some(target) => {
-                    if let Ok(mut f) = zip.by_name(&target) {
-                        use std::io::Read;
-                        let mut s = String::new();
-                        if f.read_to_string(&mut s).is_err() {
-                            out.push(error("mscz-score", format!("cannot read {target}")));
-                        } else {
-                            if !s.contains("<museScore") {
-                                out.push(error(
-                                    "mscz-score",
-                                    format!("{target}: missing <museScore> root"),
-                                ));
+                    if let Ok(f) = zip.by_name(&target) {
+                        let sz = f.size();
+                        match read_bounded_utf8(f, sz, &target, MAX_MSCZ_ENTRY_BYTES) {
+                            Err(e) => {
+                                out.push(error("mscz-score", e));
                             }
-                            if !s.contains("<Measure>") && !s.contains("<Measure ") {
-                                out.push(error(
-                                    "mscz-score",
-                                    format!("{target}: no <Measure> found"),
-                                ));
+                            Ok(s) => {
+                                if !s.contains("<museScore") {
+                                    out.push(error(
+                                        "mscz-score",
+                                        format!("{target}: missing <museScore> root"),
+                                    ));
+                                }
+                                if !s.contains("<Measure>") && !s.contains("<Measure ") {
+                                    out.push(error(
+                                        "mscz-score",
+                                        format!("{target}: no <Measure> found"),
+                                    ));
+                                }
                             }
                         }
                     }

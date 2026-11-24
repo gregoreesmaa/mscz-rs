@@ -1,13 +1,33 @@
 //! Music-theory pitch parsing, MIDI conversion, key-aware enharmonic spelling,
 //! and MuseScore tonal pitch class (TPC) helpers.
 //!
-//! All functions in this module are pure, allocation-free (except error strings),
-//! and safe to use on `wasm32-unknown-unknown` targets.
+//! All functions in this module are pure, allocation-free on the hot path
+//! (except error strings in [`parse_pitch`]), and safe to use on
+//! `wasm32-unknown-unknown` targets.
+//!
+//! # Quick start
+//!
+//! ```
+//! use mscz::pitch::{
+//!     midi_to_pitch, midi_to_pitch_for_key, parse_pitch, pitch_to_midi, tonal_pitch_class,
+//! };
+//!
+//! let p = parse_pitch("F#5").unwrap();
+//! assert_eq!((p.step, p.alter, p.octave, p.cents), ('F', 1, 5, 0.0));
+//!
+//! let midi = pitch_to_midi(p.step, p.alter, p.octave);
+//! assert_eq!(midi, 78);
+//! assert_eq!(midi_to_pitch(78, true), ('G', -1, 5));
+//! assert_eq!(midi_to_pitch_for_key(65, 6), ('E', 1, 4)); // E#4 in F# major
+//! assert_eq!(tonal_pitch_class('F', 1), 20);
+//! ```
 
 /// A parsed scientific pitch such as `"C4"`, `"F#5"`, `"Bb3"`, `"C##4"`, or `"A4+30c"`.
+///
+/// Returned by [`parse_pitch`].
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct ParsedPitch {
-    /// Diatonic step letter (`'A'`..=`'G'`).
+    /// Diatonic step letter (`'A'`..=`'G'`, always normalized to uppercase).
     pub step: char,
     /// Chromatic alteration in semitones (`-2` = double flat, `-1` = flat,
     /// `0` = natural, `+1` = sharp, `+2` = double sharp).
@@ -31,14 +51,45 @@ fn step_semitone(step: char) -> i32 {
     }
 }
 
-/// Parse a scientific pitch string into [`ParsedPitch`].
+/// Parse a scientific pitch string into a [`ParsedPitch`].
 ///
-/// Supported forms:
-/// - Natural: `"C4"`, `"a3"`
-/// - Sharps / flats / naturals: `"F#5"`, `"Bb3"`, `"Cn4"`
-/// - Double sharps / double flats: `"C##4"`, `"Gx2"`, `"Bbb3"`
-/// - Negative octaves: `"C-1"`, `"Eb-1"`
-/// - Optional cents suffix: `"A4+30c"`, `"G3-12.5c"`, `"D#4+15"`
+/// Leading and trailing ASCII whitespace is ignored, and step/accidental letters
+/// are case-insensitive.
+///
+/// # Supported syntax
+///
+/// - **Natural**: `"C4"`, `"a3"`, `"Cn4"` (`n` / `N` is an explicit natural)
+/// - **Sharps & flats**: `"F#5"`, `"Bb3"`
+/// - **Double sharps & double flats**: `"C##4"`, `"Gx2"` (`x` / `X` = double sharp), `"Bbb3"`
+/// - **Negative octaves**: `"C-1"`, `"Eb-1"`
+/// - **Optional microtonal cents suffix**: `"A4+30c"`, `"G3-12.5c"`, `"D#4+15"`
+///
+/// # Examples
+///
+/// ```
+/// use mscz::pitch::{parse_pitch, ParsedPitch};
+///
+/// assert_eq!(
+///     parse_pitch("Bb3").unwrap(),
+///     ParsedPitch { step: 'B', alter: -1, octave: 3, cents: 0.0 }
+/// );
+/// assert_eq!(
+///     parse_pitch("Gx2").unwrap(),
+///     ParsedPitch { step: 'G', alter: 2, octave: 2, cents: 0.0 }
+/// );
+/// let micro = parse_pitch("A4+30c").unwrap();
+/// assert_eq!((micro.step, micro.octave), ('A', 4));
+/// assert!((micro.cents - 30.0).abs() < 1e-9);
+/// ```
+///
+/// # Errors
+///
+/// Returns `Err(String)` when:
+/// - The string is empty or does not start with a diatonic step `'A'..='G'`.
+/// - The accidental exceeds a double sharp (`+2`) or double flat (`-2`).
+/// - The octave is missing, not an integer, or outside `-1..=9`.
+/// - A trailing cents suffix cannot be parsed, is non-finite, or has `|cents| >= 100.0`.
+/// - The resulting rounded MIDI note number falls outside `0..=127` (e.g. `"Cb-1"` or `"A9"`).
 pub fn parse_pitch(s: &str) -> Result<ParsedPitch, String> {
     let t = s.trim();
     let mut it = t.chars();
@@ -145,15 +196,38 @@ pub fn parse_pitch(s: &str) -> Result<ParsedPitch, String> {
     })
 }
 
-/// Convert `(step, alter, octave)` to a MIDI note number (`C4` = `60`, `A4` = `69`, `C-1` = `0`).
+/// Convert `(step, alter, octave)` to a MIDI note number (`C4` = `60`, `A4` = `69`, `C-1` = `0`, `G9` = `127`).
+///
+/// `step` is matched case-insensitively (`'A'..='G'`); any other character is treated as `'C'` (`0`).
+///
+/// # Examples
+///
+/// ```
+/// use mscz::pitch::pitch_to_midi;
+///
+/// assert_eq!(pitch_to_midi('C', 0, 4), 60);
+/// assert_eq!(pitch_to_midi('A', 0, 4), 69);
+/// assert_eq!(pitch_to_midi('F', 1, 4), 66);
+/// assert_eq!(pitch_to_midi('B', -1, 3), 58);
+/// ```
 pub fn pitch_to_midi(step: char, alter: i32, octave: i32) -> i32 {
     (octave + 1) * 12 + step_semitone(step) + alter
 }
 
 /// Convert a MIDI note number (`0..=127`) to `(step, alter, octave)`.
 ///
-/// When `prefer_flats` is `false`, accidentals are spelled as sharps (`C#`, `D#`, `F#`, `G#`, `A#`).
-/// When `prefer_flats` is `true`, accidentals are spelled as flats (`Db`, `Eb`, `Gb`, `Ab`, `Bb`).
+/// - When `prefer_flats` is `false`, accidentals are spelled as sharps (`C#`, `D#`, `F#`, `G#`, `A#`).
+/// - When `prefer_flats` is `true`, accidentals are spelled as flats (`Db`, `Eb`, `Gb`, `Ab`, `Bb`).
+///
+/// # Examples
+///
+/// ```
+/// use mscz::pitch::midi_to_pitch;
+///
+/// assert_eq!(midi_to_pitch(60, false), ('C', 0, 4));
+/// assert_eq!(midi_to_pitch(61, false), ('C', 1, 4));
+/// assert_eq!(midi_to_pitch(61, true), ('D', -1, 4));
+/// ```
 pub fn midi_to_pitch(midi: u8, prefer_flats: bool) -> (char, i32, i32) {
     let m = midi as i32;
     let octave = m.div_euclid(12) - 1;
@@ -210,7 +284,19 @@ pub fn midi_to_pitch(midi: u8, prefer_flats: bool) -> (char, i32, i32) {
 ///
 /// For extreme sharp/flat keys, diatonic enharmonics such as `E#` (`key_fifths >= 6`),
 /// `B#` (`key_fifths >= 7`), `Cb` (`key_fifths <= -6`), and `Fb` (`key_fifths <= -7`)
-/// are spelled with the matching octave adjustment so `pitch_to_midi(step, alter, octave) == midi as i32`.
+/// are spelled with the matching octave adjustment so
+/// `pitch_to_midi(step, alter, octave) == midi as i32` always holds.
+///
+/// # Examples
+///
+/// ```
+/// use mscz::pitch::midi_to_pitch_for_key;
+///
+/// assert_eq!(midi_to_pitch_for_key(70, -1), ('B', -1, 4)); // Bb4 in F major
+/// assert_eq!(midi_to_pitch_for_key(66, 1), ('F', 1, 4));   // F#4 in G major
+/// assert_eq!(midi_to_pitch_for_key(60, 7), ('B', 1, 3));   // B#3 in C# major
+/// assert_eq!(midi_to_pitch_for_key(59, -6), ('C', -1, 4)); // Cb4 in Gb major
+/// ```
 pub fn midi_to_pitch_for_key(midi: u8, key_fifths: i32) -> (char, i32, i32) {
     let m = midi as i32;
     let octave = m.div_euclid(12) - 1;
@@ -234,7 +320,20 @@ pub fn midi_to_pitch_for_key(midi: u8, key_fifths: i32) -> (char, i32, i32) {
 
 /// MuseScore line-of-fifths Tonal Pitch Class (TPC), where `C = 14`, `G = 15`, `F = 13`.
 ///
+/// Natural base values along the line of fifths:
+/// `F = 13`, `C = 14`, `G = 15`, `D = 16`, `A = 17`, `E = 18`, `B = 19`.
 /// Each sharp adds `7` and each flat subtracts `7` (e.g. `F# = 20`, `Bb = 12`, `C## = 28`).
+///
+/// # Examples
+///
+/// ```
+/// use mscz::pitch::tonal_pitch_class;
+///
+/// assert_eq!(tonal_pitch_class('C', 0), 14);
+/// assert_eq!(tonal_pitch_class('F', 1), 20);
+/// assert_eq!(tonal_pitch_class('B', -1), 12);
+/// assert_eq!(tonal_pitch_class('C', 2), 28);
+/// ```
 pub fn tonal_pitch_class(step: char, alter: i32) -> i32 {
     let base = match step.to_ascii_uppercase() {
         'C' => 14,
