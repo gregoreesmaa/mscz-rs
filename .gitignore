@@ -1,0 +1,8 @@
+/target/
+Cargo.lock
+*.mscz
+*.mscx
+*.musicxml
+!tests/fixtures/*.musicxml
+.DS_Store
+Thumbs.db
