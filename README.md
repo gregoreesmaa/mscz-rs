@@ -244,7 +244,7 @@ cargo run --example 01_compose_two_voice
 
 ---
 
-## License
+## License & Citation
 
 Dual-licensed under either:
 
@@ -252,3 +252,16 @@ Dual-licensed under either:
 - **Apache License, Version 2.0** ([`LICENSE-APACHE`](LICENSE-APACHE))
 
 at your option. Zero GPL or AGPL dependencies anywhere in the dependency tree.
+
+If you use `mscz` in research or music software, please cite:
+
+```bibtex
+@software{eesmaa_mscz_rs_2026,
+  title        = {mscz-rs: Pure-Rust MuseScore 4 (.mscz), MusicXML 3.1/4.0, and bekern Engine},
+  author       = {Gregor Eesmaa and mscz-rs contributors},
+  year         = {2026},
+  version      = {0.1.0},
+  license      = {MIT OR Apache-2.0},
+  url          = {https://github.com/gregoreesmaa/mscz-rs}
+}
+```
