@@ -51,7 +51,7 @@
 //! ```
 
 use std::collections::BTreeMap;
-use std::fmt;
+use std::fmt::{self, Write as _};
 use std::io::{Cursor, Read, Write};
 
 use serde::{Deserialize, Serialize};
@@ -550,16 +550,16 @@ fn parse_pitch(s: &str) -> Result<(char, i32, i32, i32, Option<i32>), String> {
 // Duration -> MusicXML type + dots
 // ---------------------------------------------------------------------------
 
-/// All (type name, base ticks, dots 0..=3) candidates for `divisions`.
+/// Map tick duration to `(type name, dots, actual ticks)`.
+/// `actual != ticks` means the caller must log `duration-quantized` loss.
 ///
 /// A base of `divisions / 2^k` ticks is only exact when `divisions` is a
 /// multiple of `2^k`; otherwise that type (and shorter ones) cannot be
 /// written exactly and is skipped, so quantisation records real loss.
-fn duration_candidates(divisions: u32) -> Vec<(&'static str, i64, u8, i64)> {
-    let d = divisions as i64;
-    // (type name, divisor of divisions for one base unit)
-    let bases: &[(&str, i64)] = &[
-        ("whole", -4), // whole = 4 * divisions (negative = multiply)
+pub fn quantize_duration(ticks: i64, divisions: u32) -> (&'static str, u8, i64) {
+    // (type name, divisor of divisions for one base unit; negative = multiply)
+    const BASES: [(&str, i64); 7] = [
+        ("whole", -4),
         ("half", -2),
         ("quarter", 1),
         ("eighth", 2),
@@ -567,15 +567,18 @@ fn duration_candidates(divisions: u32) -> Vec<(&'static str, i64, u8, i64)> {
         ("32nd", 8),
         ("64th", 16),
     ];
-    let mut out = Vec::new();
-    for (name, unit) in bases {
-        let base = if *unit < 0 {
+    let d = divisions as i64;
+    let mut best: Option<(&'static str, u8, i64)> = None;
+    let mut best_dist = i64::MAX;
+    let mut best_dots = u8::MAX;
+    for (name, unit) in BASES {
+        let base = if unit < 0 {
             d * -unit
         } else {
-            if d % *unit != 0 {
+            if d % unit != 0 {
                 continue;
             }
-            d / *unit
+            d / unit
         };
         if base <= 0 {
             continue;
@@ -587,30 +590,19 @@ fn duration_candidates(divisions: u32) -> Vec<(&'static str, i64, u8, i64)> {
             if num % den != 0 {
                 continue;
             }
-            out.push((*name, base, dots, num / den));
+            let value = num / den;
+            if value <= 0 {
+                continue;
+            }
+            let dist = (value - ticks).abs();
+            if dist < best_dist || (dist == best_dist && dots < best_dots) {
+                best_dist = dist;
+                best_dots = dots;
+                best = Some((name, dots, value));
+            }
         }
     }
-    out
-}
-
-/// Map tick duration to `(type name, dots, actual ticks)`.
-/// `actual != ticks` means the caller must log `duration-quantized` loss.
-pub fn quantize_duration(ticks: i64, divisions: u32) -> (&'static str, u8, i64) {
-    let mut best: Option<(&'static str, u8, i64)> = None;
-    let mut best_dist = i64::MAX;
-    let mut best_dots = u8::MAX;
-    for (name, _base, dots, value) in duration_candidates(divisions) {
-        if value <= 0 {
-            continue;
-        }
-        let dist = (value - ticks).abs();
-        if dist < best_dist || (dist == best_dist && dots < best_dots) {
-            best_dist = dist;
-            best_dots = dots;
-            best = Some((name, dots, value));
-        }
-    }
-    best.unwrap_or(("64th", 0, divisions as i64 / 16))
+    best.unwrap_or(("64th", 0, d / 16))
 }
 
 // ---------------------------------------------------------------------------
@@ -925,7 +917,25 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
 
 /// XML-escape text content.
 pub fn escape_xml(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
+    if !s
+        .bytes()
+        .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\''))
+    {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    write_escaped_xml(&mut out, s);
+    out
+}
+
+fn write_escaped_xml(out: &mut String, s: &str) {
+    if !s
+        .bytes()
+        .any(|b| matches!(b, b'&' | b'<' | b'>' | b'"' | b'\''))
+    {
+        out.push_str(s);
+        return;
+    }
     for c in s.chars() {
         match c {
             '&' => out.push_str("&amp;"),
@@ -936,7 +946,6 @@ pub fn escape_xml(s: &str) -> String {
             _ => out.push(c),
         }
     }
-    out
 }
 
 fn accidental_name(alter: i32) -> Option<&'static str> {
@@ -1093,58 +1102,56 @@ fn tie_elements(seg: &Segment) -> (bool, bool) {
     }
 }
 
-/// `<tied>` elements for one segment (same sourcing as [`tie_elements`]).
-fn tied_xml(seg: &Segment) -> String {
-    let (start, stop) = tie_elements(seg);
-    let mut out = String::new();
-    if start {
+/// Write `<notations>` block for one segment directly into `out`: tied +
+/// slurs + articulations + fermata. Emits nothing when the segment carries
+/// none. Rests only ever carry fermatas (the corpus has no slurred/articulated
+/// rests), but the rendering is uniform.
+fn write_notations_xml(out: &mut String, seg: &Segment) {
+    let (tie_start, tie_stop) = tie_elements(seg);
+    let has_art = seg
+        .note
+        .articulations
+        .iter()
+        .any(|a| matches!(a.as_str(), "stacc" | "accent" | "tenuto"));
+    let fermata = seg.note.articulations.iter().any(|a| a == "fermata");
+    if !tie_start
+        && !tie_stop
+        && !seg.note.slur_start
+        && !seg.note.slur_stop
+        && !has_art
+        && !fermata
+    {
+        return;
+    }
+    out.push_str("        <notations>");
+    if tie_start {
         out.push_str("<tied type=\"start\"/>");
     }
-    if stop {
+    if tie_stop {
         out.push_str("<tied type=\"stop\"/>");
     }
-    out
-}
-
-/// `<notations>` block for one segment: tied + slurs + articulations +
-/// fermata. Empty when the segment carries none. Rests only ever carry
-/// fermatas (the corpus has no slurred/articulated rests), but the
-/// rendering is uniform.
-fn notations_xml(seg: &Segment) -> String {
-    let tied = tied_xml(seg);
-    let mut slurs = String::new();
     if seg.note.slur_start {
-        slurs.push_str("<slur type=\"start\" number=\"1\"/>");
+        out.push_str("<slur type=\"start\" number=\"1\"/>");
     }
     if seg.note.slur_stop {
-        slurs.push_str("<slur type=\"stop\" number=\"1\"/>");
+        out.push_str("<slur type=\"stop\" number=\"1\"/>");
     }
-    let mut arts = String::new();
-    for a in &seg.note.articulations {
-        match a.as_str() {
-            "stacc" => arts.push_str("<staccato/>"),
-            "accent" => arts.push_str("<accent/>"),
-            "tenuto" => arts.push_str("<tenuto/>"),
-            _ => {}
-        }
-    }
-    let fermata = seg.note.articulations.iter().any(|a| a == "fermata");
-    if tied.is_empty() && slurs.is_empty() && arts.is_empty() && !fermata {
-        return String::new();
-    }
-    let mut out = String::from("        <notations>");
-    out.push_str(&tied);
-    out.push_str(&slurs);
-    if !arts.is_empty() {
+    if has_art {
         out.push_str("<articulations>");
-        out.push_str(&arts);
+        for a in &seg.note.articulations {
+            match a.as_str() {
+                "stacc" => out.push_str("<staccato/>"),
+                "accent" => out.push_str("<accent/>"),
+                "tenuto" => out.push_str("<tenuto/>"),
+                _ => {}
+            }
+        }
         out.push_str("</articulations>");
     }
     if fermata {
         out.push_str("<fermata/>");
     }
     out.push_str("</notations>\n");
-    out
 }
 
 fn push_note_xml(
@@ -1166,16 +1173,11 @@ fn push_note_xml(
         if seg.note.rest {
             out.push_str("        <rest/>\n");
         } else {
-            out.push_str(&format!(
-                "        <pitch><step>{}</step>{}<octave>{}</octave></pitch>\n",
-                seg.note.step,
-                if seg.note.alter != 0 {
-                    format!("<alter>{}</alter>", seg.note.alter)
-                } else {
-                    String::new()
-                },
-                seg.note.octave,
-            ));
+            let _ = write!(out, "        <pitch><step>{}</step>", seg.note.step);
+            if seg.note.alter != 0 {
+                let _ = write!(out, "<alter>{}</alter>", seg.note.alter);
+            }
+            let _ = writeln!(out, "<octave>{}</octave></pitch>", seg.note.octave);
         }
         let (typename, dots, shown) = quantize_duration(seg.note.dur_ticks, divisions);
         if shown != seg.note.dur_ticks {
@@ -1192,17 +1194,17 @@ fn push_note_xml(
                 None,
             );
         }
-        out.push_str(&format!("        <voice>{}</voice>\n", seg.note.voice));
-        out.push_str(&format!("        <type>{typename}</type>\n"));
+        let _ = writeln!(out, "        <voice>{}</voice>", seg.note.voice);
+        let _ = writeln!(out, "        <type>{typename}</type>");
         for _ in 0..dots {
             out.push_str("        <dot/>\n");
         }
         if !seg.note.rest {
             if let Some(acc) = accidental_name(seg.note.alter) {
-                out.push_str(&format!("        <accidental>{acc}</accidental>\n"));
+                let _ = writeln!(out, "        <accidental>{acc}</accidental>");
             }
         }
-        out.push_str(&notations_xml(seg));
+        write_notations_xml(out, seg);
         out.push_str("      </note>\n");
         return;
     }
@@ -1232,18 +1234,13 @@ fn push_note_xml(
     if seg.note.rest {
         out.push_str("        <rest/>\n");
     } else {
-        out.push_str(&format!(
-            "        <pitch><step>{}</step>{}<octave>{}</octave></pitch>\n",
-            seg.note.step,
-            if seg.note.alter != 0 {
-                format!("<alter>{}</alter>", seg.note.alter)
-            } else {
-                String::new()
-            },
-            seg.note.octave,
-        ));
+        let _ = write!(out, "        <pitch><step>{}</step>", seg.note.step);
+        if seg.note.alter != 0 {
+            let _ = write!(out, "<alter>{}</alter>", seg.note.alter);
+        }
+        let _ = writeln!(out, "<octave>{}</octave></pitch>", seg.note.octave);
     }
-    out.push_str(&format!("        <duration>{dur}</duration>\n"));
+    let _ = writeln!(out, "        <duration>{dur}</duration>");
     let (tie_start, tie_stop) = tie_elements(seg);
     if tie_start {
         out.push_str("        <tie type=\"start\"/>\n");
@@ -1251,43 +1248,44 @@ fn push_note_xml(
     if tie_stop {
         out.push_str("        <tie type=\"stop\"/>\n");
     }
-    out.push_str(&format!("        <voice>{}</voice>\n", seg.note.voice));
-    out.push_str(&format!("        <type>{typename}</type>\n"));
+    let _ = writeln!(out, "        <voice>{}</voice>", seg.note.voice);
+    let _ = writeln!(out, "        <type>{typename}</type>");
     for _ in 0..dots {
         out.push_str("        <dot/>\n");
     }
-    let notations = notations_xml(seg);
     if !seg.note.rest {
         if let Some(acc) = accidental_name(seg.note.alter) {
-            out.push_str(&format!("        <accidental>{acc}</accidental>\n"));
+            let _ = writeln!(out, "        <accidental>{acc}</accidental>");
         }
-        out.push_str(&notations);
+        write_notations_xml(out, seg);
         if let Some(ly) = &seg.note.lyric {
-            out.push_str(&format!(
-                "        <lyric><text>{}</text></lyric>\n",
-                escape_xml(ly)
-            ));
+            out.push_str("        <lyric><text>");
+            write_escaped_xml(out, ly);
+            out.push_str("</text></lyric>\n");
         }
     } else {
-        out.push_str(&notations);
+        write_notations_xml(out, seg);
     }
     out.push_str("      </note>\n");
 }
 
-/// `<clef>` element for a recorded sign/line. The token spelling for a
-/// percussion clef is `p` (single char); MusicXML spells it
-/// `percussion`, and the pair re-parses to the same token.
-fn clef_xml(sign: char, line: u32, octave_change: Option<i32>) -> String {
-    let name = match sign {
-        'p' => "percussion".to_string(),
-        s => s.to_string(),
-    };
-    match octave_change {
-        Some(oct) if oct != 0 => format!(
-            "        <clef><sign>{name}</sign><line>{line}</line><clef-octave-change>{oct}</clef-octave-change></clef>\n"
-        ),
-        _ => format!("        <clef><sign>{name}</sign><line>{line}</line></clef>\n"),
+/// Write `<clef>` element for a recorded sign/line directly into `out`.
+/// The token spelling for a percussion clef is `p` (single char); MusicXML
+/// spells it `percussion`, and the pair re-parses to the same token.
+fn write_clef_xml(out: &mut String, sign: char, line: u32, octave_change: Option<i32>) {
+    out.push_str("        <clef><sign>");
+    if sign == 'p' {
+        out.push_str("percussion");
+    } else {
+        out.push(sign);
     }
+    let _ = write!(out, "</sign><line>{line}</line>");
+    if let Some(oct) = octave_change {
+        if oct != 0 {
+            let _ = write!(out, "<clef-octave-change>{oct}</clef-octave-change>");
+        }
+    }
+    out.push_str("</clef>\n");
 }
 
 /// Measure-scoped override for one 1-based measure number, if any (last-wins).
@@ -1295,44 +1293,58 @@ fn measure_attr(score: &Score, measure: u32) -> Option<&MeasureAttr> {
     score.measure_attrs.iter().rfind(|a| a.measure == measure)
 }
 
-/// `<direction>` carrying one measure-level dynamic mark.
-fn dyn_direction_xml(dynamic: &str) -> String {
-    format!(
-        "      <direction placement=\"below\"><direction-type><dynamics><{dynamic}/></dynamics></direction-type></direction>\n"
-    )
+/// Write `<direction>` carrying one measure-level dynamic mark.
+fn write_dyn_direction_xml(out: &mut String, dynamic: &str) {
+    let _ = writeln!(
+        out,
+        "      <direction placement=\"below\"><direction-type><dynamics><{dynamic}/></dynamics></direction-type></direction>"
+    );
 }
 
-/// `<direction>` carrying one hairpin wedge event.
-fn hairpin_direction_xml(hairpin: &str) -> String {
+/// Write `<direction>` carrying one hairpin wedge event.
+fn write_hairpin_direction_xml(out: &mut String, hairpin: &str) {
     let wedge = match hairpin {
         "cresc" => "crescendo",
         "dim" => "diminuendo",
         _ => "stop",
     };
-    format!(
-        "      <direction placement=\"below\"><direction-type><wedge type=\"{wedge}\"/></direction-type></direction>\n"
-    )
+    let _ = writeln!(
+        out,
+        "      <direction placement=\"below\"><direction-type><wedge type=\"{wedge}\"/></direction-type></direction>"
+    );
 }
 
-/// `<barline>` for a recorded bar style. The rendering re-parses to the
+/// Write `<barline>` for a recorded bar style. The rendering re-parses to the
 /// same token (repeat direction wins over style, like the importer), so
 /// barlines are idempotent across round trips.
-fn barline_xml(right: bool, style: &str) -> String {
+fn write_barline_xml(out: &mut String, right: bool, style: &str) {
     let loc = if right { "right" } else { "left" };
     match style {
-        "repeat-left" => format!(
-            "      <barline location=\"{loc}\"><bar-style>heavy-light</bar-style><repeat direction=\"forward\"/></barline>\n"
-        ),
-        "repeat-right" => format!(
-            "      <barline location=\"{loc}\"><bar-style>light-heavy</bar-style><repeat direction=\"backward\"/></barline>\n"
-        ),
+        "repeat-left" => {
+            let _ = writeln!(
+                out,
+                "      <barline location=\"{loc}\"><bar-style>heavy-light</bar-style><repeat direction=\"forward\"/></barline>"
+            );
+        }
+        "repeat-right" => {
+            let _ = writeln!(
+                out,
+                "      <barline location=\"{loc}\"><bar-style>light-heavy</bar-style><repeat direction=\"backward\"/></barline>"
+            );
+        }
         "light-heavy" => {
-            format!("      <barline location=\"{loc}\"><bar-style>light-heavy</bar-style></barline>\n")
+            let _ = writeln!(
+                out,
+                "      <barline location=\"{loc}\"><bar-style>light-heavy</bar-style></barline>"
+            );
         }
         "double" => {
-            format!("      <barline location=\"{loc}\"><bar-style>light-light</bar-style></barline>\n")
+            let _ = writeln!(
+                out,
+                "      <barline location=\"{loc}\"><bar-style>light-light</bar-style></barline>"
+            );
         }
-        _ => String::new(),
+        _ => {}
     }
 }
 
@@ -1372,42 +1384,44 @@ pub fn to_musicxml_version(
         MusicXmlVersion::V31 => "3.1",
         MusicXmlVersion::V40 => "4.0",
     };
-    let mut out = String::new();
+    let note_count: usize = score
+        .parts
+        .iter()
+        .map(|p| p.groups.iter().map(|g| g.members.len()).sum::<usize>())
+        .sum();
+    let mut out = String::with_capacity(note_count * 220 + 1024);
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-    out.push_str(&format!(
-        "<!DOCTYPE score-partwise PUBLIC \"-//Recordare//DTD MusicXML {ver_str} Partwise//EN\" \"http://www.musicxml.org/dtds/partwise.dtd\">\n"
-    ));
-    out.push_str(&format!("<score-partwise version=\"{ver_str}\">\n"));
-    out.push_str(&format!(
-        "  <work><work-title>{}</work-title></work>\n",
-        escape_xml(&score.title)
-    ));
+    let _ = writeln!(
+        out,
+        "<!DOCTYPE score-partwise PUBLIC \"-//Recordare//DTD MusicXML {ver_str} Partwise//EN\" \"http://www.musicxml.org/dtds/partwise.dtd\">"
+    );
+    let _ = writeln!(out, "<score-partwise version=\"{ver_str}\">");
+    out.push_str("  <work><work-title>");
+    write_escaped_xml(&mut out, &score.title);
+    out.push_str("</work-title></work>\n");
     if let Some(c) = &score.composer {
-        out.push_str(&format!(
-            "  <identification>\n    <creator type=\"composer\">{}</creator>\n  </identification>\n",
-            escape_xml(c)
-        ));
+        out.push_str("  <identification>\n    <creator type=\"composer\">");
+        write_escaped_xml(&mut out, c);
+        out.push_str("</creator>\n  </identification>\n");
     }
     out.push_str("  <part-list>\n");
     for (i, part) in score.parts.iter().enumerate() {
-        out.push_str(&format!(
-            "    <score-part id=\"P{}\"><part-name>{}</part-name></score-part>\n",
-            i + 1,
-            escape_xml(&part.name),
-        ));
+        let _ = write!(out, "    <score-part id=\"P{}\"><part-name>", i + 1);
+        write_escaped_xml(&mut out, &part.name);
+        out.push_str("</part-name></score-part>\n");
     }
     out.push_str("  </part-list>\n");
 
     let windows = score.measure_windows();
     for (i, part) in score.parts.iter().enumerate() {
-        out.push_str(&format!("  <part id=\"P{}\">\n", i + 1));
+        let _ = writeln!(out, "  <part id=\"P{}\">", i + 1);
         let layout = layout_part(score, part, losses);
         for (m, voices) in layout.iter().enumerate() {
             let mlen = windows
                 .get(m)
                 .map(|&(a, b)| b - a)
                 .unwrap_or_else(|| score.measure_ticks());
-            out.push_str(&format!("    <measure number=\"{}\">\n", m + 1));
+            let _ = writeln!(out, "    <measure number=\"{}\">", m + 1);
             let attrs = measure_attr(score, m as u32 + 1);
             if m == 0 {
                 let (clef_s, clef_l, clef_oct) = match attrs {
@@ -1424,15 +1438,13 @@ pub fn to_musicxml_version(
                     None => (score.beats, score.beat_type),
                 };
                 out.push_str("      <attributes>\n");
-                out.push_str(&format!(
-                    "        <divisions>{}</divisions>\n",
-                    score.divisions
-                ));
-                out.push_str(&format!("        <key><fifths>{key}</fifths></key>\n"));
-                out.push_str(&format!(
-                    "        <time><beats>{beats}</beats><beat-type>{beat_type}</beat-type></time>\n",
-                ));
-                out.push_str(&clef_xml(clef_s, clef_l, clef_oct));
+                let _ = writeln!(out, "        <divisions>{}</divisions>", score.divisions);
+                let _ = writeln!(out, "        <key><fifths>{key}</fifths></key>");
+                let _ = writeln!(
+                    out,
+                    "        <time><beats>{beats}</beats><beat-type>{beat_type}</beat-type></time>"
+                );
+                write_clef_xml(&mut out, clef_s, clef_l, clef_oct);
                 out.push_str("      </attributes>\n");
             } else if let Some(a) = attrs {
                 let has_clef = a.clef_sign.is_some()
@@ -1441,46 +1453,45 @@ pub fn to_musicxml_version(
                 if has_clef || a.key_fifths.is_some() || a.time.is_some() {
                     out.push_str("      <attributes>\n");
                     if has_clef {
-                        out.push_str(&clef_xml(
+                        write_clef_xml(
+                            &mut out,
                             a.clef_sign.unwrap_or('G'),
                             a.clef_line.unwrap_or(2),
                             a.clef_octave_change,
-                        ));
+                        );
                     }
                     if let Some(k) = a.key_fifths {
-                        out.push_str(&format!("        <key><fifths>{k}</fifths></key>\n"));
+                        let _ = writeln!(out, "        <key><fifths>{k}</fifths></key>");
                     }
                     if let Some(t) = a.time {
-                        out.push_str(&format!(
-                            "        <time><beats>{}</beats><beat-type>{}</beat-type></time>\n",
-                            t.beats, t.beat_type,
-                        ));
+                        let _ = writeln!(
+                            out,
+                            "        <time><beats>{}</beats><beat-type>{}</beat-type></time>",
+                            t.beats, t.beat_type
+                        );
                     }
                     out.push_str("      </attributes>\n");
                 }
             }
             if let Some(b) = attrs.and_then(|a| a.barline_left.as_deref()) {
-                out.push_str(&barline_xml(false, b));
+                write_barline_xml(&mut out, false, b);
             }
             if let Some(d) = attrs.and_then(|a| a.dynamic.as_deref()) {
-                out.push_str(&dyn_direction_xml(d));
+                write_dyn_direction_xml(&mut out, d);
             }
             if let Some(h) = attrs.and_then(|a| a.hairpin.as_deref()) {
-                out.push_str(&hairpin_direction_xml(h));
+                write_hairpin_direction_xml(&mut out, h);
             }
-            for (vi, (voice, segs)) in voices.iter().enumerate() {
-                let _ = voice;
+            for (vi, (_voice, segs)) in voices.iter().enumerate() {
                 if vi > 0 {
-                    out.push_str(&format!(
-                        "      <backup><duration>{mlen}</duration></backup>\n",
-                    ));
+                    let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
                 }
                 for s in segs {
                     push_note_xml(&mut out, s, score.divisions, losses, &part.name);
                 }
             }
             if let Some(b) = attrs.and_then(|a| a.barline_right.as_deref()) {
-                out.push_str(&barline_xml(true, b));
+                write_barline_xml(&mut out, true, b);
             }
             out.push_str("    </measure>\n");
         }
@@ -1515,23 +1526,22 @@ fn gcd_i64(mut a: i64, mut b: i64) -> i64 {
     a.max(1)
 }
 
-/// Format a MuseScore 4 `<location>` element from a measure delta and a
-/// tick offset delta (fractions are relative to one whole note = 4 * divisions).
-fn mscx_location_xml(indent: &str, dm: i64, df_ticks: i64, divisions: u32) -> String {
-    let mut out = String::new();
-    out.push_str(&format!("{indent}<location>\n"));
+/// Write a MuseScore 4 `<location>` element from a measure delta and a
+/// tick offset delta directly into `out` (fractions are relative to one whole
+/// note = 4 * divisions).
+fn write_mscx_location_xml(out: &mut String, indent: &str, dm: i64, df_ticks: i64, divisions: u32) {
+    let _ = writeln!(out, "{indent}<location>");
     if dm != 0 {
-        out.push_str(&format!("{indent}  <measures>{dm}</measures>\n"));
+        let _ = writeln!(out, "{indent}  <measures>{dm}</measures>");
     }
     if df_ticks != 0 {
         let whole = (divisions as i64 * 4).max(1);
         let g = gcd_i64(df_ticks, whole);
         let num = df_ticks / g;
         let den = whole / g;
-        out.push_str(&format!("{indent}  <fractions>{num}/{den}</fractions>\n"));
+        let _ = writeln!(out, "{indent}  <fractions>{num}/{den}</fractions>");
     }
-    out.push_str(&format!("{indent}  </location>\n"));
-    out
+    let _ = writeln!(out, "{indent}  </location>");
 }
 
 /// Map MusicXML-style `(sign, line, octave_change)` to a MuseScore 4 clef type.
@@ -1556,15 +1566,6 @@ fn mscx_clef_type(sign: char, line: u32, octave_change: Option<i32>) -> &'static
         ('C', _, _) => "C3",
         ('p' | 'P', _, _) => "PERC",
         _ => "G",
-    }
-}
-
-fn mscx_articulation_subtype(art: &str) -> Option<&'static str> {
-    match art {
-        "stacc" => Some("articStaccatoAbove"),
-        "accent" => Some("articAccentAbove"),
-        "tenuto" => Some("articTenutoAbove"),
-        _ => None,
     }
 }
 
@@ -1635,38 +1636,46 @@ fn group_voice_items(segs: &[Segment]) -> Vec<MscxItem<'_>> {
 /// `<Articulation>`, `<Fermata>`, `<Lyrics>`, and `<BarLine>` /
 /// `<startRepeat/>` / `<endRepeat>`.
 pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
-    let mut out = String::new();
+    let note_count: usize = score
+        .parts
+        .iter()
+        .map(|p| p.groups.iter().map(|g| g.members.len()).sum::<usize>())
+        .sum();
+    let mut out = String::with_capacity(note_count * 220 + 2048);
     out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
     out.push_str("<museScore version=\"4.20\">\n");
     out.push_str("  <programVersion>4.2.0</programVersion>\n");
     out.push_str("  <Score>\n");
-    out.push_str(&format!("    <Division>{}</Division>\n", score.divisions));
+    let _ = writeln!(out, "    <Division>{}</Division>", score.divisions);
     out.push_str("    <showInvisible>1</showInvisible>\n");
     out.push_str("    <showUnprintable>1</showUnprintable>\n");
     out.push_str("    <showFrames>1</showFrames>\n");
     out.push_str("    <showMargins>0</showMargins>\n");
-    out.push_str(&format!(
-        "    <metaTag name=\"workTitle\">{}</metaTag>\n",
-        escape_xml(&score.title)
-    ));
+    out.push_str("    <metaTag name=\"workTitle\">");
+    write_escaped_xml(&mut out, &score.title);
+    out.push_str("</metaTag>\n");
     if let Some(c) = &score.composer {
-        out.push_str(&format!(
-            "    <metaTag name=\"composer\">{}</metaTag>\n",
-            escape_xml(c)
-        ));
+        out.push_str("    <metaTag name=\"composer\">");
+        write_escaped_xml(&mut out, c);
+        out.push_str("</metaTag>\n");
     }
     for (i, part) in score.parts.iter().enumerate() {
-        let pname = escape_xml(&part.name);
-        out.push_str(&format!("    <Part id=\"{}\">\n", i + 1));
+        let _ = writeln!(out, "    <Part id=\"{}\">", i + 1);
         out.push_str("      <Staff>\n");
         out.push_str("        <StaffType group=\"pitched\">\n");
         out.push_str("          <name>stdNormal</name>\n");
         out.push_str("          </StaffType>\n");
         out.push_str("        </Staff>\n");
-        out.push_str(&format!("      <trackName>{pname}</trackName>\n"));
+        out.push_str("      <trackName>");
+        write_escaped_xml(&mut out, &part.name);
+        out.push_str("</trackName>\n");
         out.push_str("      <Instrument>\n");
-        out.push_str(&format!("        <longName>{pname}</longName>\n"));
-        out.push_str(&format!("        <trackName>{pname}</trackName>\n"));
+        out.push_str("        <longName>");
+        write_escaped_xml(&mut out, &part.name);
+        out.push_str("</longName>\n");
+        out.push_str("        <trackName>");
+        write_escaped_xml(&mut out, &part.name);
+        out.push_str("</trackName>\n");
         out.push_str("        <Channel>\n");
         out.push_str("          <program value=\"0\"/>\n");
         out.push_str("          <synti>Fluid</synti>\n");
@@ -1678,21 +1687,22 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
     let windows = score.measure_windows();
 
     for (i, part) in score.parts.iter().enumerate() {
-        out.push_str(&format!("    <Staff id=\"{}\">\n", i + 1));
+        let _ = writeln!(out, "    <Staff id=\"{}\">", i + 1);
         if i == 0 {
             out.push_str("      <VBox>\n");
             out.push_str("        <height>10</height>\n");
             out.push_str("        <Text>\n");
             out.push_str("          <style>title</style>\n");
-            out.push_str(&format!(
-                "          <text>{}</text>\n",
-                escape_xml(&score.title)
-            ));
+            out.push_str("          <text>");
+            write_escaped_xml(&mut out, &score.title);
+            out.push_str("</text>\n");
             out.push_str("          </Text>\n");
             if let Some(c) = &score.composer {
                 out.push_str("        <Text>\n");
                 out.push_str("          <style>composer</style>\n");
-                out.push_str(&format!("          <text>{}</text>\n", escape_xml(c)));
+                out.push_str("          <text>");
+                write_escaped_xml(&mut out, c);
+                out.push_str("</text>\n");
                 out.push_str("          </Text>\n");
             }
             out.push_str("        </VBox>\n");
@@ -1858,20 +1868,20 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                         };
                         let ct = mscx_clef_type(clef_s, clef_l, clef_oct);
                         out.push_str("          <Clef>\n");
-                        out.push_str(&format!(
-                            "            <concertClefType>{ct}</concertClefType>\n"
-                        ));
-                        out.push_str(&format!(
-                            "            <transposingClefType>{ct}</transposingClefType>\n"
-                        ));
+                        let _ =
+                            writeln!(out, "            <concertClefType>{ct}</concertClefType>");
+                        let _ = writeln!(
+                            out,
+                            "            <transposingClefType>{ct}</transposingClefType>"
+                        );
                         out.push_str("            <isHeader>1</isHeader>\n");
                         out.push_str("            </Clef>\n");
                         out.push_str("          <KeySig>\n");
-                        out.push_str(&format!("            <concertKey>{cur_key}</concertKey>\n"));
+                        let _ = writeln!(out, "            <concertKey>{cur_key}</concertKey>");
                         out.push_str("            </KeySig>\n");
                         out.push_str("          <TimeSig>\n");
-                        out.push_str(&format!("            <sigN>{}</sigN>\n", cur_sig.0));
-                        out.push_str(&format!("            <sigD>{}</sigD>\n", cur_sig.1));
+                        let _ = writeln!(out, "            <sigN>{}</sigN>", cur_sig.0);
+                        let _ = writeln!(out, "            <sigD>{}</sigD>", cur_sig.1);
                         out.push_str("            </TimeSig>\n");
                     } else if let Some(a) = attrs {
                         if a.clef_sign.is_some()
@@ -1884,47 +1894,45 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                                 a.clef_octave_change,
                             );
                             out.push_str("          <Clef>\n");
-                            out.push_str(&format!(
-                                "            <concertClefType>{ct}</concertClefType>\n"
-                            ));
-                            out.push_str(&format!(
-                                "            <transposingClefType>{ct}</transposingClefType>\n"
-                            ));
+                            let _ = writeln!(
+                                out,
+                                "            <concertClefType>{ct}</concertClefType>"
+                            );
+                            let _ = writeln!(
+                                out,
+                                "            <transposingClefType>{ct}</transposingClefType>"
+                            );
                             out.push_str("            </Clef>\n");
                         }
                         if a.key_fifths.is_some() {
                             out.push_str("          <KeySig>\n");
-                            out.push_str(&format!(
-                                "            <concertKey>{cur_key}</concertKey>\n"
-                            ));
+                            let _ = writeln!(out, "            <concertKey>{cur_key}</concertKey>");
                             out.push_str("            </KeySig>\n");
                         }
                         if a.time.is_some() {
                             out.push_str("          <TimeSig>\n");
-                            out.push_str(&format!("            <sigN>{}</sigN>\n", cur_sig.0));
-                            out.push_str(&format!("            <sigD>{}</sigD>\n", cur_sig.1));
+                            let _ = writeln!(out, "            <sigN>{}</sigN>", cur_sig.0);
+                            let _ = writeln!(out, "            <sigD>{}</sigD>", cur_sig.1);
                             out.push_str("            </TimeSig>\n");
                         }
                     }
 
                     if let Some(d) = attrs.and_then(|a| a.dynamic.as_deref()) {
-                        out.push_str("          <Dynamic>\n");
-                        out.push_str(&format!(
-                            "            <subtype>{}</subtype>\n",
-                            escape_xml(d)
-                        ));
-                        out.push_str("            </Dynamic>\n");
+                        out.push_str("          <Dynamic>\n            <subtype>");
+                        write_escaped_xml(&mut out, d);
+                        out.push_str("</subtype>\n            </Dynamic>\n");
                     }
                     if let Some(stops) = hp_stop_start.get(&m) {
                         for &(dm, df) in stops {
                             out.push_str("          <Spanner type=\"HairPin\">\n");
                             out.push_str("            <prev>\n");
-                            out.push_str(&mscx_location_xml(
+                            write_mscx_location_xml(
+                                &mut out,
                                 "              ",
                                 dm,
                                 df,
                                 score.divisions,
-                            ));
+                            );
                             out.push_str("              </prev>\n");
                             out.push_str("            </Spanner>\n");
                         }
@@ -1932,15 +1940,16 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                     if let Some(&(sub, dm, df)) = hp_start.get(&m) {
                         out.push_str("          <Spanner type=\"HairPin\">\n");
                         out.push_str("            <HairPin>\n");
-                        out.push_str(&format!("              <subtype>{sub}</subtype>\n"));
+                        let _ = writeln!(out, "              <subtype>{sub}</subtype>");
                         out.push_str("              </HairPin>\n");
                         out.push_str("            <next>\n");
-                        out.push_str(&mscx_location_xml(
+                        write_mscx_location_xml(
+                            &mut out,
                             "              ",
                             dm,
                             df,
                             score.divisions,
-                        ));
+                        );
                         out.push_str("              </next>\n");
                         out.push_str("            </Spanner>\n");
                     }
@@ -1965,18 +1974,18 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                         out.push_str("          <Rest>\n");
                         if items.len() == 1 && item.dur_ticks == mlen {
                             out.push_str("            <durationType>measure</durationType>\n");
-                            out.push_str(&format!(
-                                "            <duration>{}/{}</duration>\n",
+                            let _ = writeln!(
+                                out,
+                                "            <duration>{}/{}</duration>",
                                 cur_sig.0, cur_sig.1
-                            ));
+                            );
                         } else {
                             let (dtype, dots) = mscx_duration_type(item.dur_ticks, score.divisions);
                             if dots > 0 {
-                                out.push_str(&format!("            <dots>{dots}</dots>\n"));
+                                let _ = writeln!(out, "            <dots>{dots}</dots>");
                             }
-                            out.push_str(&format!(
-                                "            <durationType>{dtype}</durationType>\n"
-                            ));
+                            let _ =
+                                writeln!(out, "            <durationType>{dtype}</durationType>");
                         }
                         out.push_str("            </Rest>\n");
                         continue;
@@ -1985,28 +1994,27 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                     let (dtype, dots) = mscx_duration_type(item.dur_ticks, score.divisions);
                     out.push_str("          <Chord>\n");
                     if dots > 0 {
-                        out.push_str(&format!("            <dots>{dots}</dots>\n"));
+                        let _ = writeln!(out, "            <dots>{dots}</dots>");
                     }
-                    out.push_str(&format!(
-                        "            <durationType>{dtype}</durationType>\n"
-                    ));
+                    let _ = writeln!(out, "            <durationType>{dtype}</durationType>");
                     if item.grace {
                         out.push_str("            <appoggiatura/>\n");
                     }
                     if let Some(ly) = item.members.iter().find_map(|s| s.note.lyric.as_deref()) {
-                        out.push_str("            <Lyrics>\n");
-                        out.push_str(&format!("              <text>{}</text>\n", escape_xml(ly)));
-                        out.push_str("              </Lyrics>\n");
+                        out.push_str("            <Lyrics>\n              <text>");
+                        write_escaped_xml(&mut out, ly);
+                        out.push_str("</text>\n              </Lyrics>\n");
                     }
                     if let Some(&(dm, df)) = slur_prev.get(&(m, vi, ii)) {
                         out.push_str("            <Spanner type=\"Slur\">\n");
                         out.push_str("              <prev>\n");
-                        out.push_str(&mscx_location_xml(
+                        write_mscx_location_xml(
+                            &mut out,
                             "                ",
                             dm,
                             df,
                             score.divisions,
-                        ));
+                        );
                         out.push_str("                </prev>\n");
                         out.push_str("              </Spanner>\n");
                     }
@@ -2015,27 +2023,30 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                         out.push_str("              <Slur>\n");
                         out.push_str("                </Slur>\n");
                         out.push_str("              <next>\n");
-                        out.push_str(&mscx_location_xml(
+                        write_mscx_location_xml(
+                            &mut out,
                             "                ",
                             dm,
                             df,
                             score.divisions,
-                        ));
+                        );
                         out.push_str("                </next>\n");
                         out.push_str("              </Spanner>\n");
                     }
-                    let mut emitted_arts = Vec::new();
+                    let mut emitted_arts = 0u8;
                     for s in &item.members {
                         for a in &s.note.articulations {
-                            if let Some(sub) = mscx_articulation_subtype(a) {
-                                if !emitted_arts.contains(&sub) {
-                                    emitted_arts.push(sub);
-                                    out.push_str("            <Articulation>\n");
-                                    out.push_str(&format!(
-                                        "              <subtype>{sub}</subtype>\n"
-                                    ));
-                                    out.push_str("              </Articulation>\n");
-                                }
+                            let (bit, sub) = match a.as_str() {
+                                "stacc" => (1u8 << 0, "articStaccatoAbove"),
+                                "accent" => (1u8 << 1, "articAccentAbove"),
+                                "tenuto" => (1u8 << 2, "articTenutoAbove"),
+                                _ => continue,
+                            };
+                            if emitted_arts & bit == 0 {
+                                emitted_arts |= bit;
+                                out.push_str("            <Articulation>\n              <subtype>");
+                                out.push_str(sub);
+                                out.push_str("</subtype>\n              </Articulation>\n");
                             }
                         }
                     }
@@ -2044,12 +2055,13 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                         if let Some(&(dm, df)) = tie_prev.get(&(m, vi, ii, ni)) {
                             out.push_str("              <Spanner type=\"Tie\">\n");
                             out.push_str("                <prev>\n");
-                            out.push_str(&mscx_location_xml(
+                            write_mscx_location_xml(
+                                &mut out,
                                 "                  ",
                                 dm,
                                 df,
                                 score.divisions,
-                            ));
+                            );
                             out.push_str("                  </prev>\n");
                             out.push_str("                </Spanner>\n");
                         }
@@ -2058,20 +2070,22 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                             out.push_str("                <Tie>\n");
                             out.push_str("                  </Tie>\n");
                             out.push_str("                <next>\n");
-                            out.push_str(&mscx_location_xml(
+                            write_mscx_location_xml(
+                                &mut out,
                                 "                  ",
                                 dm,
                                 df,
                                 score.divisions,
-                            ));
+                            );
                             out.push_str("                  </next>\n");
                             out.push_str("                </Spanner>\n");
                         }
-                        out.push_str(&format!("              <pitch>{}</pitch>\n", s.note.midi));
-                        out.push_str(&format!(
-                            "              <tpc>{}</tpc>\n",
+                        let _ = writeln!(out, "              <pitch>{}</pitch>", s.note.midi);
+                        let _ = writeln!(
+                            out,
+                            "              <tpc>{}</tpc>",
                             tpc(s.note.step, s.note.alter)
-                        ));
+                        );
                         out.push_str("              </Note>\n");
                     }
                     out.push_str("            </Chord>\n");
@@ -2082,12 +2096,13 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                         for &(dm, df) in stops {
                             out.push_str("          <Spanner type=\"HairPin\">\n");
                             out.push_str("            <prev>\n");
-                            out.push_str(&mscx_location_xml(
+                            write_mscx_location_xml(
+                                &mut out,
                                 "              ",
                                 dm,
                                 df,
                                 score.divisions,
-                            ));
+                            );
                             out.push_str("              </prev>\n");
                             out.push_str("            </Spanner>\n");
                         }
@@ -2246,20 +2261,22 @@ pub fn ser_for_inputs(
 pub fn pack_mscz(score: &Score, mscx: &str) -> Result<Vec<u8>, String> {
     let stem = score_stem(&score.title);
     let mscx_name = format!("{stem}.mscx");
-    let mut buf = Cursor::new(Vec::new());
+    let mut buf = Cursor::new(Vec::with_capacity(mscx.len() / 4 + 512));
     {
         let mut zip = zip::ZipWriter::new(&mut buf);
-        let opts = zip::write::SimpleFileOptions::default()
+        let stored = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let deflated = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Deflated);
-        zip.start_file("META-INF/container.xml", opts)
+        zip.start_file("META-INF/container.xml", stored)
             .map_err(|e| format!("zip container.xml: {e}"))?;
         zip.write_all(container_xml(&mscx_name).as_bytes())
             .map_err(|e| format!("zip container.xml: {e}"))?;
-        zip.start_file(mscx_name, opts)
+        zip.start_file(mscx_name, deflated)
             .map_err(|e| format!("zip score: {e}"))?;
         zip.write_all(mscx.as_bytes())
             .map_err(|e| format!("zip score: {e}"))?;
-        zip.start_file("score_style.mss", opts)
+        zip.start_file("score_style.mss", stored)
             .map_err(|e| format!("zip score_style.mss: {e}"))?;
         zip.write_all(score_style_mss().as_bytes())
             .map_err(|e| format!("zip score_style.mss: {e}"))?;
@@ -2302,7 +2319,7 @@ fn read_bounded_utf8<R: Read>(
             "{name:?} exceeds maximum uncompressed size ({declared_size} > {max_bytes} bytes)"
         ));
     }
-    let mut buf = Vec::new();
+    let mut buf = Vec::with_capacity(declared_size.min(1024 * 1024) as usize);
     reader
         .take(max_bytes + 1)
         .read_to_end(&mut buf)
@@ -2320,11 +2337,7 @@ fn read_bounded_utf8<R: Read>(
 pub fn read_mscz(bytes: &[u8]) -> Result<MsczContents, String> {
     let mut zip =
         zip::ZipArchive::new(Cursor::new(bytes)).map_err(|e| format!("not a readable zip: {e}"))?;
-    let mut entries = Vec::with_capacity(zip.len());
-    for i in 0..zip.len() {
-        let f = zip.by_index(i).map_err(|e| format!("zip entry {i}: {e}"))?;
-        entries.push(f.name().to_string());
-    }
+    let entries: Vec<String> = zip.file_names().map(str::to_string).collect();
 
     let container = {
         let f = zip
@@ -2843,18 +2856,18 @@ pub fn validate_mscz(data: &[u8]) -> Vec<Issue> {
         } else {
             let mscx_target = rootfiles.iter().find(|p| p.ends_with(".mscx")).cloned();
             for rf in &rootfiles {
-                match zip.by_name(rf) {
-                    Err(_) => out.push(error(
+                if zip.index_for_name(rf).is_none() {
+                    out.push(error(
                         "mscz-score",
                         format!("container points at {rf:?} but it is not in the zip"),
-                    )),
-                    Ok(f) if rf.ends_with(".mss") => {
+                    ));
+                } else if rf.ends_with(".mss") {
+                    if let Ok(f) = zip.by_name(rf) {
                         let sz = f.size();
                         if let Err(e) = read_bounded_utf8(f, sz, rf, MAX_MSCZ_ENTRY_BYTES) {
                             out.push(error("mscz-style", e));
                         }
                     }
-                    Ok(_) => {}
                 }
             }
             match mscx_target {
@@ -2898,26 +2911,30 @@ pub fn validate_mscz(data: &[u8]) -> Vec<Issue> {
 
 /// Small two-bar example input (also used by the `example` CLI subcommand).
 pub fn example_input() -> ScoreInput {
-    serde_json::from_value(serde_json::json!({
-        "title": "Two-Voice Prelude",
-        "composer": "Example",
-        "divisions": 480,
-        "time": {"beats": 4, "beat_type": 4},
-        "key_fifths": 0,
-        "parts": [
-            {"name": "Piano", "notes": [
-                {"pitch": "C4", "onset": 0.0, "dur": 1.0},
-                {"pitch": "E4", "onset": 1.0, "dur": 1.0},
-                {"pitch": "G4", "onset": 2.0, "dur": 1.0},
-                {"pitch": "C5", "onset": 3.0, "dur": 1.0},
-                {"pitch": "G4", "onset": 4.0, "dur": 1.5},
-                {"pitch": "E4", "onset": 5.5, "dur": 0.5},
-                {"pitch": "D4", "onset": 6.0, "dur": 1.0},
-                {"pitch": "C4", "onset": 7.0, "dur": 1.0}
-            ]}
-        ]
-    }))
-    .expect("example input is valid")
+    ScoreInput {
+        title: Some("Two-Voice Prelude".to_string()),
+        composer: Some("Example".to_string()),
+        divisions: SCORE_DIVISIONS,
+        time: Some(TimeSig {
+            beats: 4,
+            beat_type: 4,
+        }),
+        key_fifths: 0,
+        parts: vec![PartInput {
+            name: "Piano".to_string(),
+            notes: vec![
+                NoteInput::note("C4", 0.0, 1.0),
+                NoteInput::note("E4", 1.0, 1.0),
+                NoteInput::note("G4", 2.0, 1.0),
+                NoteInput::note("C5", 3.0, 1.0),
+                NoteInput::note("G4", 4.0, 1.5),
+                NoteInput::note("E4", 5.5, 0.5),
+                NoteInput::note("D4", 6.0, 1.0),
+                NoteInput::note("C4", 7.0, 1.0),
+            ],
+        }],
+        ..Default::default()
+    }
 }
 
 #[cfg(test)]

@@ -147,6 +147,9 @@ fn take_tail_rest(toks: &[&str], i: &mut usize, mods: &mut NoteMods) {
 /// Mutable `measure_attrs` slot for one 1-based measure (created on
 /// first use; callers sort by measure at the end).
 fn attr_for(attrs: &mut Vec<MeasureAttr>, measure_1based: u32) -> &mut MeasureAttr {
+    if attrs.last().is_some_and(|a| a.measure == measure_1based) {
+        return attrs.last_mut().expect("just checked");
+    }
     if let Some(i) = attrs.iter().position(|a| a.measure == measure_1based) {
         return &mut attrs[i];
     }
@@ -443,10 +446,18 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             }
             bar_start += barlen;
             measure += 1;
-            voices = vec![0.0];
+            voices.clear();
+            voices.push(0.0);
             seg = 0;
-            last_onset = vec![None];
-            spans = vec![Vec::new()];
+            last_onset.clear();
+            last_onset.push(None);
+            for s in &mut spans {
+                s.clear();
+            }
+            spans.truncate(1);
+            if spans.is_empty() {
+                spans.push(Vec::new());
+            }
             grace_run = false;
             // Pending starts survive the bar: the encoder emits them
             // immediately before their member event, so a start is only

@@ -113,19 +113,6 @@ struct Doc {
     parts: Vec<DocPart>,
 }
 
-pub(crate) fn step_semitone(step: char) -> i32 {
-    match step {
-        'C' => 0,
-        'D' => 2,
-        'E' => 4,
-        'F' => 5,
-        'G' => 7,
-        'A' => 9,
-        'B' => 11,
-        _ => 0,
-    }
-}
-
 /// Text of the first `<tag ...>text</tag>` occurrence, trimmed.
 fn tag_text(s: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}");
@@ -1193,19 +1180,14 @@ pub fn split_measures(xml: &str, size: u32) -> Result<Vec<(u32, String)>, String
         let q = xml[rs..]
             .find('>')
             .ok_or("split_measures: bad score-partwise tag")?;
-        xml[rs..rs + q + 1].to_string()
+        &xml[rs..rs + q + 1]
     };
-    let part_list = block_inclusive(xml, "part-list")
-        .ok_or("split_measures: no part-list")?
-        .to_string();
-    let mut parts: Vec<(String, Vec<String>)> = Vec::new();
+    let part_list = block_inclusive(xml, "part-list").ok_or("split_measures: no part-list")?;
+    let mut parts: Vec<(&str, Vec<&str>)> = Vec::new();
     for part_xml in elements(xml, "part") {
         let q = part_xml.find('>').ok_or("split_measures: bad part tag")?;
-        let open = part_xml[..q + 1].to_string();
-        let meas: Vec<String> = elements(part_xml, "measure")
-            .into_iter()
-            .map(|m| m.to_string())
-            .collect();
+        let open = &part_xml[..q + 1];
+        let meas = elements(part_xml, "measure");
         if meas.is_empty() {
             continue;
         }
@@ -1215,27 +1197,26 @@ pub fn split_measures(xml: &str, size: u32) -> Result<Vec<(u32, String)>, String
         return Err("split_measures: no measures found".to_string());
     }
     let n = parts.iter().map(|(_, m)| m.len()).max().unwrap_or(0);
-    let mut out = Vec::new();
+    let mut carry: Vec<Option<&str>> = vec![None; parts.len()];
+    let mut out = Vec::with_capacity(n.div_ceil(size as usize));
     let mut idx = 0usize;
     while idx < n {
         let mut chunk = String::from("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
-        chunk.push_str(&root_open);
+        chunk.push_str(root_open);
         chunk.push('\n');
-        chunk.push_str(&part_list);
+        chunk.push_str(part_list);
         chunk.push('\n');
-        for (open, meas) in &parts {
+        for (pi, (open, meas)) in parts.iter().enumerate() {
             // Running header state: last <attributes> block strictly
-            // before this chunk; prepended when the chunk's first
-            // measure carries none of its own.
-            let mut carry: Option<String> = None;
-            for m in meas.iter().take(idx) {
-                if let Some(a) = attributes_block(m) {
-                    carry = Some(a);
-                }
-            }
+            // before this chunk; prepended when a measure in the chunk
+            // carries none of its own.
+            let chunk_carry = carry[pi];
             chunk.push_str(open);
-            for m in meas.iter().skip(idx).take(size as usize) {
-                chunk.push_str(&emit_measure(m, carry.as_deref()));
+            for &m in meas.iter().skip(idx).take(size as usize) {
+                chunk.push_str(&emit_measure(m, chunk_carry));
+                if let Some(a) = attributes_block(m) {
+                    carry[pi] = Some(a);
+                }
             }
             chunk.push_str("</part>");
         }
@@ -1256,10 +1237,10 @@ fn block_inclusive<'a>(s: &'a str, name: &str) -> Option<&'a str> {
 }
 
 /// Full `<attributes>...</attributes>` block of one measure body.
-fn attributes_block(meas: &str) -> Option<String> {
+fn attributes_block(meas: &str) -> Option<&str> {
     let s = meas.find("<attributes")?;
     let e = meas[s..].find("</attributes>")? + "</attributes>".len();
-    Some(meas[s..s + e].to_string())
+    Some(&meas[s..s + e])
 }
 
 /// Measure body closed and de-paginated for standalone rendering:
@@ -1363,7 +1344,7 @@ pub fn score_events(xml: &str) -> Result<Vec<ScoreEvent>, String> {
                             out.push(ScoreEvent {
                                 measure,
                                 onset: round3(onset as f64 / div),
-                                midi: (octave + 1) * 12 + step_semitone(step) + alter,
+                                midi: crate::pitch::pitch_to_midi(step, alter, octave),
                                 dur: round3(dur as f64 / div),
                                 staff: staff_base + local - 1,
                                 step,
@@ -1483,7 +1464,7 @@ pub fn notation_events(xml: &str) -> Result<Vec<NotationEvent>, String> {
                         part_staves = part_staves.max(local);
                         let (step, alter, octave, midi, rest) = match n.pitch {
                             Some((st, al, oc)) => {
-                                (st, al, oc, (oc + 1) * 12 + step_semitone(st) + al, false)
+                                (st, al, oc, crate::pitch::pitch_to_midi(st, al, oc), false)
                             }
                             None => ('R', 0, -1, -1, true),
                         };
@@ -1777,8 +1758,6 @@ fn parse_note(s: &str) -> NoteEv {
         let octave = tag_text(s, "octave")
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(4);
-        let _midi_check = (octave + 1) * 12 + step_semitone(step.to_ascii_uppercase()) + alter;
-        let _ = _midi_check;
         Some((step.to_ascii_uppercase(), alter, octave))
     };
     let tuplet_ratio = match (

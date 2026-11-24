@@ -28,7 +28,7 @@
 //! against each other and never scale. A no-ratio stop with no pending
 //! visual start on its key still fails closed (stray-stop).
 
-use super::musicxml_import::{step_semitone, BekernNote, StaffHeader};
+use super::musicxml_import::{BekernNote, StaffHeader};
 
 /// Open tuplet spans keyed by `(staff, voice)`: a stack of
 /// `((actual, normal), number)` so nested tuplets stay balanced.
@@ -45,37 +45,40 @@ type TupletSpans = std::collections::HashMap<(u32, u32), Vec<((u32, u32), u32)>>
 /// never snap: they fail closed as before.
 pub const DURATION_SNAP_BEATS: f64 = 0.005;
 
+/// Canonical bekern duration table sorted largest-first (beats, dot count).
+/// Shared by [`duration_token`] and [`emit_rest`].
+const DURATION_TABLE: &[(&str, f64, u8)] = &[
+    ("breve", 8.0, 0),
+    ("whole", 7.0, 2),
+    ("whole", 6.0, 1),
+    ("whole", 4.0, 0),
+    ("half", 3.5, 2),
+    ("half", 3.0, 1),
+    ("half", 2.0, 0),
+    ("quarter", 1.75, 2),
+    ("quarter", 1.5, 1),
+    ("quarter", 1.0, 0),
+    ("eighth", 0.875, 2),
+    ("eighth", 0.75, 1),
+    ("eighth", 0.5, 0),
+    ("16th", 0.4375, 2),
+    ("16th", 0.375, 1),
+    ("16th", 0.25, 0),
+    ("32nd", 0.21875, 2),
+    ("32nd", 0.1875, 1),
+    ("32nd", 0.125, 0),
+    ("64th", 0.09375, 1),
+    ("64th", 0.0625, 0),
+    ("128th", 0.03125, 0),
+];
+
 /// Map a beat duration to (type token, dot count): the nearest table
 /// entry within [`DURATION_SNAP_BEATS`]; anything farther (tuplets,
 /// genuinely un-notatable values) is `None`.
 pub fn duration_token(dur_beats: f64) -> Option<(&'static str, u8)> {
-    const TABLE: &[(&str, f64, u8)] = &[
-        ("128th", 0.03125, 0),
-        ("64th", 0.09375, 1),
-        ("64th", 0.0625, 0),
-        ("32nd", 0.125, 0),
-        ("16th", 0.25, 0),
-        ("eighth", 0.5, 0),
-        ("quarter", 1.0, 0),
-        ("half", 2.0, 0),
-        ("whole", 4.0, 0),
-        ("breve", 8.0, 0),
-        ("32nd", 0.1875, 1),
-        ("16th", 0.375, 1),
-        ("eighth", 0.75, 1),
-        ("quarter", 1.5, 1),
-        ("half", 3.0, 1),
-        ("whole", 6.0, 1),
-        ("32nd", 0.21875, 2),
-        ("16th", 0.4375, 2),
-        ("eighth", 0.875, 2),
-        ("quarter", 1.75, 2),
-        ("half", 3.5, 2),
-        ("whole", 7.0, 2),
-    ];
     let mut best: Option<(&'static str, u8)> = None;
     let mut best_dist = f64::INFINITY;
-    for (t, d, dots) in TABLE {
+    for (t, d, dots) in DURATION_TABLE {
         let dist = (d - dur_beats).abs();
         if dist < best_dist {
             best_dist = dist;
@@ -105,7 +108,7 @@ fn key_token(fifths: i32) -> String {
 }
 
 fn midi_of(step: char, octave: i32, alter: i32) -> i32 {
-    (octave + 1) * 12 + step_semitone(step) + alter
+    crate::pitch::pitch_to_midi(step, alter, octave)
 }
 
 /// Gaps at or below this (beats) are swallowed, not filled: onsets are
@@ -140,37 +143,13 @@ fn emit_rest(
     tol: f64,
     resid: Option<f64>,
 ) -> Result<(), String> {
-    const UNITS: &[(&str, f64, u8)] = &[
-        ("breve", 8.0, 0),
-        ("whole", 7.0, 2),
-        ("whole", 6.0, 1),
-        ("whole", 4.0, 0),
-        ("half", 3.5, 2),
-        ("half", 3.0, 1),
-        ("half", 2.0, 0),
-        ("quarter", 1.75, 2),
-        ("quarter", 1.5, 1),
-        ("quarter", 1.0, 0),
-        ("eighth", 0.875, 2),
-        ("eighth", 0.75, 1),
-        ("eighth", 0.5, 0),
-        ("16th", 0.4375, 2),
-        ("16th", 0.375, 1),
-        ("16th", 0.25, 0),
-        ("32nd", 0.21875, 2),
-        ("32nd", 0.1875, 1),
-        ("32nd", 0.125, 0),
-        ("64th", 0.09375, 1),
-        ("64th", 0.0625, 0),
-        ("128th", 0.03125, 0),
-    ];
     // Atomic: callers emit a wrapper bracket for the whole gap when
     // this fails, so a partial prefix here would double-fill decode's
     // cursor (e.g. half-dot + 16th + 64th, then a whole+quarter wrapper
     // covering the same gap again — observed as +150-tick shifts and
-    // cross-bar spills on triplet-grid late entries). Stage into a
-    // local buffer and commit only on full success.
-    let mut staged: Vec<String> = Vec::new();
+    // cross-bar spills on triplet-grid late entries). Record `mark` and
+    // truncate `out` on error to avoid staging into a separate Vec.
+    let mark = out.len();
     let mut rem = written;
     while rem > tol {
         // Match within the tolerance: quantum-rounded values land on
@@ -183,7 +162,8 @@ fn emit_rest(
         // gaps under nested brackets (ds0134: 0.498 vs an eighth under
         // a (3,2) wrapper). Decoded timing shifts stay within one
         // gap-space quantum either way.
-        let Some(&(typ, val, dots)) = UNITS.iter().find(|(_, v, _)| *v <= rem + tol) else {
+        let Some(&(typ, val, dots)) = DURATION_TABLE.iter().find(|(_, v, _)| *v <= rem + tol)
+        else {
             // Greedy is stuck with a sub-128th remainder (failure implies
             // `rem < 128th - tol`: anything larger would have matched the
             // 128th row). Inside a real tuplet span this is quantum dust
@@ -194,25 +174,24 @@ fn emit_rest(
                 let n = (rem / SIXTY_FOURTH).round();
                 if (n == 0.0 || n == 1.0) && (rem - n * SIXTY_FOURTH).abs() <= cap {
                     if n == 1.0 {
-                        staged.push("rest".to_string());
-                        staged.push("64th".to_string());
+                        out.push("rest".to_string());
+                        out.push("64th".to_string());
                     }
-                    out.extend(staged);
                     return Ok(());
                 }
             }
+            out.truncate(mark);
             return Err(format!(
                 "untypeable rest gap {written} at measure {measure}"
             ));
         };
-        staged.push("rest".to_string());
-        staged.push(typ.to_string());
+        out.push("rest".to_string());
+        out.push(typ.to_string());
         for _ in 0..dots {
-            staged.push("dot".to_string());
+            out.push("dot".to_string());
         }
         rem -= val;
     }
-    out.extend(staged);
     Ok(())
 }
 
@@ -260,7 +239,7 @@ pub fn to_bekern(
 ) -> Result<(Vec<String>, usize), String> {
     let mut heads: Vec<&StaffHeader> = headers.iter().collect();
     heads.sort_by_key(|h| h.staff);
-    let mut out = Vec::new();
+    let mut out = Vec::with_capacity(events.len() * 4 + heads.len() * 3 + 16);
     for h in &heads {
         out.push(clef_token(h.clef_sign, h.clef_line, h.clef_octave_change));
         out.push(key_token(h.key_fifths));
@@ -285,14 +264,10 @@ pub fn to_bekern(
         }
     }
     let cap_for = |m: u32| -> f64 {
-        let mut cap = initial_cap;
-        for (&cm, &sig) in sig_by_measure.iter() {
-            if cm > m {
-                break;
-            }
-            cap = sig;
-        }
-        cap
+        sig_by_measure
+            .range(..=m)
+            .next_back()
+            .map_or(initial_cap, |(_, &sig)| sig)
     };
     let mut evs: Vec<&BekernNote> = Vec::with_capacity(events.len());
     let mut graces = 0usize;

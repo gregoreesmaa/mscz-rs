@@ -21,6 +21,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+#[cfg(not(target_arch = "wasm32"))]
 use std::path::Path;
 
 /// One measure entry: confidence in `[0, 1]`, note count for ranking,
@@ -97,6 +98,7 @@ pub fn parse_lattice(text: &str) -> Result<LatticeDoc, String> {
 /// Read + validate a producer lattice file. Fails loud on any shape
 /// violation: confidence outside `[0, 1]`, non-finite bbox entries,
 /// anything but exactly 2 candidates, or duplicate measure ordinals.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn read_lattice(path: &Path) -> Result<LatticeDoc, String> {
     let text =
         std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;

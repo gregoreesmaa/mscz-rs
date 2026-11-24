@@ -679,7 +679,7 @@ fn cmd_bekern_decode(a: &BekernDecodeArgs) -> Result<(), Err> {
 }
 
 fn cmd_example(a: &ExampleArgs) -> Result<(), Err> {
-    let text = serde_json::to_string_pretty(&serde_json::to_value(example_input())?)?;
+    let text = serde_json::to_string_pretty(&example_input())?;
     write_file(&a.out, text.as_bytes())?;
     println!("wrote {}", a.out.display());
     Ok(())

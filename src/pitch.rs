@@ -131,27 +131,24 @@ pub fn parse_pitch(s: &str) -> Result<ParsedPitch, String> {
         return Err(format!("triple flat unsupported in pitch {s:?}"));
     }
 
-    // Octave: optional '-', then ASCII digits.
-    let mut dig = String::new();
-    let mut tail = rest;
-    if let Some(r) = tail.strip_prefix('-') {
-        dig.push('-');
-        tail = r;
-    } else if let Some(r) = tail.strip_prefix('+') {
-        tail = r;
-    }
-    while let Some(c) = tail.chars().next() {
-        if c.is_ascii_digit() {
-            dig.push(c);
-            tail = &tail[1..];
-        } else {
-            break;
-        }
-    }
-    if dig.is_empty() || dig == "-" {
+    // Octave: optional '-' or '+', then ASCII digits.
+    let (oct_src, neg) = if rest.starts_with('-') {
+        (rest, true)
+    } else if let Some(r) = rest.strip_prefix('+') {
+        (r, false)
+    } else {
+        (rest, false)
+    };
+    let digits_start = usize::from(neg);
+    let digits_len = oct_src.as_bytes()[digits_start..]
+        .iter()
+        .take_while(|b| b.is_ascii_digit())
+        .count();
+    if digits_len == 0 {
         return Err(format!("missing octave in pitch {s:?}"));
     }
-    let octave: i32 = dig
+    let (oct_str, tail) = oct_src.split_at(digits_start + digits_len);
+    let octave: i32 = oct_str
         .parse()
         .map_err(|_| format!("bad octave in pitch {s:?}"))?;
     if !(-1..=9).contains(&octave) {
