@@ -20,7 +20,8 @@ Pure-Rust, zero-GPL symbolic music notation library and CLI: JSON note lists, Mu
 | `src/main.rs` | Feature-gated (`cli`). Thin `clap` CLI exposing all 12 subcommands (`example`, `serialize`, `mscz`, `pack`, `validate`, `import`, `bekern`, `bekern-decode`, `bekern2musicxml`, `split`, `system-breaks`, `ser`). |
 | `examples/` | Runnable end-to-end examples: `01_compose_two_voice.rs`, `02_musicxml_to_mscz.rs`, `03_validate_and_inspect.rs`, `04_bekern_ml_roundtrip.rs` (`required-features = ["bekern"]`). |
 | `tests/fixtures/` | CC0 1.0 OpenScore Lieder MusicXML 3.1 fixtures (`ds0001.musicxml`, `ds0037.musicxml`, `ds0409.musicxml`) + `tests/integration_public_api.rs`. |
-| `.github/workflows/ci.yml` | Authoritative CI gate (formatting, tests, `--no-default-features`, doctests, clippy, rustdoc, `wasm32-unknown-unknown`). |
+| `.github/workflows/ci.yml` | Authoritative CI matrix (`ubuntu-latest`, `windows-latest`, `macos-latest`): formatting, Clippy, tests (`--all-features` & `--no-default-features`), rustdoc, and `wasm32-unknown-unknown`. |
+| `.github/workflows/release.yml` | Automated `crates.io` publish and GitHub Release pipeline triggered by `v*.*.*` tags (or manual `workflow_dispatch` dry-run). |
 
 ## Verification Commands
 
@@ -78,4 +79,13 @@ cargo check --target wasm32-unknown-unknown --no-default-features
 2. Run all 7 verification commands above and confirm zero warnings/errors.
 3. Verify `cargo publish --dry-run` (checks packaged file list, license files, README, and build from tarball).
 4. Spot-check generated `.mscz` archives in MuseScore 4 desktop when `.mscx` emission changed (zero repair dialogs).
-5. Tag `vX.Y.Z`, push to `main` + tag on GitHub, verify green CI, publish to `crates.io` (`cargo publish`), and create the GitHub Release from `CHANGELOG.md`.
+5. Tag `vX.Y.Z` and push to trigger automated publishing and GitHub Release creation (see below).
+
+## CI & Release Automation
+
+- **CI (`.github/workflows/ci.yml`):** Runs on every `push` and `pull_request` to `main` across `ubuntu-latest`, `windows-latest`, and `macos-latest` (`cargo fmt --all -- --check` on Ubuntu, `clippy` + `test` for both `--all-features` and `--no-default-features`, `RUSTDOCFLAGS="-D warnings" cargo doc --no-deps --all-features`, and `wasm32-unknown-unknown` check on Ubuntu).
+- **Release (`.github/workflows/release.yml`):** Configure the repository secret `CARGO_REGISTRY_TOKEN` (a `crates.io` API token) in GitHub Settings → Secrets and variables → Actions. To cut a release after bumping `Cargo.toml` and `CHANGELOG.md` on `main`:
+  ```bash
+  git tag vX.Y.Z && git push origin vX.Y.Z
+  ```
+  The workflow verifies `Cargo.toml` matches `vX.Y.Z`, re-runs the full clippy/test/doc suite, publishes to `crates.io`, and creates a GitHub Release with auto-generated notes. Manual `workflow_dispatch` runs default to `cargo publish --dry-run` (and skip upload gracefully if `CARGO_REGISTRY_TOKEN` is unset).

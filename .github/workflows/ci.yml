@@ -4,14 +4,19 @@ on:
   push:
     branches: [main]
   pull_request:
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
 
 jobs:
   check:
-    name: Test, Clippy & WASM Check
-    runs-on: ubuntu-latest
+    name: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -20,25 +25,26 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
-          targets: wasm32-unknown-unknown
+          targets: ${{ matrix.os == 'ubuntu-latest' && 'wasm32-unknown-unknown' || '' }}
 
       - name: Cache Cargo artifacts
         uses: Swatinem/rust-cache@v2
 
       - name: Check formatting
-        run: cargo fmt --check
+        if: matrix.os == 'ubuntu-latest'
+        run: cargo fmt --all -- --check
 
-      - name: Run tests (all targets, all features)
-        run: cargo test --all-targets --all-features
+      - name: Run Clippy (all targets, all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: Run Clippy (no default features)
+        run: cargo clippy --no-default-features -- -D warnings
+
+      - name: Run tests (all features)
+        run: cargo test --all-features
 
       - name: Run tests (no default features)
         run: cargo test --no-default-features
-
-      - name: Run doc tests
-        run: cargo test --doc
-
-      - name: Run Clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build docs (warnings denied)
         env:
@@ -46,4 +52,5 @@ jobs:
         run: cargo doc --no-deps --all-features
 
       - name: Check wasm32-unknown-unknown target
+        if: matrix.os == 'ubuntu-latest'
         run: cargo check --target wasm32-unknown-unknown --no-default-features
