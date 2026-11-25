@@ -65,6 +65,8 @@ pub mod decode;
 pub mod lattice;
 pub mod musicxml_import;
 pub mod pitch;
+#[cfg(feature = "wasm")]
+pub mod wasm;
 
 pub use builder::{PartBuilder, ScoreBuilder};
 

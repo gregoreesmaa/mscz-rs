@@ -18,6 +18,7 @@ default = ["cli", "bekern", "lattice"]
 cli = ["dep:clap", "dep:serde_json", "bekern", "lattice"]
 bekern = []
 lattice = ["dep:serde_json"]
+wasm = ["bekern"]
 
 [lib]
 name = "mscz"
