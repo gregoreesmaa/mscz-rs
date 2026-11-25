@@ -165,6 +165,7 @@ fn microtone_records_loss_table_entry() {
                 tie_start: false,
                 tie_stop: false,
             }],
+            ..Default::default()
         }],
         notes: Vec::new(),
         part_name: None,

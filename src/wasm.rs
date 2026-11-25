@@ -69,7 +69,7 @@ pub fn stitch_uni_bekern(raw: &str) -> String {
     }
 
     let mut out: Vec<&str> = Vec::new();
-    let mut active_clef: Option<&str> = None;
+    let mut active_clefs: Vec<&str> = Vec::new();
     let mut active_key: Option<&str> = None;
     let mut active_time: Option<&str> = None;
 
@@ -79,7 +79,7 @@ pub fn stitch_uni_bekern(raw: &str) -> String {
             while idx < sys.len() && is_header_token(sys[idx]) {
                 let tok = sys[idx];
                 if tok.starts_with("clef-") {
-                    active_clef = Some(tok);
+                    active_clefs.push(tok);
                 } else if tok.starts_with("key") {
                     active_key = Some(tok);
                 } else if tok.starts_with("time-") {
@@ -93,12 +93,19 @@ pub fn stitch_uni_bekern(raw: &str) -> String {
                 out.push("bar");
             }
             // Strip unchanged courtesy headers at the start of system 2+,
-            // but emit genuine mid-page clef/key/time changes.
+            // supporting multi-staff clef sequences while still emitting
+            // genuine mid-page clef/key/time changes.
+            let mut clef_pos = 0usize;
             while idx < sys.len() && is_header_token(sys[idx]) {
                 let tok = sys[idx];
                 let unchanged = if tok.starts_with("clef-") {
-                    let same = active_clef == Some(tok);
-                    active_clef = Some(tok);
+                    let same = active_clefs.get(clef_pos).copied() == Some(tok);
+                    if clef_pos < active_clefs.len() {
+                        active_clefs[clef_pos] = tok;
+                    } else {
+                        active_clefs.push(tok);
+                    }
+                    clef_pos += 1;
                     same
                 } else if tok.starts_with("key") {
                     let same = active_key == Some(tok);
@@ -121,8 +128,12 @@ pub fn stitch_uni_bekern(raw: &str) -> String {
         // Emit remaining tokens of this system, tracking mid-system header changes.
         while idx < sys.len() {
             let tok = sys[idx];
-            if tok.starts_with("clef-") {
-                active_clef = Some(tok);
+            if tok.starts_with("clef-") && active_clefs.len() <= 1 {
+                if active_clefs.is_empty() {
+                    active_clefs.push(tok);
+                } else {
+                    active_clefs[0] = tok;
+                }
             } else if tok.starts_with("key") {
                 active_key = Some(tok);
             } else if tok.starts_with("time-") {

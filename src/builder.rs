@@ -423,6 +423,7 @@ impl PartBuilder {
         PartInput {
             name: self.name,
             notes: self.notes,
+            ..Default::default()
         }
     }
 }

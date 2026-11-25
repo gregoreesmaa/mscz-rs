@@ -275,10 +275,12 @@ fn empty_score_and_empty_part_handling() {
             PartInput {
                 name: "Violin".into(),
                 notes: vec![],
+                ..Default::default()
             },
             PartInput {
                 name: "Cello".into(),
                 notes: vec![],
+                ..Default::default()
             },
         ],
         ..Default::default()
@@ -292,10 +294,12 @@ fn empty_score_and_empty_part_handling() {
             PartInput {
                 name: "Silent".into(),
                 notes: vec![],
+                ..Default::default()
             },
             PartInput {
                 name: "Piano".into(),
                 notes: vec![NoteInput::note("C4", 0.0, 4.0)],
+                ..Default::default()
             },
         ],
         ..Default::default()

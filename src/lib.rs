@@ -209,6 +209,12 @@ pub struct PartInput {
     pub name: String,
     #[serde(default)]
     pub notes: Vec<NoteInput>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clef_sign: Option<char>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clef_line: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clef_octave_change: Option<i32>,
 }
 
 impl Default for PartInput {
@@ -216,6 +222,9 @@ impl Default for PartInput {
         Self {
             name: default_part_name(),
             notes: Vec::new(),
+            clef_sign: None,
+            clef_line: None,
+            clef_octave_change: None,
         }
     }
 }
@@ -389,6 +398,9 @@ pub struct Part {
     pub groups: Vec<ChordGroup>,
     pub voices: Vec<u32>,
     pub end_ticks: i64,
+    pub clef_sign: Option<char>,
+    pub clef_line: Option<u32>,
+    pub clef_octave_change: Option<i32>,
 }
 
 /// Fully resolved score plus the loss table accumulated while building it.
@@ -657,6 +669,58 @@ pub fn quantize_duration(ticks: i64, divisions: u32) -> (&'static str, u8, i64) 
     best.unwrap_or(("64th", 0, d / 16))
 }
 
+/// Try to express a non-dyadic tick duration as a standard note type (+ dots)
+/// scaled by a common tuplet ratio `(actual_notes, normal_notes)`, i.e.
+/// `dur_ticks ~= base_ticks * normal_notes / actual_notes` (within +/- 1 tick).
+///
+/// Returns `Some((type_name, dots, base_ticks, actual_notes, normal_notes))`
+/// only when `quantize_duration(dur_ticks, divisions)` is not already exact.
+fn tuplet_duration(
+    dur_ticks: i64,
+    divisions: u32,
+) -> Option<(&'static str, u8, i64, u32, u32)> {
+    if dur_ticks <= 0 {
+        return None;
+    }
+    let (_, _, exact_shown) = quantize_duration(dur_ticks, divisions);
+    if exact_shown == dur_ticks {
+        return None;
+    }
+    const RATIOS: [(u32, u32); 8] = [
+        (3, 2),
+        (5, 4),
+        (5, 2),
+        (7, 4),
+        (7, 8),
+        (9, 8),
+        (3, 4),
+        (2, 3),
+    ];
+    for (actual, normal) in RATIOS {
+        let written_est = (dur_ticks * actual as i64 + normal as i64 / 2) / normal as i64;
+        let (name, dots, base_ticks) = quantize_duration(written_est, divisions);
+        let expected = (base_ticks * normal as i64 + actual as i64 / 2) / actual as i64;
+        if (expected - dur_ticks).abs() <= 1 {
+            return Some((name, dots, base_ticks, actual, normal));
+        }
+    }
+    None
+}
+
+/// Undotted base duration name and tick count for a MuseScore `<Tuplet><baseNote>`.
+fn undotted_base_note(base_ticks: i64, dots: u8, divisions: u32) -> (&'static str, i64) {
+    if dots == 0 {
+        let (name, _, val) = quantize_duration(base_ticks, divisions);
+        return (name, val);
+    }
+    // Strip dots: base_ticks = undotted * (2^(dots+1) - 1) / 2^dots
+    let num = (1i64 << (dots + 1)) - 1;
+    let den = 1i64 << dots;
+    let undotted = (base_ticks * den + num / 2) / num;
+    let (name, _, val) = quantize_duration(undotted, divisions);
+    (name, val)
+}
+
 // ---------------------------------------------------------------------------
 // Score assembly
 // ---------------------------------------------------------------------------
@@ -707,7 +771,8 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
         return Err(format!("unsupported beat_type {beat_type}"));
     }
 
-    let raw_parts: Vec<(String, &[NoteInput])> = if !input.parts.is_empty() {
+    type RawPart<'a> = (String, &'a [NoteInput], Option<char>, Option<u32>, Option<i32>);
+    let raw_parts: Vec<RawPart<'_>> = if !input.parts.is_empty() {
         input
             .parts
             .iter()
@@ -719,6 +784,9 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                         p.name.clone()
                     },
                     p.notes.as_slice(),
+                    p.clef_sign,
+                    p.clef_line,
+                    p.clef_octave_change,
                 )
             })
             .collect()
@@ -729,15 +797,18 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                 .clone()
                 .unwrap_or_else(|| "Part 1".to_string()),
             input.notes.as_slice(),
+            None,
+            None,
+            None,
         )]
     };
-    if raw_parts.iter().all(|(_, n)| n.is_empty()) {
+    if raw_parts.iter().all(|(_, n, _, _, _)| n.is_empty()) {
         return Err("score has no notes".to_string());
     }
 
     let mut losses = LossTable::default();
     let mut parts = Vec::new();
-    for (pname, notes) in &raw_parts {
+    for (pname, notes, clef_sign, clef_line, clef_octave_change) in &raw_parts {
         if notes.is_empty() {
             continue;
         }
@@ -942,6 +1013,9 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
             groups,
             voices,
             end_ticks,
+            clef_sign: *clef_sign,
+            clef_line: *clef_line,
+            clef_octave_change: *clef_octave_change,
         });
     }
 
@@ -1261,23 +1335,29 @@ fn push_note_xml(
         return;
     }
     // `<duration>` carries the exact tick count (timing is lossless).
-    // `<type>` is display-only: the nearest type+dots value is shown and
-    // any discrepancy is logged as display loss.
-    let (typename, dots, shown) = quantize_duration(seg.dur_ticks, divisions);
-    if shown != seg.dur_ticks {
-        losses.push(
-            "loss",
-            "note-type-approximated",
-            format!(
-                "{} ticks shown as {typename}{} ({} ticks)",
-                seg.dur_ticks,
-                ".".repeat(dots as usize),
-                shown
-            ),
-            Some(part_name.to_string()),
-            None,
-        );
-    }
+    // `<type>` uses exact tuplet written duration + `<time-modification>` when
+    // the duration matches a clean tuplet ratio; otherwise falls back to the
+    // nearest dyadic type+dots and logs display loss.
+    let tuplet_mod = tuplet_duration(seg.dur_ticks, divisions);
+    let (typename, dots) = if let Some((tn, td, _, _, _)) = tuplet_mod {
+        (tn, td)
+    } else {
+        let (tn, td, shown) = quantize_duration(seg.dur_ticks, divisions);
+        if shown != seg.dur_ticks {
+            losses.push(
+                "loss",
+                "note-type-approximated",
+                format!(
+                    "{} ticks shown as {tn}{} ({shown} ticks)",
+                    seg.dur_ticks,
+                    ".".repeat(td as usize),
+                ),
+                Some(part_name.to_string()),
+                None,
+            );
+        }
+        (tn, td)
+    };
     let dur = seg.dur_ticks;
     out.push_str("      <note>\n");
     if seg.chord {
@@ -1309,6 +1389,14 @@ fn push_note_xml(
         if let Some(acc) = accidental_name(seg.note.alter) {
             let _ = writeln!(out, "        <accidental>{acc}</accidental>");
         }
+    }
+    if let Some((_, _, _, actual, normal)) = tuplet_mod {
+        let _ = writeln!(
+            out,
+            "        <time-modification><actual-notes>{actual}</actual-notes><normal-notes>{normal}</normal-notes></time-modification>"
+        );
+    }
+    if !seg.note.rest {
         write_notations_xml(out, seg);
         if let Some(ly) = &seg.note.lyric {
             out.push_str("        <lyric><text>");
@@ -1476,13 +1564,17 @@ pub fn to_musicxml_version(
             let _ = writeln!(out, "    <measure number=\"{}\">", m + 1);
             let attrs = measure_attr(score, m as u32 + 1);
             if m == 0 {
-                let (clef_s, clef_l, clef_oct) = match attrs {
-                    Some(a) => (
-                        a.clef_sign.unwrap_or('G'),
-                        a.clef_line.unwrap_or(2),
-                        a.clef_octave_change,
-                    ),
-                    None => ('G', 2, None),
+                let (clef_s, clef_l, clef_oct) = if let Some(s) = part.clef_sign {
+                    (s, part.clef_line.unwrap_or(2), part.clef_octave_change)
+                } else {
+                    match attrs {
+                        Some(a) => (
+                            a.clef_sign.unwrap_or('G'),
+                            a.clef_line.unwrap_or(2),
+                            a.clef_octave_change,
+                        ),
+                        None => ('G', 2, None),
+                    }
                 };
                 let key = attrs.and_then(|a| a.key_fifths).unwrap_or(score.key_fifths);
                 let (beats, beat_type) = match attrs.and_then(|a| a.time) {
@@ -1909,18 +2001,24 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                 out.push_str("        <endRepeat>2</endRepeat>\n");
             }
 
-            for (vi, (_voice, items)) in voices.iter().enumerate() {
+            // MuseScore 4 enforces a hard maximum of 4 voices per Staff;
+            // emitting a 5th <voice> overflows its internal track array.
+            for (vi, (_voice, items)) in voices.iter().take(4).enumerate() {
                 out.push_str("        <voice>\n");
                 if vi == 0 {
                     // Opening or mid-stream Clef, KeySig, TimeSig belong inside voice 0.
                     if m == 0 {
-                        let (clef_s, clef_l, clef_oct) = match attrs {
-                            Some(a) => (
-                                a.clef_sign.unwrap_or('G'),
-                                a.clef_line.unwrap_or(2),
-                                a.clef_octave_change,
-                            ),
-                            None => ('G', 2, None),
+                        let (clef_s, clef_l, clef_oct) = if let Some(s) = part.clef_sign {
+                            (s, part.clef_line.unwrap_or(2), part.clef_octave_change)
+                        } else {
+                            match attrs {
+                                Some(a) => (
+                                    a.clef_sign.unwrap_or('G'),
+                                    a.clef_line.unwrap_or(2),
+                                    a.clef_octave_change,
+                                ),
+                                None => ('G', 2, None),
+                            }
                         };
                         let ct = mscx_clef_type(clef_s, clef_l, clef_oct);
                         out.push_str("          <Clef>\n");
@@ -2015,7 +2113,67 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                     }
                 }
 
+                // Track open <Tuplet> state: (actual, normal, written_acc, target_written).
+                let mut open_tuplet: Option<(u32, u32, i64, i64)> = None;
+
                 for (ii, item) in items.iter().enumerate() {
+                    let is_measure_rest =
+                        item.is_rest && !item.grace && items.len() == 1 && item.dur_ticks == mlen;
+                    let tup = if !item.grace && !is_measure_rest {
+                        tuplet_duration(item.dur_ticks, score.divisions)
+                    } else {
+                        None
+                    };
+
+                    if let Some((t_name, t_dots, t_base, actual, normal)) = tup {
+                        if let Some((oa, on, _, _)) = open_tuplet {
+                            if (oa, on) != (actual, normal) {
+                                out.push_str("          <endTuplet/>\n");
+                                open_tuplet = None;
+                            }
+                        }
+                        if open_tuplet.is_none() {
+                            // Look ahead across consecutive same-ratio items to pick the
+                            // undotted baseNote and total written span `actual * unit_base`.
+                            let (mut unit_name, mut unit_base) =
+                                undotted_base_note(t_base, t_dots, score.divisions);
+                            let mut acc = 0i64;
+                            for next_item in &items[ii..] {
+                                if next_item.grace {
+                                    continue;
+                                }
+                                let Some((_, nd, nb, na, nn)) =
+                                    tuplet_duration(next_item.dur_ticks, score.divisions)
+                                else {
+                                    break;
+                                };
+                                if (na, nn) != (actual, normal) {
+                                    break;
+                                }
+                                let (un, ub) = undotted_base_note(nb, nd, score.divisions);
+                                if ub < unit_base {
+                                    unit_base = ub;
+                                    unit_name = un;
+                                }
+                                acc += nb;
+                                if acc >= actual as i64 * unit_base {
+                                    break;
+                                }
+                            }
+                            let target_written = actual as i64 * unit_base;
+                            out.push_str("          <Tuplet>\n");
+                            let _ = writeln!(out, "            <normalNotes>{normal}</normalNotes>");
+                            let _ = writeln!(out, "            <actualNotes>{actual}</actualNotes>");
+                            let _ = writeln!(out, "            <baseNote>{unit_name}</baseNote>");
+                            out.push_str("            </Tuplet>\n");
+                            open_tuplet = Some((actual, normal, 0, target_written));
+                        }
+                        let _ = t_name;
+                    } else if !item.grace && open_tuplet.is_some() {
+                        out.push_str("          <endTuplet/>\n");
+                        open_tuplet = None;
+                    }
+
                     let has_fermata = item
                         .members
                         .iter()
@@ -2032,7 +2190,7 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                             continue;
                         }
                         out.push_str("          <Rest>\n");
-                        if items.len() == 1 && item.dur_ticks == mlen {
+                        if is_measure_rest {
                             out.push_str("            <durationType>measure</durationType>\n");
                             let _ = writeln!(
                                 out,
@@ -2040,7 +2198,11 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                                 cur_sig.0, cur_sig.1
                             );
                         } else {
-                            let (dtype, dots) = mscx_duration_type(item.dur_ticks, score.divisions);
+                            let (dtype, dots) = if let Some((tn, td, _, _, _)) = tup {
+                                (tn, td)
+                            } else {
+                                mscx_duration_type(item.dur_ticks, score.divisions)
+                            };
                             if dots > 0 {
                                 let _ = writeln!(out, "            <dots>{dots}</dots>");
                             }
@@ -2048,10 +2210,23 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                                 writeln!(out, "            <durationType>{dtype}</durationType>");
                         }
                         out.push_str("            </Rest>\n");
+                        if let (Some((_, _, t_base, _, _)), Some((_, _, acc, target))) =
+                            (tup, open_tuplet.as_mut())
+                        {
+                            *acc += t_base;
+                            if *acc >= *target {
+                                out.push_str("          <endTuplet/>\n");
+                                open_tuplet = None;
+                            }
+                        }
                         continue;
                     }
 
-                    let (dtype, dots) = mscx_duration_type(item.dur_ticks, score.divisions);
+                    let (dtype, dots) = if let Some((tn, td, _, _, _)) = tup {
+                        (tn, td)
+                    } else {
+                        mscx_duration_type(item.dur_ticks, score.divisions)
+                    };
                     out.push_str("          <Chord>\n");
                     if dots > 0 {
                         let _ = writeln!(out, "            <dots>{dots}</dots>");
@@ -2149,6 +2324,18 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                         out.push_str("              </Note>\n");
                     }
                     out.push_str("            </Chord>\n");
+                    if let (Some((_, _, t_base, _, _)), Some((_, _, acc, target))) =
+                        (tup, open_tuplet.as_mut())
+                    {
+                        *acc += t_base;
+                        if *acc >= *target {
+                            out.push_str("          <endTuplet/>\n");
+                            open_tuplet = None;
+                        }
+                    }
+                }
+                if open_tuplet.is_some() {
+                    out.push_str("          <endTuplet/>\n");
                 }
 
                 if vi == 0 {
@@ -2992,6 +3179,7 @@ pub fn example_input() -> ScoreInput {
                 NoteInput::note("D4", 6.0, 1.0),
                 NoteInput::note("C4", 7.0, 1.0),
             ],
+            ..Default::default()
         }],
         ..Default::default()
     }

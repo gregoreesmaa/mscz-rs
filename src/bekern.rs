@@ -120,7 +120,7 @@ fn is_header_tok(tok: &str) -> bool {
 /// carried-over header token(s) into Page `p`'s opening header before joining
 /// non-empty pages with `<sys>`.
 pub fn stitch_pages_bekern(pages: &[&str]) -> String {
-    let mut active_clef: Option<&str> = None;
+    let mut active_clefs: Vec<&str> = Vec::new();
     let mut active_key: Option<&str> = None;
     let mut active_time: Option<&str> = None;
     let mut stitched_pages: Vec<Vec<&str>> = Vec::with_capacity(pages.len());
@@ -140,13 +140,13 @@ pub fn stitch_pages_bekern(pages: &[&str]) -> String {
 
         // Count leading header tokens at the start of this page.
         let mut hdr_end = 0usize;
-        let mut has_clef = false;
+        let mut page_clefs: Vec<&str> = Vec::new();
         let mut has_key = false;
         let mut has_time = false;
         while hdr_end < toks.len() && is_header_tok(toks[hdr_end]) {
             let t = toks[hdr_end];
             if t.starts_with("clef-") {
-                has_clef = true;
+                page_clefs.push(t);
             } else if t.starts_with("key") {
                 has_key = true;
             } else if t.starts_with("time-") {
@@ -155,15 +155,13 @@ pub fn stitch_pages_bekern(pages: &[&str]) -> String {
             hdr_end += 1;
         }
 
-        let mut page_out: Vec<&str> = Vec::with_capacity(toks.len() + 3);
+        let mut page_out: Vec<&str> = Vec::with_capacity(toks.len() + active_clefs.len() + 3);
         if !stitched_pages.is_empty() {
             // Preserve Page p's own opening header tokens and inject any
-            // omitted carried-over clef/key/time from Page p-1 in canonical
+            // omitted carried-over clef(s)/key/time from Page p-1 in canonical
             // position at the end of the opening header (or before body).
-            if !has_clef {
-                if let Some(c) = active_clef {
-                    page_out.push(c);
-                }
+            if page_clefs.is_empty() {
+                page_out.extend_from_slice(&active_clefs);
             }
             page_out.extend_from_slice(&toks[..hdr_end]);
             if !has_key {
@@ -186,11 +184,18 @@ pub fn stitch_pages_bekern(pages: &[&str]) -> String {
             page_out.extend_from_slice(&toks);
         }
 
-        // Track active clef/key/time across the entire page so mid-page
-        // changes carry forward to Page p+1.
+        // Track active clefs/key/time across the page so mid-page changes
+        // carry forward to Page p+1.
+        if !page_clefs.is_empty() {
+            active_clefs = page_clefs;
+        }
         for &tok in &page_out {
-            if tok.starts_with("clef-") {
-                active_clef = Some(tok);
+            if tok.starts_with("clef-") && active_clefs.len() <= 1 {
+                if active_clefs.is_empty() {
+                    active_clefs.push(tok);
+                } else {
+                    active_clefs[0] = tok;
+                }
             } else if tok.starts_with("key") {
                 active_key = Some(tok);
             } else if tok.starts_with("time-") {
@@ -3161,13 +3166,29 @@ mod tests {
         // Verify tie link survived in unmerged decode and re-serialized XML.
         assert!(out_xml.contains(r#"<tie type="start"/>"#));
         assert!(out_xml.contains(r#"<tie type="stop"/>"#));
-        let voices_m1: std::collections::BTreeSet<u32> = dec_unmerged.parts[0]
-            .notes
+        // Multi-staff piano input (G-2 + F-4) decodes into 2 parts with exact clefs
+        // and 3 distinct (part, voice) streams in measure 1.
+        assert_eq!(dec_unmerged.parts.len(), 2);
+        assert_eq!(
+            (dec_unmerged.parts[0].clef_sign, dec_unmerged.parts[0].clef_line),
+            (Some('G'), Some(2))
+        );
+        assert_eq!(
+            (dec_unmerged.parts[1].clef_sign, dec_unmerged.parts[1].clef_line),
+            (Some('F'), Some(4))
+        );
+        let part_voices_m1: std::collections::BTreeSet<(usize, u32)> = dec_unmerged
+            .parts
             .iter()
-            .filter(|n| !n.rest && n.onset < 4.0)
-            .map(|n| n.voice)
+            .enumerate()
+            .flat_map(|(pi, p)| {
+                p.notes
+                    .iter()
+                    .filter(|n| !n.rest && n.onset < 4.0)
+                    .map(move |n| (pi, n.voice))
+            })
             .collect();
-        assert_eq!(voices_m1, [1, 2, 3].into_iter().collect());
+        assert_eq!(part_voices_m1.len(), 3);
     }
 
     #[test]

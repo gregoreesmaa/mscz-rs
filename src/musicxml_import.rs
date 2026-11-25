@@ -68,6 +68,7 @@ pub fn score_inputs_by_page(xml: &str) -> Result<Vec<PageScore>, String> {
                         .filter(|n| n.page == page)
                         .map(|n| n.note.clone())
                         .collect(),
+                    ..Default::default()
                 })
                 .collect();
             PageScore {

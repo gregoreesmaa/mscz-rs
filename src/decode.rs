@@ -221,8 +221,98 @@ fn barline_right_of(t: &str) -> Option<&'static str> {
 /// voice, pitch), which drops the superseded head). Stack order is
 /// push order (oldest first), so the end-of-stream flush and every
 /// fallback are deterministic.
-/// Open tie-chain state keyed by `(step, octave, alter)`.
-type PendingTies = std::collections::BTreeMap<(char, i32, i32), Vec<(usize, f64, f64, NoteMods)>>;
+/// Natural center MIDI pitch for a clef, used to partition `V > K` voice
+/// segments monotonically across `K` staves in multi-staff `bekern+` streams.
+fn clef_center_midi(sign: char, line: u32, oct: Option<i32>) -> f64 {
+    let base = match (sign, line) {
+        ('G', 1) => 74.0, // French violin
+        ('G', _) => 71.0, // Treble (B4)
+        ('C', 1) => 67.0, // Soprano (G4)
+        ('C', 2) => 64.0, // Mezzo-soprano (E4)
+        ('C', 3) => 60.0, // Alto (C4)
+        ('C', 4) => 57.0, // Tenor (A3)
+        ('C', 5) => 53.0, // Baritone C (F3)
+        ('F', 3) => 53.0, // Baritone F
+        ('F', 5) => 47.0, // Sub-bass
+        ('F', _) => 50.0, // Bass (D3)
+        _ => 64.0,
+    };
+    base + 12.0 * oct.unwrap_or(0) as f64
+}
+
+/// Monotonically map `0..v` voice segments in one measure onto `0..k` staves,
+/// returning `(staff_idx, local_voice_1based)` for each segment.
+///
+/// `to_bekern` orders `(staff, voice)` in strictly ascending staff order, so:
+/// - When `v <= k`, segment `s` maps 1-to-1 to staff `s`, local voice `1`.
+/// - When `v > k`, a small DP finds the minimum-cost monotonic contiguous
+///   partition of `0..v` into `k` non-empty staff blocks matching each staff's
+///   clef register, numbering local voices `1..=4` within each staff.
+fn assign_segments_to_staves(
+    seg_mean_midi: &[Option<f64>],
+    clefs: &[(char, u32, Option<i32>)],
+) -> Vec<(usize, u32)> {
+    let v = seg_mean_midi.len();
+    let k = clefs.len();
+    if v == 0 || k <= 1 {
+        return (0..v).map(|s| (0, s as u32 + 1)).collect();
+    }
+    if v <= k {
+        return (0..v).map(|s| (s, 1)).collect();
+    }
+
+    let centers: Vec<f64> = clefs
+        .iter()
+        .map(|&(sign, line, oct)| clef_center_midi(sign, line, oct))
+        .collect();
+
+    // dp[s][i] = min cost to partition segments 0..i across staves 0..s (1-indexed counts).
+    let inf = f64::INFINITY;
+    let mut dp = vec![vec![inf; v + 1]; k + 1];
+    let mut prev = vec![vec![0usize; v + 1]; k + 1];
+    dp[0][0] = 0.0;
+
+    for s in 1..=k {
+        let center = centers[s - 1];
+        for i in s..=(v - (k - s)) {
+            let mut seg_cost = 0.0;
+            for j in (s - 1..i).rev() {
+                if let Some(m) = seg_mean_midi[j] {
+                    seg_cost += (m - center).abs();
+                }
+                let block_len = i - j;
+                // Gentle preference for balanced voice counts & staying <= 4 voices/staff.
+                let over_cap = if block_len > 4 {
+                    (block_len - 4) as f64 * 500.0
+                } else {
+                    0.0
+                };
+                let balance = (block_len as f64 - 1.0) * 0.25;
+                let cand = dp[s - 1][j] + seg_cost + balance + over_cap;
+                if cand < dp[s][i] {
+                    dp[s][i] = cand;
+                    prev[s][i] = j;
+                }
+            }
+        }
+    }
+
+    let mut out = vec![(0usize, 1u32); v];
+    let mut cur = v;
+    for s in (1..=k).rev() {
+        let start = prev[s][cur];
+        for (offset, slot) in out[start..cur].iter_mut().enumerate() {
+            *slot = (s - 1, (offset + 1).min(4) as u32);
+        }
+        cur = start;
+    }
+    out
+}
+
+/// Open tie-chain state keyed by `(step, octave, alter)`:
+/// `(start_measure, seg, onset, dur_acc, mods)`.
+type PendingTies =
+    std::collections::BTreeMap<(char, i32, i32), Vec<(u32, usize, f64, f64, NoteMods)>>;
 
 #[allow(clippy::too_many_arguments)]
 fn tie_note(
@@ -232,18 +322,19 @@ fn tie_note(
     onset: f64,
     performed: f64,
     voice: u32,
+    measure: u32,
     seg: usize,
     tie_start: bool,
     tie_stop: bool,
     mods: &NoteMods,
-) -> Option<NoteInput> {
+) -> Option<(u32, NoteInput)> {
     if tie_stop {
         // Move the stack out so the merge below never holds a borrow
         // across a map mutation.
         let mut stack = pending.remove(&key).unwrap_or_default();
         let i = stack
             .iter()
-            .rposition(|(s, _, _, _)| *s == seg)
+            .rposition(|(_, s, _, _, _)| *s == seg)
             .or(if stack.len() == 1 {
                 Some(0)
             } else if stack.len() > 1 {
@@ -256,7 +347,7 @@ fn tie_note(
             });
         match i {
             Some(i) => {
-                let (_, o, acc, head_mods) = stack.remove(i);
+                let (sm, _, o, acc, head_mods) = stack.remove(i);
                 if !stack.is_empty() {
                     pending.insert(key, stack);
                 }
@@ -266,14 +357,14 @@ fn tie_note(
                     pending
                         .entry(key)
                         .or_default()
-                        .push((seg, o, total, merged));
+                        .push((sm, seg, o, total, merged));
                     return None;
                 }
-                return Some(mk_note(pitch, o, total, voice, &merged));
+                return Some((sm, mk_note(pitch, o, total, voice, &merged)));
             }
             None => {
                 debug_assert!(stack.is_empty());
-                return Some(mk_note(pitch, onset, performed, voice, mods));
+                return Some((measure, mk_note(pitch, onset, performed, voice, mods)));
             }
         }
     }
@@ -282,12 +373,12 @@ fn tie_note(
         // entry supersedes it (mirrors the oracle dropping the old
         // head); a start on a fresh segment opens a parallel chain.
         let mut stack = pending.remove(&key).unwrap_or_default();
-        stack.retain(|(s, _, _, _)| *s != seg);
-        stack.push((seg, onset, performed, mods.clone()));
+        stack.retain(|(_, s, _, _, _)| *s != seg);
+        stack.push((measure, seg, onset, performed, mods.clone()));
         pending.insert(key, stack);
         return None;
     }
-    Some(mk_note(pitch, onset, performed, voice, mods))
+    Some((measure, mk_note(pitch, onset, performed, voice, mods)))
 }
 
 /// Decode a bekern page to a single-part [`ScoreInput`], merging tie
@@ -329,12 +420,14 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         beat_type: 4,
     };
     let mut time_set = false;
+    let mut leading_clefs: Vec<(char, u32, Option<i32>)> = Vec::new();
     let mut leading_clef_oct: Option<(char, u32, i32)> = None;
     let mut i = 0;
     while i < toks.len() {
         let t = toks[i];
         if t.starts_with("clef-") {
             let (sign, line, oct) = parse_clef_token(t)?;
+            leading_clefs.push((sign, line, oct));
             if let Some(o) = oct {
                 if leading_clef_oct.is_none() {
                     leading_clef_oct = Some((sign, line, o));
@@ -368,7 +461,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         }
     }
 
-    let mut notes: Vec<NoteInput> = Vec::new();
+    let mut tagged_notes: Vec<(u32, NoteInput)> = Vec::new();
     let mut measure_attrs: Vec<MeasureAttr> = Vec::new();
     if let Some((sign, line, oct)) = leading_clef_oct {
         let a = attr_for(&mut measure_attrs, 1);
@@ -411,30 +504,35 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             .iter()
             .fold(1.0, |acc, &(a, n)| acc * n as f64 / a as f64)
     };
-    let push_rest = |notes: &mut Vec<NoteInput>,
+    let push_rest = |notes: &mut Vec<(u32, NoteInput)>,
+                     m: u32,
                      onset: f64,
                      dur: f64,
                      voice: u32,
                      mods: &NoteMods,
                      grace: bool| {
-        notes.push(NoteInput {
-            pitch: None,
-            rest: true,
-            onset,
-            dur,
-            voice,
-            lyric: None,
-            grace,
-            slur_start: mods.slur_start,
-            slur_stop: mods.slur_stop,
-            articulations: mods.articulations.clone(),
-            tie_start: false,
-            tie_stop: false,
-        });
+        notes.push((
+            m,
+            NoteInput {
+                pitch: None,
+                rest: true,
+                onset,
+                dur,
+                voice,
+                lyric: None,
+                grace,
+                slur_start: mods.slur_start,
+                slur_stop: mods.slur_stop,
+                articulations: mods.articulations.clone(),
+                tie_start: false,
+                tie_stop: false,
+            },
+        ));
     };
 
     let mut bar_start = 0.0f64;
-    let mut barlen = time.beats as f64 * 4.0 / time.beat_type.max(1) as f64;
+    let initial_barlen = time.beats as f64 * 4.0 / time.beat_type.max(1) as f64;
+    let mut barlen = initial_barlen;
     while i < toks.len() {
         let t = toks[i];
         if t == "bar" || barline_right_of(t).is_some() {
@@ -483,6 +581,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         if t.starts_with("clef-") {
             let (sign, line, oct) = parse_clef_token(t)?;
             if !seen_event && measure == 0 {
+                leading_clefs.push((sign, line, oct));
                 // Effectively leading: preserve octave-transposing clefs
                 // (8vb/8va) on measure 1; plain clefs keep default layout.
                 if let Some(o) = oct {
@@ -491,7 +590,10 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                     a.clef_line = Some(line);
                     a.clef_octave_change = Some(o);
                 }
-            } else {
+            } else if leading_clefs.len() <= 1 {
+                // Single-staff score: apply mid-stream clef change directly.
+                // (In multi-staff scores, a single mid-stream clef token belongs
+                // to one staff only, so we avoid clobbering all staves.)
                 let a = attr_for(&mut measure_attrs, measure + 1);
                 a.clef_sign = Some(sign);
                 a.clef_line = Some(line);
@@ -640,7 +742,8 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             // jump this voice to the bar end.
             let onset = bar_start + voices[seg];
             push_rest(
-                &mut notes,
+                &mut tagged_notes,
+                measure,
                 onset,
                 barlen,
                 seg as u32 + 1,
@@ -750,19 +853,20 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                 // Merged path drops grace (the reference adapter has
                 // none); the onset is still recorded for chord runs.
                 if !is_grace {
-                    if let Some(note) = tie_note(
+                    if let Some((sm, note)) = tie_note(
                         &mut pending_tie,
                         key,
                         pitch,
                         onset,
                         performed,
                         seg as u32 + 1,
+                        measure,
                         seg,
                         tie_start,
                         tie_stop,
                         &mods,
                     ) {
-                        notes.push(note);
+                        tagged_notes.push((sm, note));
                     }
                 }
             } else {
@@ -773,7 +877,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                     note.grace = true;
                     note.dur = dur_written;
                 }
-                notes.push(note);
+                tagged_notes.push((measure, note));
             }
             // Chord tones never advance the cursor.
         } else {
@@ -793,19 +897,20 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                     if is_grace {
                         last_onset[seg] = Some(onset);
                     } else {
-                        if let Some(note) = tie_note(
+                        if let Some((sm, note)) = tie_note(
                             &mut pending_tie,
                             key,
                             pitch,
                             onset,
                             performed,
                             seg as u32 + 1,
+                            measure,
                             seg,
                             tie_start,
                             tie_stop,
                             &mods,
                         ) {
-                            notes.push(note);
+                            tagged_notes.push((sm, note));
                         }
                         last_onset[seg] = Some(onset);
                     }
@@ -817,7 +922,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                         note.grace = true;
                         note.dur = dur_written;
                     }
-                    notes.push(note);
+                    tagged_notes.push((measure, note));
                     last_onset[seg] = Some(onset);
                 }
             } else if merge_ties && is_grace {
@@ -826,7 +931,8 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                 last_onset[seg] = Some(onset);
             } else {
                 push_rest(
-                    &mut notes,
+                    &mut tagged_notes,
+                    measure,
                     onset,
                     if is_grace { dur_written } else { performed },
                     seg as u32 + 1,
@@ -849,23 +955,100 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
     // each link's own voice (a hardcoded voice-1 flush used to shove
     // them into another voice's span and drop real notes on overlap).
     for ((s, o, a), stack) in pending_tie {
-        for (fseg, onset, acc, fmods) in stack {
+        for (sm, fseg, onset, acc, fmods) in stack {
             let pitch = format!("{s}{}{}", alter_suffix(a)?, o);
             let note = mk_note(pitch, onset, acc, fseg as u32 + 1, &fmods);
-            notes.push(note);
+            tagged_notes.push((sm, note));
         }
     }
     measure_attrs.sort_by_key(|a| a.measure);
+
+    let parts = if leading_clefs.len() <= 1 {
+        let (clef_sign, clef_line, clef_octave_change) = match leading_clefs.first() {
+            Some(&(s, l, o)) => (Some(s), Some(l), o),
+            None => (None, None, None),
+        };
+        vec![PartInput {
+            name: "decoded".to_string(),
+            notes: tagged_notes.into_iter().map(|(_, n)| n).collect(),
+            clef_sign,
+            clef_line,
+            clef_octave_change,
+        }]
+    } else {
+        let k = leading_clefs.len();
+        // Per-measure voice-segment pitch statistics for monotonic staff assignment.
+        let mut by_measure: std::collections::BTreeMap<u32, Vec<(f64, usize)>> =
+            std::collections::BTreeMap::new();
+        for (m, n) in &tagged_notes {
+            let seg_idx = n.voice.saturating_sub(1) as usize;
+            let entry = by_measure.entry(*m).or_default();
+            if entry.len() <= seg_idx {
+                entry.resize(seg_idx + 1, (0.0, 0));
+            }
+            if !n.rest {
+                if let Some(p_str) = n.pitch.as_deref() {
+                    if let Ok(parsed) = crate::pitch::parse_pitch(p_str) {
+                        let midi =
+                            crate::pitch::pitch_to_midi(parsed.step, parsed.alter, parsed.octave);
+                        entry[seg_idx].0 += midi as f64;
+                        entry[seg_idx].1 += 1;
+                    }
+                }
+            }
+        }
+        let mut measure_maps: std::collections::BTreeMap<u32, Vec<(usize, u32)>> =
+            std::collections::BTreeMap::new();
+        for (m, stats) in by_measure {
+            let means: Vec<Option<f64>> = stats
+                .into_iter()
+                .map(|(sum, cnt)| if cnt > 0 { Some(sum / cnt as f64) } else { None })
+                .collect();
+            measure_maps.insert(m, assign_segments_to_staves(&means, &leading_clefs));
+        }
+
+        let total_notes = tagged_notes.len();
+        let mut part_notes: Vec<Vec<NoteInput>> = vec![Vec::new(); k];
+        for (m, mut n) in tagged_notes {
+            let seg_idx = n.voice.saturating_sub(1) as usize;
+            let (staff_idx, local_voice) = measure_maps
+                .get(&m)
+                .and_then(|map| map.get(seg_idx).copied())
+                .unwrap_or((seg_idx.min(k - 1), 1));
+            n.voice = local_voice;
+            part_notes[staff_idx].push(n);
+        }
+
+        // Preserve all K staves even if one staff had zero events on this page.
+        if total_notes > 0 {
+            for pnotes in &mut part_notes {
+                if pnotes.is_empty() {
+                    pnotes.push(NoteInput::rest(0.0, initial_barlen.max(1.0)));
+                }
+            }
+        }
+
+        leading_clefs
+            .iter()
+            .zip(part_notes)
+            .enumerate()
+            .map(|(idx, (&(s, l, o), notes))| PartInput {
+                name: format!("Staff {}", idx + 1),
+                notes,
+                clef_sign: Some(s),
+                clef_line: Some(l),
+                clef_octave_change: o,
+            })
+            .collect()
+    };
+
     Ok(ScoreInput {
         title: None,
         composer: None,
         divisions: SCORE_DIVISIONS,
         time: Some(time),
         key_fifths,
-        parts: vec![PartInput {
-            name: "decoded".to_string(),
-            notes,
-        }],
+        parts,
         notes: Vec::new(),
         part_name: None,
         measure_attrs,
