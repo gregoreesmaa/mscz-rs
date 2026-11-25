@@ -1019,6 +1019,11 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
         });
     }
 
+    let mut measure_attrs = input.measure_attrs.clone();
+    if !measure_attrs.is_sorted_by_key(|a| a.measure) {
+        measure_attrs.sort_by_key(|a| a.measure);
+    }
+
     Ok((
         Score {
             title: input
@@ -1031,7 +1036,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
             beat_type,
             key_fifths: input.key_fifths,
             parts,
-            measure_attrs: input.measure_attrs.clone(),
+            measure_attrs,
         },
         losses,
     ))
@@ -1430,7 +1435,16 @@ fn write_clef_xml(out: &mut String, sign: char, line: u32, octave_change: Option
 
 /// Measure-scoped override for one 1-based measure number, if any (last-wins).
 fn measure_attr(score: &Score, measure: u32) -> Option<&MeasureAttr> {
-    score.measure_attrs.iter().rfind(|a| a.measure == measure)
+    let attrs = &score.measure_attrs;
+    if attrs.is_empty() {
+        return None;
+    }
+    let idx = attrs.partition_point(|a| a.measure <= measure);
+    if idx > 0 && attrs[idx - 1].measure == measure {
+        Some(&attrs[idx - 1])
+    } else {
+        None
+    }
 }
 
 /// Write `<direction>` carrying one measure-level dynamic mark.
@@ -2514,7 +2528,8 @@ pub fn pack_mscz(score: &Score, mscx: &str) -> Result<Vec<u8>, String> {
         let stored = zip::write::SimpleFileOptions::default()
             .compression_method(zip::CompressionMethod::Stored);
         let deflated = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Deflated);
+            .compression_method(zip::CompressionMethod::Deflated)
+            .compression_level(Some(1));
         zip.start_file("META-INF/container.xml", stored)
             .map_err(|e| format!("zip container.xml: {e}"))?;
         zip.write_all(container_xml(&mscx_name).as_bytes())

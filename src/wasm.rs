@@ -148,6 +148,40 @@ pub fn stitch_uni_bekern(raw: &str) -> String {
 }
 
 /// Compile a `bekern+` token string (single-system or `<sys>`-delimited
+/// full-page stream) directly into both native MuseScore 4 `.mscz` archive
+/// bytes and a MusicXML 3.1 document string while parsing [`Score`] only once.
+pub fn compile_bekern_to_mscz_and_musicxml(
+    bekern_text: &str,
+    title: Option<&str>,
+) -> Result<(Vec<u8>, String), String> {
+    let cleaned = stitch_uni_bekern(bekern_text);
+    if cleaned.is_empty() {
+        return Err("empty bekern token stream".to_string());
+    }
+    let mut decoded = decode::decode_bekern_unmerged(&cleaned)?;
+    if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
+        decoded.title = Some(t.to_string());
+    }
+    let (score, mut losses) = parse_score(&decoded)?;
+    let mscx = to_mscx(&score, &mut losses);
+    let mscz = pack_mscz(&score, &mscx)?;
+    let xml = to_musicxml(&score, &mut losses);
+    Ok((mscz, xml))
+}
+
+/// Validate `bekern+` syntax by running `stitch_uni_bekern`,
+/// `decode_bekern_unmerged`, and `parse_score` without XML or ZIP serialization.
+pub fn validate_bekern_syntax_str(bekern_text: &str) -> Result<(), String> {
+    let cleaned = stitch_uni_bekern(bekern_text);
+    if cleaned.is_empty() {
+        return Err("empty bekern token stream".to_string());
+    }
+    let decoded = decode::decode_bekern_unmerged(&cleaned)?;
+    let _ = parse_score(&decoded)?;
+    Ok(())
+}
+
+/// Compile a `bekern+` token string (single-system or `<sys>`-delimited
 /// full-page stream) directly into native MuseScore 4 `.mscz` archive bytes.
 pub fn compile_bekern_to_mscz(bekern_text: &str, title: Option<&str>) -> Result<Vec<u8>, String> {
     let cleaned = stitch_uni_bekern(bekern_text);
@@ -281,6 +315,78 @@ pub unsafe extern "C" fn bekern_to_musicxml(
     }
 }
 
+/// Convert UTF-8 `bekern+` text (and optional UTF-8 `title`) into BOTH `.mscz`
+/// and MusicXML 3.1 UTF-8 bytes in a single parse pass.
+///
+/// The result buffer is framed as:
+/// `[u32_le mscz_len][mscz bytes][musicxml utf8 bytes]`.
+/// Returns the total framed byte length on success, or `0` on error.
+///
+/// # Safety
+/// Input pointers must be valid for their respective byte lengths.
+#[no_mangle]
+pub unsafe extern "C" fn bekern_to_mscz_and_musicxml(
+    bekern_ptr: *const u8,
+    bekern_len: usize,
+    title_ptr: *const u8,
+    title_len: usize,
+) -> usize {
+    let bekern = match read_utf8_arg(bekern_ptr, bekern_len) {
+        Ok(s) => s,
+        Err(e) => return set_error(e),
+    };
+    let title = match read_utf8_arg(title_ptr, title_len) {
+        Ok(s) if !s.is_empty() => Some(s),
+        Ok(_) => None,
+        Err(e) => return set_error(e),
+    };
+    match compile_bekern_to_mscz_and_musicxml(bekern, title) {
+        Ok((mscz, xml)) => {
+            let mscz_len = match u32::try_from(mscz.len()) {
+                Ok(n) => n,
+                Err(_) => return set_error("mscz output exceeds u32 length".to_string()),
+            };
+            let xml_bytes = xml.into_bytes();
+            let mut framed = Vec::with_capacity(4 + mscz.len() + xml_bytes.len());
+            framed.extend_from_slice(&mscz_len.to_le_bytes());
+            framed.extend_from_slice(&mscz);
+            framed.extend_from_slice(&xml_bytes);
+            set_result(framed)
+        }
+        Err(e) => set_error(e),
+    }
+}
+
+/// Validate UTF-8 `bekern+` syntax without serializing `.mscx`/MusicXML/ZIP.
+/// Returns `1` on success, or `0` on error (inspect [`wasm_error_ptr`] /
+/// [`wasm_error_len`]).
+///
+/// # Safety
+/// `bekern_ptr` must be valid for `bekern_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn validate_bekern_syntax(
+    bekern_ptr: *const u8,
+    bekern_len: usize,
+) -> u32 {
+    let bekern = match read_utf8_arg(bekern_ptr, bekern_len) {
+        Ok(s) => s,
+        Err(e) => {
+            set_error(e);
+            return 0;
+        }
+    };
+    match validate_bekern_syntax_str(bekern) {
+        Ok(()) => {
+            LAST_ERROR.with(|e| e.borrow_mut().clear());
+            1
+        }
+        Err(e) => {
+            set_error(e);
+            0
+        }
+    }
+}
+
 /// Stitch newline-separated per-page `bekern+` streams into a single `<sys>`-joined
 /// multi-page `bekern+` stream with carried-over headers.
 /// Returns the output byte length on success, or `0` on error.
@@ -384,5 +490,45 @@ mod tests {
         );
         let mscz_bytes = compile_bekern_to_mscz(&stitched, Some("Two-Page Waltz")).unwrap();
         assert!(!has_errors(&validate_mscz(&mscz_bytes)));
+    }
+
+    #[test]
+    fn wasm_fused_bekern_to_mscz_and_musicxml_framing() {
+        let bekern = "clef-G-2 key-1 time-4-4 quarter C 4 quarter D 4 quarter E 4 quarter F 4 bar half G 4 half C 5 bar-light-heavy";
+        let title = "Fused Test";
+        let total_len = unsafe {
+            bekern_to_mscz_and_musicxml(bekern.as_ptr(), bekern.len(), title.as_ptr(), title.len())
+        };
+        assert!(total_len > 4);
+        let framed = unsafe {
+            slice::from_raw_parts(wasm_result_ptr(), wasm_result_len()).to_vec()
+        };
+        assert_eq!(framed.len(), total_len);
+        let mscz_len = u32::from_le_bytes([framed[0], framed[1], framed[2], framed[3]]) as usize;
+        assert!(mscz_len > 0 && 4 + mscz_len < framed.len());
+        let mscz_bytes = &framed[4..4 + mscz_len];
+        let xml = std::str::from_utf8(&framed[4 + mscz_len..]).unwrap();
+
+        assert!(!has_errors(&validate_mscz(mscz_bytes)));
+        assert!(!has_errors(&validate_musicxml(xml)));
+        assert_eq!(mscz_bytes, compile_bekern_to_mscz(bekern, Some(title)).unwrap());
+        assert_eq!(xml, compile_bekern_to_musicxml(bekern, Some(title)).unwrap());
+    }
+
+    #[test]
+    fn wasm_validate_bekern_syntax_accepts_valid_and_rejects_malformed() {
+        let valid = "clef-G-2 key+0 time-4-4 quarter C 4 half D 4 quarter E 4 bar-light-heavy";
+        let ok = unsafe { validate_bekern_syntax(valid.as_ptr(), valid.len()) };
+        assert_eq!(ok, 1);
+        assert_eq!(wasm_error_len(), 0);
+
+        let bad = "clef-G-2 key+0 time-4-4 F quarter C 4 bar";
+        let err = unsafe { validate_bekern_syntax(bad.as_ptr(), bad.len()) };
+        assert_eq!(err, 0);
+        let msg = unsafe {
+            let s = slice::from_raw_parts(wasm_error_ptr(), wasm_error_len());
+            std::str::from_utf8(s).unwrap().to_string()
+        };
+        assert!(msg.contains("unexpected token"), "got: {msg}");
     }
 }
