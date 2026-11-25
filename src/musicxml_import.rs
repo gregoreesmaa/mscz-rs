@@ -1750,12 +1750,14 @@ fn parse_note(s: &str) -> NoteEv {
         None
     } else {
         let step = tag_text(s, "step")
+            .or_else(|| tag_text(s, "display-step"))
             .and_then(|v| v.chars().next())
             .unwrap_or('C');
         let alter = tag_text(s, "alter")
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(0);
         let octave = tag_text(s, "octave")
+            .or_else(|| tag_text(s, "display-octave"))
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(4);
         Some((step.to_ascii_uppercase(), alter, octave))
@@ -2854,5 +2856,46 @@ mod tests {
             (notes[2].pitch.as_deref(), notes[2].onset),
             (Some("G4"), 3.0)
         );
+    }
+
+    #[test]
+    fn unpitched_percussion_preserves_display_step_and_octave() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list><score-part id="P1"><part-name>Drums</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>4</divisions>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>percussion</sign><line>2</line></clef>
+      </attributes>
+      <note>
+        <unpitched><display-step>F</display-step><display-octave>4</display-octave></unpitched>
+        <duration>4</duration><voice>1</voice><type>quarter</type>
+      </note>
+      <note>
+        <unpitched><display-step>G</display-step><display-octave>5</display-octave></unpitched>
+        <duration>4</duration><voice>1</voice><type>quarter</type>
+      </note>
+      <note>
+        <unpitched><display-step>E</display-step><display-octave>5</display-octave></unpitched>
+        <duration>8</duration><voice>1</voice><type>half</type>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let input = score_input_from_musicxml(xml).unwrap();
+        let pitches: Vec<&str> = input.parts[0]
+            .notes
+            .iter()
+            .filter_map(|n| n.pitch.as_deref())
+            .collect();
+        assert_eq!(pitches, vec!["F4", "G5", "E5"]);
+
+        let events = bekern_events(xml).unwrap();
+        assert_eq!(events[0].pitch, Some(('F', 4, 0)));
+        assert_eq!(events[1].pitch, Some(('G', 5, 0)));
+        assert_eq!(events[2].pitch, Some(('E', 5, 0)));
     }
 }

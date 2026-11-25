@@ -48,19 +48,27 @@ pub const DURATION_SNAP_BEATS: f64 = 0.005;
 /// Canonical bekern duration table sorted largest-first (beats, dot count).
 /// Shared by [`duration_token`] and [`emit_rest`].
 const DURATION_TABLE: &[(&str, f64, u8)] = &[
+    ("breve", 15.0, 3),
+    ("breve", 14.0, 2),
+    ("breve", 12.0, 1),
     ("breve", 8.0, 0),
+    ("whole", 7.5, 3),
     ("whole", 7.0, 2),
     ("whole", 6.0, 1),
     ("whole", 4.0, 0),
+    ("half", 3.75, 3),
     ("half", 3.5, 2),
     ("half", 3.0, 1),
     ("half", 2.0, 0),
+    ("quarter", 1.875, 3),
     ("quarter", 1.75, 2),
     ("quarter", 1.5, 1),
     ("quarter", 1.0, 0),
+    ("eighth", 0.9375, 3),
     ("eighth", 0.875, 2),
     ("eighth", 0.75, 1),
     ("eighth", 0.5, 0),
+    ("16th", 0.46875, 3),
     ("16th", 0.4375, 2),
     ("16th", 0.375, 1),
     ("16th", 0.25, 0),
@@ -92,11 +100,121 @@ pub fn duration_token(dur_beats: f64) -> Option<(&'static str, u8)> {
 }
 
 fn clef_token(sign: char, line: u32, octave_change: Option<i32>) -> String {
-    match (sign, line, octave_change) {
-        ('G', 2, Some(-1)) => "clef-G-2-8vb".to_string(),
-        ('G', 2, Some(1)) => "clef-G-2-8va".to_string(),
+    match octave_change {
+        Some(-1) => format!("clef-{sign}-{line}-8vb"),
+        Some(1) => format!("clef-{sign}-{line}-8va"),
         _ => format!("clef-{sign}-{line}"),
     }
+}
+
+fn is_header_tok(tok: &str) -> bool {
+    tok.starts_with("clef-") || tok.starts_with("key") || tok.starts_with("time-")
+}
+
+/// Stitch consecutive pages of `bekern+` into a single `<sys>`-joined stream.
+///
+/// Walks `pages` in order, strips `<bos>`/`<pad>` (stopping each page at
+/// `<eos>`), tracks active `clef-*`, `key*`, and `time-*` at the end of each
+/// page, and when Page `p` (for `p > 0`) omits `time-*` (or `clef-*`/`key*`)
+/// in its opening header — as is standard engraving on Page 2+ — injects the
+/// carried-over header token(s) into Page `p`'s opening header before joining
+/// non-empty pages with `<sys>`.
+pub fn stitch_pages_bekern(pages: &[&str]) -> String {
+    let mut active_clef: Option<&str> = None;
+    let mut active_key: Option<&str> = None;
+    let mut active_time: Option<&str> = None;
+    let mut stitched_pages: Vec<Vec<&str>> = Vec::with_capacity(pages.len());
+
+    for page in pages {
+        let mut toks: Vec<&str> = Vec::new();
+        for tok in page.split_whitespace() {
+            match tok {
+                "<bos>" | "<pad>" => continue,
+                "<eos>" => break,
+                _ => toks.push(tok),
+            }
+        }
+        if toks.is_empty() {
+            continue;
+        }
+
+        // Count leading header tokens at the start of this page.
+        let mut hdr_end = 0usize;
+        let mut has_clef = false;
+        let mut has_key = false;
+        let mut has_time = false;
+        while hdr_end < toks.len() && is_header_tok(toks[hdr_end]) {
+            let t = toks[hdr_end];
+            if t.starts_with("clef-") {
+                has_clef = true;
+            } else if t.starts_with("key") {
+                has_key = true;
+            } else if t.starts_with("time-") {
+                has_time = true;
+            }
+            hdr_end += 1;
+        }
+
+        let mut page_out: Vec<&str> = Vec::with_capacity(toks.len() + 3);
+        if !stitched_pages.is_empty() {
+            // Preserve Page p's own opening header tokens and inject any
+            // omitted carried-over clef/key/time from Page p-1 in canonical
+            // position at the end of the opening header (or before body).
+            if !has_clef {
+                if let Some(c) = active_clef {
+                    page_out.push(c);
+                }
+            }
+            page_out.extend_from_slice(&toks[..hdr_end]);
+            if !has_key {
+                if let Some(k) = active_key {
+                    // Insert before any explicit time-* if present, else at end.
+                    if let Some(pos) = page_out.iter().position(|t| t.starts_with("time-")) {
+                        page_out.insert(pos, k);
+                    } else {
+                        page_out.push(k);
+                    }
+                }
+            }
+            if !has_time {
+                if let Some(t) = active_time {
+                    page_out.push(t);
+                }
+            }
+            page_out.extend_from_slice(&toks[hdr_end..]);
+        } else {
+            page_out.extend_from_slice(&toks);
+        }
+
+        // Track active clef/key/time across the entire page so mid-page
+        // changes carry forward to Page p+1.
+        for &tok in &page_out {
+            if tok.starts_with("clef-") {
+                active_clef = Some(tok);
+            } else if tok.starts_with("key") {
+                active_key = Some(tok);
+            } else if tok.starts_with("time-") {
+                active_time = Some(tok);
+            }
+        }
+
+        stitched_pages.push(page_out);
+    }
+
+    if stitched_pages.is_empty() {
+        return String::new();
+    }
+
+    let total_toks: usize =
+        stitched_pages.iter().map(Vec::len).sum::<usize>() + stitched_pages.len() - 1;
+    let mut joined: Vec<&str> = Vec::with_capacity(total_toks);
+    for (idx, p) in stitched_pages.iter().enumerate() {
+        if idx > 0 {
+            joined.push("<sys>");
+        }
+        joined.extend_from_slice(p);
+    }
+    joined.join(" ")
 }
 
 fn key_token(fifths: i32) -> String {
@@ -3120,5 +3238,95 @@ mod tests {
             .filter_map(|n| n.pitch.as_deref())
             .collect();
         assert_eq!(pitches, vec!["F3", "C6"]);
+    }
+
+    #[test]
+    fn octave_clef_8vb_and_8va_emit_for_bass_and_c_clefs() {
+        assert_eq!(super::clef_token('F', 4, Some(-1)), "clef-F-4-8vb");
+        assert_eq!(super::clef_token('F', 4, Some(1)), "clef-F-4-8va");
+        assert_eq!(super::clef_token('G', 2, Some(-1)), "clef-G-2-8vb");
+        assert_eq!(super::clef_token('G', 2, Some(1)), "clef-G-2-8va");
+        assert_eq!(super::clef_token('C', 3, Some(-1)), "clef-C-3-8vb");
+        assert_eq!(super::clef_token('F', 4, None), "clef-F-4");
+
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list><score-part id="P1"><part-name>Contrabass</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>4</divisions>
+        <key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>F</sign><line>4</line><clef-octave-change>-1</clef-octave-change></clef>
+      </attributes>
+      <note><pitch><step>E</step><octave>1</octave></pitch><duration>16</duration><voice>1</voice><type>whole</type></note>
+    </measure>
+    <measure number="2">
+      <attributes>
+        <clef><sign>F</sign><line>4</line><clef-octave-change>1</clef-octave-change></clef>
+      </attributes>
+      <note><pitch><step>E</step><octave>4</octave></pitch><duration>16</duration><voice>1</voice><type>whole</type></note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let headers = super::super::musicxml_import::staff_headers(xml).unwrap();
+        let events = super::super::musicxml_import::bekern_events(xml).unwrap();
+        let (toks, _) = to_bekern(&events, &headers).unwrap();
+        assert_eq!(toks[0], "clef-F-4-8vb");
+        assert!(toks.contains(&"clef-F-4-8va".to_string()));
+
+        let dec = super::super::decode::decode_bekern_unmerged(&toks.join(" ")).unwrap();
+        let (score, mut losses) = super::super::parse_score(&dec).unwrap();
+        let out_xml = super::super::to_musicxml(&score, &mut losses);
+        assert!(out_xml.contains("<clef><sign>F</sign><line>4</line><clef-octave-change>-1</clef-octave-change></clef>"));
+        assert!(out_xml.contains("<clef><sign>F</sign><line>4</line><clef-octave-change>1</clef-octave-change></clef>"));
+        let mscx = super::super::to_mscx(&score, &mut losses);
+        assert!(mscx.contains("<concertClefType>F8vb</concertClefType>"));
+        assert!(mscx.contains("<concertClefType>F8va</concertClefType>"));
+    }
+
+    #[test]
+    fn duration_table_covers_triple_dots_and_dotted_breve() {
+        assert_eq!(duration_token(15.0), Some(("breve", 3)));
+        assert_eq!(duration_token(14.0), Some(("breve", 2)));
+        assert_eq!(duration_token(12.0), Some(("breve", 1)));
+        assert_eq!(duration_token(7.5), Some(("whole", 3)));
+        assert_eq!(duration_token(3.75), Some(("half", 3)));
+        assert_eq!(duration_token(1.875), Some(("quarter", 3)));
+        assert_eq!(duration_token(0.9375), Some(("eighth", 3)));
+        assert_eq!(duration_token(0.46875), Some(("16th", 3)));
+        // Round-trip through decode_bekern_unmerged + quantize_duration
+        let stream = "clef-G-2 key+0 time-4-4 quarter C 4 dot dot dot 32nd D 4 half E 4 bar";
+        let dec = super::super::decode::decode_bekern_unmerged(stream).unwrap();
+        let (score, mut losses) = super::super::parse_score(&dec).unwrap();
+        let xml = super::super::to_musicxml(&score, &mut losses);
+        assert_eq!(xml.matches("<dot/>").count(), 3);
+        let (t, dots, ticks) = super::super::quantize_duration(5760, 480);
+        assert_eq!((t, dots, ticks), ("breve", 1, 5760));
+    }
+
+    #[test]
+    fn stitch_pages_bekern_carries_over_omitted_time_and_midpage_changes() {
+        let page1 = "<bos> clef-G-2 key+1 time-3-4 quarter G 4 half A 4 bar time-6-8 quarter B 4 dot quarter C 5 dot bar <eos>";
+        // Standard engraving on Page 2: repeats clef + key, omits time-*
+        let page2 = "<bos> clef-G-2 key+1 quarter D 5 dot quarter E 5 dot bar <eos>";
+        // Page 3 has an explicit meter change to 2/4: must NOT inject 6/8
+        let page3 = "<bos> clef-G-2 key+1 time-2-4 quarter F 5 quarter G 5 bar-light-heavy <eos>";
+        let stitched = super::stitch_pages_bekern(&[page1, page2, page3]);
+        assert_eq!(
+            stitched,
+            concat!(
+                "clef-G-2 key+1 time-3-4 quarter G 4 half A 4 bar time-6-8 quarter B 4 dot quarter C 5 dot bar ",
+                "<sys> ",
+                "clef-G-2 key+1 time-6-8 quarter D 5 dot quarter E 5 dot bar ",
+                "<sys> ",
+                "clef-G-2 key+1 time-2-4 quarter F 5 quarter G 5 bar-light-heavy"
+            )
+        );
+        // Empty pages are ignored cleanly; missing clef/key/time all carry forward.
+        let bare_p2 = "quarter A 4 quarter B 4 bar";
+        let stitched2 = super::stitch_pages_bekern(&["   ", page1, "", bare_p2]);
+        assert!(stitched2.ends_with("<sys> clef-G-2 key+1 time-6-8 quarter A 4 quarter B 4 bar"));
     }
 }

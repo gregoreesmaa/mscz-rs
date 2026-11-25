@@ -540,7 +540,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         if let Some(short) = t.strip_prefix("dyn-") {
             match short {
                 "pp" | "p" | "mp" | "mf" | "f" | "ff" | "sfz" => {
-                    attr_for(&mut measure_attrs, measure + 1).dynamic = Some(short.to_string());
+                    attr_for(&mut measure_attrs, measure + 1).push_dynamic(short);
                 }
                 _ => return Err(format!("unexpected token {t:?} in measure {measure}")),
             }
@@ -550,13 +550,13 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         if let Some(short) = t.strip_prefix("hairpin-") {
             match short {
                 "cresc-start" => {
-                    attr_for(&mut measure_attrs, measure + 1).hairpin = Some("cresc".to_string())
+                    attr_for(&mut measure_attrs, measure + 1).push_hairpin("cresc")
                 }
                 "dim-start" => {
-                    attr_for(&mut measure_attrs, measure + 1).hairpin = Some("dim".to_string())
+                    attr_for(&mut measure_attrs, measure + 1).push_hairpin("dim")
                 }
                 "stop" => {
-                    attr_for(&mut measure_attrs, measure + 1).hairpin = Some("stop".to_string())
+                    attr_for(&mut measure_attrs, measure + 1).push_hairpin("stop")
                 }
                 _ => return Err(format!("unexpected token {t:?} in measure {measure}")),
             }
@@ -2094,5 +2094,41 @@ mod tests {
             issues.iter().all(|i| i.severity != "error"),
             "validates cleanly: {issues:?}"
         );
+    }
+
+    #[test]
+    fn multiple_dynamics_and_hairpins_in_same_measure_do_not_overwrite() {
+        use super::super::{has_errors, pack_mscz, parse_score, to_mscx, to_musicxml, validate_mscz, validate_musicxml};
+        use super::decode_bekern_unmerged;
+
+        let stream = concat!(
+            "clef-G-2 key+0 time-4-4 ",
+            "dyn-p hairpin-cresc-start voice-1 quarter C 4 quarter D 4 ",
+            "dyn-f hairpin-stop quarter E 4 quarter F 4 bar ",
+            "dyn-mf hairpin-dim-start voice-1 half G 4 half A 4 bar ",
+            "hairpin-stop dyn-pp voice-1 whole C 4 bar-light-heavy"
+        );
+        let dec = decode_bekern_unmerged(stream).unwrap();
+        let m1 = dec.measure_attrs.iter().find(|a| a.measure == 1).unwrap();
+        assert_eq!(m1.dynamic.as_deref(), Some("p"));
+        assert_eq!(m1.all_dynamics(), vec!["p", "f"]);
+        assert_eq!(m1.hairpin.as_deref(), Some("cresc"));
+        assert_eq!(m1.all_hairpins(), vec!["cresc", "stop"]);
+
+        let (score, mut losses) = parse_score(&dec).unwrap();
+        let xml = to_musicxml(&score, &mut losses);
+        assert!(!has_errors(&validate_musicxml(&xml)));
+        assert!(xml.contains("<dynamics><p/></dynamics>"));
+        assert!(xml.contains("<dynamics><f/></dynamics>"));
+        assert!(xml.contains("<wedge type=\"crescendo\"/>"));
+        assert!(xml.contains("<wedge type=\"stop\"/>"));
+
+        let mscx = to_mscx(&score, &mut losses);
+        assert!(mscx.contains("<subtype>p</subtype>"));
+        assert!(mscx.contains("<subtype>f</subtype>"));
+        // Both same-measure cresc (m1) and cross-measure dim (m2->m3) hairpins emit cleanly.
+        assert!(mscx.matches("<Spanner type=\"HairPin\">").count() >= 4);
+        let mscz_bytes = pack_mscz(&score, &mscx).unwrap();
+        assert!(!has_errors(&validate_mscz(&mscz_bytes)));
     }
 }

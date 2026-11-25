@@ -246,12 +246,61 @@ pub struct MeasureAttr {
     pub time: Option<TimeSig>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dynamic: Option<String>,
+    /// Additional dynamics in order when a measure contains more than one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dynamics: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hairpin: Option<String>,
+    /// Additional hairpin events in order when a measure contains more than one
+    /// (e.g. `cresc` followed by `stop` in the same measure).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hairpins: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub barline_left: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub barline_right: Option<String>,
+}
+
+impl MeasureAttr {
+    /// Append a dynamic mark without overwriting an earlier dynamic in the same measure.
+    pub fn push_dynamic(&mut self, dyn_name: impl Into<String>) {
+        let d = dyn_name.into();
+        if self.dynamic.is_none() {
+            self.dynamic = Some(d);
+        } else {
+            self.dynamics.push(d);
+        }
+    }
+
+    /// All dynamic marks in this measure in order (`dynamic` followed by `dynamics`).
+    pub fn all_dynamics(&self) -> Vec<&str> {
+        let mut out = Vec::with_capacity(usize::from(self.dynamic.is_some()) + self.dynamics.len());
+        if let Some(d) = self.dynamic.as_deref() {
+            out.push(d);
+        }
+        out.extend(self.dynamics.iter().map(String::as_str));
+        out
+    }
+
+    /// Append a hairpin event without overwriting an earlier hairpin in the same measure.
+    pub fn push_hairpin(&mut self, hp: impl Into<String>) {
+        let h = hp.into();
+        if self.hairpin.is_none() {
+            self.hairpin = Some(h);
+        } else {
+            self.hairpins.push(h);
+        }
+    }
+
+    /// All hairpin events in this measure in order (`hairpin` followed by `hairpins`).
+    pub fn all_hairpins(&self) -> Vec<&str> {
+        let mut out = Vec::with_capacity(usize::from(self.hairpin.is_some()) + self.hairpins.len());
+        if let Some(h) = self.hairpin.as_deref() {
+            out.push(h);
+        }
+        out.extend(self.hairpins.iter().map(String::as_str));
+        out
+    }
 }
 
 /// Top-level JSON document. Either `parts` or the flat `notes` shorthand
@@ -560,7 +609,8 @@ fn parse_pitch(s: &str) -> Result<(char, i32, i32, i32, Option<i32>), String> {
 /// written exactly and is skipped, so quantisation records real loss.
 pub fn quantize_duration(ticks: i64, divisions: u32) -> (&'static str, u8, i64) {
     // (type name, divisor of divisions for one base unit; negative = multiply)
-    const BASES: [(&str, i64); 7] = [
+    const BASES: [(&str, i64); 8] = [
+        ("breve", -8),
         ("whole", -4),
         ("half", -2),
         ("quarter", 1),
@@ -1478,11 +1528,13 @@ pub fn to_musicxml_version(
             if let Some(b) = attrs.and_then(|a| a.barline_left.as_deref()) {
                 write_barline_xml(&mut out, false, b);
             }
-            if let Some(d) = attrs.and_then(|a| a.dynamic.as_deref()) {
-                write_dyn_direction_xml(&mut out, d);
-            }
-            if let Some(h) = attrs.and_then(|a| a.hairpin.as_deref()) {
-                write_hairpin_direction_xml(&mut out, h);
+            if let Some(a) = attrs {
+                for d in a.all_dynamics() {
+                    write_dyn_direction_xml(&mut out, d);
+                }
+                for h in a.all_hairpins() {
+                    write_hairpin_direction_xml(&mut out, h);
+                }
             }
             for (vi, (_voice, segs)) in voices.iter().enumerate() {
                 if vi > 0 {
@@ -1776,40 +1828,42 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
         }
 
         // Pair measure-scoped hairpins across measures (on voice 0).
-        // hp_start: measure_idx -> (subtype: 0=cresc|1=dim, dm, df_ticks)
+        // hp_start: measure_idx -> Vec<(subtype: 0=cresc|1=dim, dm, df_ticks)>
         // hp_stop_start: measure_idx -> Vec<(dm, df_ticks)> (closed at start of measure)
         // hp_stop_end: measure_idx -> Vec<(dm, df_ticks)> (closed at end of measure)
-        let mut hp_start: BTreeMap<usize, (u8, i64, i64)> = BTreeMap::new();
+        let mut hp_start: BTreeMap<usize, Vec<(u8, i64, i64)>> = BTreeMap::new();
         let mut hp_stop_start: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
         let mut hp_stop_end: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
         let mut open_hp: Option<(usize, u8)> = None;
         for m in 0..n_measures {
-            if let Some(h) = measure_attr(score, m as u32 + 1).and_then(|a| a.hairpin.as_deref()) {
-                match h {
-                    "cresc" | "dim" => {
-                        if let Some((sm, sub)) = open_hp.take() {
-                            if m > sm {
-                                let dm = m as i64 - sm as i64;
-                                hp_start.insert(sm, (sub, dm, 0));
-                                hp_stop_start.entry(m).or_default().push((-dm, 0));
+            if let Some(a) = measure_attr(score, m as u32 + 1) {
+                for h in a.all_hairpins() {
+                    match h {
+                        "cresc" | "dim" => {
+                            if let Some((sm, sub)) = open_hp.take() {
+                                if m > sm {
+                                    let dm = m as i64 - sm as i64;
+                                    hp_start.entry(sm).or_default().push((sub, dm, 0));
+                                    hp_stop_start.entry(m).or_default().push((-dm, 0));
+                                }
                             }
+                            let sub = if h == "cresc" { 0 } else { 1 };
+                            open_hp = Some((m, sub));
                         }
-                        let sub = if h == "cresc" { 0 } else { 1 };
-                        open_hp = Some((m, sub));
-                    }
-                    _ => {
-                        if let Some((sm, sub)) = open_hp.take() {
-                            if m > sm {
-                                let dm = m as i64 - sm as i64;
-                                hp_start.insert(sm, (sub, dm, 0));
-                                hp_stop_start.entry(m).or_default().push((-dm, 0));
-                            } else {
-                                let mlen = windows
-                                    .get(m)
-                                    .map(|&(a, b)| b - a)
-                                    .unwrap_or_else(|| score.measure_ticks());
-                                hp_start.insert(sm, (sub, 0, mlen));
-                                hp_stop_end.entry(m).or_default().push((0, -mlen));
+                        _ => {
+                            if let Some((sm, sub)) = open_hp.take() {
+                                if m > sm {
+                                    let dm = m as i64 - sm as i64;
+                                    hp_start.entry(sm).or_default().push((sub, dm, 0));
+                                    hp_stop_start.entry(m).or_default().push((-dm, 0));
+                                } else {
+                                    let mlen = windows
+                                        .get(m)
+                                        .map(|&(a, b)| b - a)
+                                        .unwrap_or_else(|| score.measure_ticks());
+                                    hp_start.entry(sm).or_default().push((sub, 0, mlen));
+                                    hp_stop_end.entry(m).or_default().push((0, -mlen));
+                                }
                             }
                         }
                     }
@@ -1824,7 +1878,7 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                     .map(|&(a, b)| b - a)
                     .unwrap_or_else(|| score.measure_ticks());
                 let dm = last as i64 - sm as i64;
-                hp_start.insert(sm, (sub, dm, mlen));
+                hp_start.entry(sm).or_default().push((sub, dm, mlen));
                 hp_stop_end.entry(last).or_default().push((-dm, -mlen));
             }
         }
@@ -1919,10 +1973,12 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                         }
                     }
 
-                    if let Some(d) = attrs.and_then(|a| a.dynamic.as_deref()) {
-                        out.push_str("          <Dynamic>\n            <subtype>");
-                        write_escaped_xml(&mut out, d);
-                        out.push_str("</subtype>\n            </Dynamic>\n");
+                    if let Some(a) = attrs {
+                        for d in a.all_dynamics() {
+                            out.push_str("          <Dynamic>\n            <subtype>");
+                            write_escaped_xml(&mut out, d);
+                            out.push_str("</subtype>\n            </Dynamic>\n");
+                        }
                     }
                     if let Some(stops) = hp_stop_start.get(&m) {
                         for &(dm, df) in stops {
@@ -1939,21 +1995,23 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                             out.push_str("            </Spanner>\n");
                         }
                     }
-                    if let Some(&(sub, dm, df)) = hp_start.get(&m) {
-                        out.push_str("          <Spanner type=\"HairPin\">\n");
-                        out.push_str("            <HairPin>\n");
-                        let _ = writeln!(out, "              <subtype>{sub}</subtype>");
-                        out.push_str("              </HairPin>\n");
-                        out.push_str("            <next>\n");
-                        write_mscx_location_xml(
-                            &mut out,
-                            "              ",
-                            dm,
-                            df,
-                            score.divisions,
-                        );
-                        out.push_str("              </next>\n");
-                        out.push_str("            </Spanner>\n");
+                    if let Some(starts) = hp_start.get(&m) {
+                        for &(sub, dm, df) in starts {
+                            out.push_str("          <Spanner type=\"HairPin\">\n");
+                            out.push_str("            <HairPin>\n");
+                            let _ = writeln!(out, "              <subtype>{sub}</subtype>");
+                            out.push_str("              </HairPin>\n");
+                            out.push_str("            <next>\n");
+                            write_mscx_location_xml(
+                                &mut out,
+                                "              ",
+                                dm,
+                                df,
+                                score.divisions,
+                            );
+                            out.push_str("              </next>\n");
+                            out.push_str("            </Spanner>\n");
+                        }
                     }
                 }
 

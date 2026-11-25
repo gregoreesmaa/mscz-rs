@@ -270,6 +270,29 @@ pub unsafe extern "C" fn bekern_to_musicxml(
     }
 }
 
+/// Stitch newline-separated per-page `bekern+` streams into a single `<sys>`-joined
+/// multi-page `bekern+` stream with carried-over headers.
+/// Returns the output byte length on success, or `0` on error.
+///
+/// # Safety
+/// `pages_ptr` must be valid for `pages_len` bytes.
+#[no_mangle]
+pub unsafe extern "C" fn stitch_pages_bekern(
+    pages_ptr: *const u8,
+    pages_len: usize,
+) -> usize {
+    let raw = match read_utf8_arg(pages_ptr, pages_len) {
+        Ok(s) => s,
+        Err(e) => return set_error(e),
+    };
+    let pages: Vec<&str> = raw.split('\n').collect();
+    let stitched = crate::bekern::stitch_pages_bekern(&pages);
+    if stitched.is_empty() {
+        return set_error("empty bekern pages".to_string());
+    }
+    set_result(stitched.into_bytes())
+}
+
 /// Pointer to the most recent successful output buffer.
 #[no_mangle]
 pub extern "C" fn wasm_result_ptr() -> *const u8 {
@@ -331,5 +354,24 @@ mod tests {
     fn wasm_empty_input_reports_error() {
         let err = compile_bekern_to_mscz("   <bos> <eos>  ", None).unwrap_err();
         assert!(err.contains("empty"));
+    }
+
+    #[test]
+    fn wasm_stitch_pages_bekern_compiles_multipage_score() {
+        let p1 = "<bos> clef-G-2 key-1 time-3-4 quarter F 4 half A 4 bar <eos>";
+        let p2 = "<bos> clef-G-2 key-1 quarter C 5 half F 5 bar-light-heavy <eos>";
+        let joined = format!("{p1}\n{p2}");
+        let len = unsafe { stitch_pages_bekern(joined.as_ptr(), joined.len()) };
+        assert!(len > 0);
+        let stitched = unsafe {
+            let slice = slice::from_raw_parts(wasm_result_ptr(), wasm_result_len());
+            std::str::from_utf8(slice).unwrap().to_string()
+        };
+        assert_eq!(
+            stitched,
+            "clef-G-2 key-1 time-3-4 quarter F 4 half A 4 bar <sys> clef-G-2 key-1 time-3-4 quarter C 5 half F 5 bar-light-heavy"
+        );
+        let mscz_bytes = compile_bekern_to_mscz(&stitched, Some("Two-Page Waltz")).unwrap();
+        assert!(!has_errors(&validate_mscz(&mscz_bytes)));
     }
 }
