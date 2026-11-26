@@ -153,17 +153,9 @@ fn microtone_records_loss_table_entry() {
             name: "Violin".to_string(),
             notes: vec![NoteInput {
                 pitch: Some("A4+30c".to_string()),
-                rest: false,
                 onset: 0.0,
                 dur: 1.0,
-                voice: 1,
-                lyric: None,
-                grace: false,
-                slur_start: false,
-                slur_stop: false,
-                articulations: Vec::new(),
-                tie_start: false,
-                tie_stop: false,
+                ..Default::default()
             }],
             ..Default::default()
         }],
@@ -219,17 +211,9 @@ fn invalid_inputs_return_errors_and_diagnostics() {
         parts: Vec::new(),
         notes: vec![NoteInput {
             pitch: Some("Z99".to_string()),
-            rest: false,
             onset: -0.5,
             dur: 0.0,
-            voice: 1,
-            lyric: None,
-            grace: false,
-            slur_start: false,
-            slur_stop: false,
-            articulations: Vec::new(),
-            tie_start: false,
-            tie_stop: false,
+            ..Default::default()
         }],
         part_name: Some("Part 1".to_string()),
         measure_attrs: Vec::new(),

@@ -153,6 +153,17 @@ pub struct NoteInput {
     pub tie_start: bool,
     #[serde(default)]
     pub tie_stop: bool,
+    /// Explicit rational tuplet `(actual_notes, normal_notes)` (e.g. `(3, 2)`,
+    /// `(6, 4)`, `(11, 8)`). When present, MusicXML rendering emits exact
+    /// `<time-modification>` and written `<type>` instead of guessing from ticks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tuplet: Option<(u32, u32)>,
+    /// Cue-sized note (`<cue/>`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cue: bool,
+    /// Relative cross-staff shift (`-1` = `xstaff-up`, `+1` = `xstaff-down`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xstaff: Option<i8>,
 }
 
 impl Default for NoteInput {
@@ -170,6 +181,9 @@ impl Default for NoteInput {
             articulations: Vec::new(),
             tie_start: false,
             tie_stop: false,
+            tuplet: None,
+            cue: false,
+            xstaff: None,
         }
     }
 }
@@ -237,13 +251,22 @@ fn default_part_name() -> String {
     "Part 1".to_string()
 }
 
+/// Cursor-anchored event within a measure (`bekern+v2` inline dynamics,
+/// hairpins, ottava shifts, and mid-bar clef/key/time changes).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TimedEvent {
+    /// Beat offset within the measure (`0.0` = beat 0 / measure start).
+    pub onset_beats: f64,
+    /// Event kind: `"dynamic"`, `"hairpin"`, `"ottava"`, `"clef"`, `"key"`, `"time"`.
+    pub kind: String,
+    /// Event payload (e.g. `"f"`, `"cresc"`, `"dim"`, `"stop"`, `"8va"`, `"8vb"`,
+    /// `"G-2"`, `"F-4-8vb"`, `"+2"`, `"3-4"`).
+    pub value: String,
+}
+
 /// Measure-scoped notation state changes (bekern+ mid-stream headers,
-/// dynamics, hairpins, barlines). `measure` is 1-based. Every field is
-/// a last-wins override for that measure; absent fields inherit the
-/// score state. Short spellings: `dynamic` is one of
-/// `pp|p|mp|mf|f|ff|sfz`, `hairpin` one of `cresc|dim|stop`,
-/// `barline_left` is `repeat-left`, `barline_right` one of
-/// `light-heavy|repeat-right|double`.
+/// dynamics, hairpins, barlines, voltas, and cursor-anchored inline events).
+/// `measure` is 1-based.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MeasureAttr {
     pub measure: u32,
@@ -272,6 +295,13 @@ pub struct MeasureAttr {
     pub barline_left: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub barline_right: Option<String>,
+    /// Volta / ending bracket number at measure start (e.g. `"1"`, `"2"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volta: Option<String>,
+    /// Cursor-anchored inline events (dynamics, hairpins, ottavas, mid-bar
+    /// clef/key/time changes) placed at their exact beat offset within the measure.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub timed_events: Vec<TimedEvent>,
 }
 
 impl MeasureAttr {
@@ -385,6 +415,9 @@ pub struct ScoreNote {
     pub articulations: Vec<String>,
     pub tie_start: bool,
     pub tie_stop: bool,
+    pub tuplet: Option<(u32, u32)>,
+    pub cue: bool,
+    pub xstaff: Option<i8>,
 }
 
 /// Simultaneous same-voice notes sharing one onset/duration.
@@ -880,6 +913,9 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                         articulations: n.articulations.clone(),
                         tie_start: n.tie_start,
                         tie_stop: n.tie_stop,
+                        tuplet: n.tuplet,
+                        cue: n.cue,
+                        xstaff: n.xstaff,
                     },
                 ));
                 continue;
@@ -918,6 +954,9 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                     articulations: n.articulations.clone(),
                     tie_start: n.tie_start,
                     tie_stop: n.tie_stop,
+                    tuplet: n.tuplet,
+                    cue: n.cue,
+                    xstaff: n.xstaff,
                 },
             ));
         }
@@ -1187,6 +1226,9 @@ fn layout_part(
                             articulations: Vec::new(),
                             tie_start: false,
                             tie_stop: false,
+                            tuplet: None,
+                            cue: false,
+                            xstaff: None,
                         },
                         chord: false,
                         dur_ticks: ss - cursor,
@@ -1216,6 +1258,9 @@ fn layout_part(
                         articulations: Vec::new(),
                         tie_start: false,
                         tie_stop: false,
+                        tuplet: None,
+                        cue: false,
+                        xstaff: None,
                     },
                     chord: false,
                     dur_ticks: m1 - cursor,
@@ -1258,18 +1303,38 @@ fn tie_elements(seg: &Segment) -> (bool, bool) {
 /// rests), but the rendering is uniform.
 fn write_notations_xml(out: &mut String, seg: &Segment) {
     let (tie_start, tie_stop) = tie_elements(seg);
-    let has_art = seg
+    let has_art = seg.note.articulations.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "stacc" | "accent" | "tenuto" | "art-staccatissimo" | "art-soft-accent"
+        )
+    });
+    let has_orn = seg.note.articulations.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "art-trill" | "art-tremolo" | "art-mordent" | "art-turn"
+        )
+    });
+    let has_tech = seg
         .note
         .articulations
         .iter()
-        .any(|a| matches!(a.as_str(), "stacc" | "accent" | "tenuto"));
+        .any(|a| matches!(a.as_str(), "art-up-bow" | "art-down-bow"));
     let fermata = seg.note.articulations.iter().any(|a| a == "fermata");
+    let arpeggiate = seg
+        .note
+        .articulations
+        .iter()
+        .any(|a| a == "art-arpeggiate");
     if !tie_start
         && !tie_stop
         && !seg.note.slur_start
         && !seg.note.slur_stop
         && !has_art
+        && !has_orn
+        && !has_tech
         && !fermata
+        && !arpeggiate
     {
         return;
     }
@@ -1293,13 +1358,42 @@ fn write_notations_xml(out: &mut String, seg: &Segment) {
                 "stacc" => out.push_str("<staccato/>"),
                 "accent" => out.push_str("<accent/>"),
                 "tenuto" => out.push_str("<tenuto/>"),
+                "art-staccatissimo" => out.push_str("<staccatissimo/>"),
+                "art-soft-accent" => out.push_str("<soft-accent/>"),
                 _ => {}
             }
         }
         out.push_str("</articulations>");
     }
+    if has_orn {
+        out.push_str("<ornaments>");
+        for a in &seg.note.articulations {
+            match a.as_str() {
+                "art-trill" => out.push_str("<trill-mark/>"),
+                "art-tremolo" => out.push_str("<tremolo>3</tremolo>"),
+                "art-mordent" => out.push_str("<inverted-mordent/>"),
+                "art-turn" => out.push_str("<turn/>"),
+                _ => {}
+            }
+        }
+        out.push_str("</ornaments>");
+    }
+    if has_tech {
+        out.push_str("<technical>");
+        for a in &seg.note.articulations {
+            match a.as_str() {
+                "art-up-bow" => out.push_str("<up-bow/>"),
+                "art-down-bow" => out.push_str("<down-bow/>"),
+                _ => {}
+            }
+        }
+        out.push_str("</technical>");
+    }
     if fermata {
         out.push_str("<fermata/>");
+    }
+    if arpeggiate {
+        out.push_str("<arpeggiate/>");
     }
     out.push_str("</notations>\n");
 }
@@ -1314,12 +1408,19 @@ fn push_note_xml(
     staff_num: Option<u32>,
 ) {
     let voice_num = voice_override.unwrap_or(seg.note.voice);
+    let effective_staff = staff_num.map(|st| match seg.note.xstaff {
+        Some(delta) => (st as i32 + delta as i32).clamp(1, 2) as u32,
+        None => st,
+    });
     // Grace notes occupy no time: `<grace/>` plus the engraved `<type>`
     // for display, and no `<duration>` (which is also what the scorer
     // reads, so grace round-trips as zero-duration events).
     if seg.note.grace {
         out.push_str("      <note>\n");
         out.push_str("        <grace/>\n");
+        if seg.note.cue {
+            out.push_str("        <cue/>\n");
+        }
         if seg.chord {
             out.push_str("        <chord/>\n");
         }
@@ -1357,7 +1458,7 @@ fn push_note_xml(
                 let _ = writeln!(out, "        <accidental>{acc}</accidental>");
             }
         }
-        if let Some(st) = staff_num {
+        if let Some(st) = effective_staff {
             let _ = writeln!(out, "        <staff>{st}</staff>");
         }
         write_notations_xml(out, seg);
@@ -1365,10 +1466,21 @@ fn push_note_xml(
         return;
     }
     // `<duration>` carries the exact tick count (timing is lossless).
-    // `<type>` uses exact tuplet written duration + `<time-modification>` when
-    // the duration matches a clean tuplet ratio; otherwise falls back to the
-    // nearest dyadic type+dots and logs display loss.
-    let tuplet_mod = tuplet_duration(seg.dur_ticks, divisions);
+    // Prefer explicit rational `seg.note.tuplet` when present (exact
+    // `<time-modification>` for any ratio such as 6:4, 11:8, 13:8); otherwise
+    // fall back to the tick-based `tuplet_duration` guesser, then nearest dyadic.
+    let tuplet_mod = if let Some((actual, normal)) = seg.note.tuplet {
+        if actual > 0 && normal > 0 {
+            let written_est =
+                (seg.dur_ticks * actual as i64 + normal as i64 / 2) / normal as i64;
+            let (name, dots, base_ticks) = quantize_duration(written_est, divisions);
+            Some((name, dots, base_ticks, actual, normal))
+        } else {
+            tuplet_duration(seg.dur_ticks, divisions)
+        }
+    } else {
+        tuplet_duration(seg.dur_ticks, divisions)
+    };
     let (typename, dots) = if let Some((tn, td, _, _, _)) = tuplet_mod {
         (tn, td)
     } else {
@@ -1390,6 +1502,9 @@ fn push_note_xml(
     };
     let dur = seg.dur_ticks;
     out.push_str("      <note>\n");
+    if seg.note.cue {
+        out.push_str("        <cue/>\n");
+    }
     if seg.chord {
         out.push_str("        <chord/>\n");
     }
@@ -1426,7 +1541,7 @@ fn push_note_xml(
             "        <time-modification><actual-notes>{actual}</actual-notes><normal-notes>{normal}</normal-notes></time-modification>"
         );
     }
-    if let Some(st) = staff_num {
+    if let Some(st) = effective_staff {
         let _ = writeln!(out, "        <staff>{st}</staff>");
     }
     if !seg.note.rest {
@@ -1512,39 +1627,212 @@ fn has_trailing_grand_staff(parts: &[Part]) -> bool {
         && lo.clef_octave_change.is_none()
 }
 
-/// Write `<direction>` carrying one measure-level dynamic mark.
+/// Write `<direction>` carrying one dynamic mark, with optional tick `<offset>`.
 fn write_dyn_direction_xml(out: &mut String, dynamic: &str, staff_num: Option<u32>) {
-    if let Some(st) = staff_num {
-        let _ = writeln!(
-            out,
-            "      <direction placement=\"below\"><direction-type><dynamics><{dynamic}/></dynamics></direction-type><staff>{st}</staff></direction>"
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "      <direction placement=\"below\"><direction-type><dynamics><{dynamic}/></dynamics></direction-type></direction>"
-        );
-    }
+    write_dyn_direction_xml_offset(out, dynamic, staff_num, None);
 }
 
-/// Write `<direction>` carrying one hairpin wedge event.
+fn write_dyn_direction_xml_offset(
+    out: &mut String,
+    dynamic: &str,
+    staff_num: Option<u32>,
+    offset_ticks: Option<i64>,
+) {
+    out.push_str("      <direction placement=\"below\"><direction-type><dynamics><");
+    out.push_str(dynamic);
+    out.push_str("/></dynamics></direction-type>");
+    if let Some(off) = offset_ticks {
+        if off != 0 {
+            let _ = write!(out, "<offset>{off}</offset>");
+        }
+    }
+    if let Some(st) = staff_num {
+        let _ = write!(out, "<staff>{st}</staff>");
+    }
+    out.push_str("</direction>\n");
+}
+
+/// Write `<direction>` carrying one hairpin wedge event, with optional tick `<offset>`.
 fn write_hairpin_direction_xml(out: &mut String, hairpin: &str, staff_num: Option<u32>) {
+    write_hairpin_direction_xml_offset(out, hairpin, staff_num, None);
+}
+
+fn write_hairpin_direction_xml_offset(
+    out: &mut String,
+    hairpin: &str,
+    staff_num: Option<u32>,
+    offset_ticks: Option<i64>,
+) {
     let wedge = match hairpin {
         "cresc" => "crescendo",
         "dim" => "diminuendo",
         _ => "stop",
     };
-    if let Some(st) = staff_num {
-        let _ = writeln!(
-            out,
-            "      <direction placement=\"below\"><direction-type><wedge type=\"{wedge}\"/></direction-type><staff>{st}</staff></direction>"
-        );
-    } else {
-        let _ = writeln!(
-            out,
-            "      <direction placement=\"below\"><direction-type><wedge type=\"{wedge}\"/></direction-type></direction>"
-        );
+    let _ = write!(
+        out,
+        "      <direction placement=\"below\"><direction-type><wedge type=\"{wedge}\"/></direction-type>"
+    );
+    if let Some(off) = offset_ticks {
+        if off != 0 {
+            let _ = write!(out, "<offset>{off}</offset>");
+        }
     }
+    if let Some(st) = staff_num {
+        let _ = write!(out, "<staff>{st}</staff>");
+    }
+    out.push_str("</direction>\n");
+}
+
+/// Write `<direction>` carrying an `<octave-shift>` (`8va` = down, `8vb` = up, `stop`).
+fn write_ottava_direction_xml(
+    out: &mut String,
+    ottava: &str,
+    staff_num: Option<u32>,
+    offset_ticks: Option<i64>,
+) {
+    let (otype, placement) = match ottava {
+        "8va" => ("down", "above"),
+        "8vb" => ("up", "below"),
+        _ => ("stop", "above"),
+    };
+    let _ = write!(
+        out,
+        "      <direction placement=\"{placement}\"><direction-type><octave-shift type=\"{otype}\" size=\"8\"/></direction-type>"
+    );
+    if let Some(off) = offset_ticks {
+        if off != 0 {
+            let _ = write!(out, "<offset>{off}</offset>");
+        }
+    }
+    if let Some(st) = staff_num {
+        let _ = write!(out, "<staff>{st}</staff>");
+    }
+    out.push_str("</direction>\n");
+}
+
+/// Write a mid-bar `<attributes>` element for a cursor-anchored clef/key/time change.
+fn write_midbar_attr_xml(out: &mut String, kind: &str, value: &str, staff_num: Option<u32>) {
+    match kind {
+        "clef" => {
+            let mut parts = value.split('-');
+            let sign = parts.next().and_then(|s| s.chars().next()).unwrap_or('G');
+            let line: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(2);
+            let oct = match parts.next() {
+                Some("8vb") => Some(-1),
+                Some("8va") => Some(1),
+                _ => None,
+            };
+            out.push_str("      <attributes>\n");
+            write_clef_xml(out, sign, line, oct, staff_num);
+            out.push_str("      </attributes>\n");
+        }
+        "key" => {
+            if let Ok(k) = value.parse::<i32>() {
+                out.push_str("      <attributes>\n");
+                let _ = writeln!(out, "        <key><fifths>{k}</fifths></key>");
+                out.push_str("      </attributes>\n");
+            }
+        }
+        "time" => {
+            let mut parts = value.split('-');
+            if let (Some(b), Some(t)) = (
+                parts.next().and_then(|s| s.parse::<u32>().ok()),
+                parts.next().and_then(|s| s.parse::<u32>().ok()),
+            ) {
+                out.push_str("      <attributes>\n");
+                let _ = writeln!(
+                    out,
+                    "        <time><beats>{b}</beats><beat-type>{t}</beat-type></time>"
+                );
+                out.push_str("      </attributes>\n");
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Write one [`TimedEvent`] at the current cursor (with optional `<offset>` for directions).
+fn write_timed_event_xml(
+    out: &mut String,
+    ev: &TimedEvent,
+    staff_num: Option<u32>,
+    offset_ticks: Option<i64>,
+) {
+    match ev.kind.as_str() {
+        "dynamic" => write_dyn_direction_xml_offset(out, &ev.value, staff_num, offset_ticks),
+        "hairpin" => write_hairpin_direction_xml_offset(out, &ev.value, staff_num, offset_ticks),
+        "ottava" => write_ottava_direction_xml(out, &ev.value, staff_num, offset_ticks),
+        "clef" | "key" | "time" => write_midbar_attr_xml(out, &ev.kind, &ev.value, staff_num),
+        _ => {}
+    }
+}
+
+/// Emit a voice's segments while interleaving cursor-anchored `timed_events` at their
+/// exact tick positions (using `<offset>` when an event falls strictly inside a note).
+#[allow(clippy::too_many_arguments)]
+fn push_voice_with_timed_events(
+    out: &mut String,
+    segs: &[Segment],
+    m0: i64,
+    divisions: u32,
+    losses: &mut LossTable,
+    part_name: &str,
+    staff_num: Option<u32>,
+    timed: &[(i64, &TimedEvent)],
+) {
+    let mut ti = 0usize;
+    let mut cur_off = 0i64;
+    for s in segs {
+        let seg_off = s.note.start_ticks.max(m0) - m0;
+        if !s.chord {
+            // Flush events at or before this note's onset right at `cur_off`.
+            while ti < timed.len() && timed[ti].0 <= seg_off {
+                let delta = timed[ti].0 - cur_off;
+                let off = if delta > 0 { Some(delta) } else { None };
+                write_timed_event_xml(out, timed[ti].1, staff_num, off);
+                ti += 1;
+            }
+            // Also flush direction events falling strictly inside this note's span
+            // using `<offset>` relative to `cur_off`, so onset stays exact even if
+            // voice 1 holds a longer note than the voice carrying the dynamic.
+            let seg_end = seg_off + if s.note.grace { 0 } else { s.dur_ticks };
+            while ti < timed.len()
+                && timed[ti].0 < seg_end
+                && matches!(
+                    timed[ti].1.kind.as_str(),
+                    "dynamic" | "hairpin" | "ottava"
+                )
+            {
+                let delta = timed[ti].0 - cur_off;
+                let off = if delta > 0 { Some(delta) } else { None };
+                write_timed_event_xml(out, timed[ti].1, staff_num, off);
+                ti += 1;
+            }
+        }
+        push_note_xml(out, s, divisions, losses, part_name, None, staff_num);
+        if !s.chord && !s.note.grace {
+            cur_off = cur_off.max(seg_off + s.dur_ticks);
+        }
+    }
+    while ti < timed.len() {
+        write_timed_event_xml(out, timed[ti].1, staff_num, None);
+        ti += 1;
+    }
+}
+
+/// Write a left `<barline>` carrying an optional forward repeat and/or volta ending.
+fn write_left_barline_xml(out: &mut String, barline_left: Option<&str>, volta: Option<&str>) {
+    if barline_left.is_none() && volta.is_none() {
+        return;
+    }
+    out.push_str("      <barline location=\"left\">");
+    if barline_left == Some("repeat-left") {
+        out.push_str("<bar-style>heavy-light</bar-style><repeat direction=\"forward\"/>");
+    }
+    if let Some(v) = volta {
+        let _ = write!(out, "<ending number=\"{v}\" type=\"start\"/>");
+    }
+    out.push_str("</barline>\n");
 }
 
 /// Write `<barline>` for a recorded bar style. The rendering re-parses to the
@@ -1806,34 +2094,97 @@ pub fn to_musicxml_version(
                     out.push_str("      </attributes>\n");
                 }
             }
-            if let Some(b) = p_attrs
+            let barline_left = p_attrs
                 .and_then(|a| a.barline_left.as_deref())
-                .or_else(|| s_attrs.and_then(|a| a.barline_left.as_deref()))
-            {
-                write_barline_xml(&mut out, false, b);
-            }
+                .or_else(|| s_attrs.and_then(|a| a.barline_left.as_deref()));
+            let volta = p_attrs
+                .and_then(|a| a.volta.as_deref())
+                .or_else(|| s_attrs.and_then(|a| a.volta.as_deref()));
+            write_left_barline_xml(&mut out, barline_left, volta);
+            let mut timed: Vec<(i64, &TimedEvent)> = Vec::new();
+            let mut s_has_timed_dyn = false;
+            let mut s_has_timed_hp = false;
+            let mut p_has_timed_dyn = false;
+            let mut p_has_timed_hp = false;
             if let Some(a) = s_attrs {
-                for d in a.all_dynamics() {
-                    write_dyn_direction_xml(&mut out, d, None);
-                }
-                for h in a.all_hairpins() {
-                    write_hairpin_direction_xml(&mut out, h, None);
+                for te in &a.timed_events {
+                    if te.kind == "dynamic" {
+                        s_has_timed_dyn = true;
+                    } else if te.kind == "hairpin" {
+                        s_has_timed_hp = true;
+                    }
+                    let tick = (te.onset_beats * score.divisions as f64).round() as i64;
+                    timed.push((tick.max(0), te));
                 }
             }
             if let Some(a) = p_attrs {
-                for d in a.all_dynamics() {
-                    write_dyn_direction_xml(&mut out, d, None);
-                }
-                for h in a.all_hairpins() {
-                    write_hairpin_direction_xml(&mut out, h, None);
+                for te in &a.timed_events {
+                    if te.kind == "dynamic" {
+                        p_has_timed_dyn = true;
+                    } else if te.kind == "hairpin" {
+                        p_has_timed_hp = true;
+                    }
+                    let tick = (te.onset_beats * score.divisions as f64).round() as i64;
+                    timed.push((tick.max(0), te));
                 }
             }
-            for (vi, (_voice, segs)) in voices.iter().enumerate() {
-                if vi > 0 {
-                    let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+            timed.sort_by_key(|(tick, _)| *tick);
+            if let Some(a) = s_attrs {
+                if !s_has_timed_dyn {
+                    for d in a.all_dynamics() {
+                        write_dyn_direction_xml(&mut out, d, None);
+                    }
                 }
-                for s in segs {
-                    push_note_xml(&mut out, s, score.divisions, losses, &part.name, None, None);
+                if !s_has_timed_hp {
+                    for h in a.all_hairpins() {
+                        write_hairpin_direction_xml(&mut out, h, None);
+                    }
+                }
+            }
+            if let Some(a) = p_attrs {
+                if !p_has_timed_dyn {
+                    for d in a.all_dynamics() {
+                        write_dyn_direction_xml(&mut out, d, None);
+                    }
+                }
+                if !p_has_timed_hp {
+                    for h in a.all_hairpins() {
+                        write_hairpin_direction_xml(&mut out, h, None);
+                    }
+                }
+            }
+            let m0 = windows.get(m).map(|&(a, _)| a).unwrap_or(0);
+            if voices.is_empty() {
+                for &(_, te) in &timed {
+                    write_timed_event_xml(&mut out, te, None, None);
+                }
+            } else {
+                for (vi, (_voice, segs)) in voices.iter().enumerate() {
+                    if vi > 0 {
+                        let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+                        for s in segs {
+                            push_note_xml(
+                                &mut out,
+                                s,
+                                score.divisions,
+                                losses,
+                                &part.name,
+                                None,
+                                None,
+                            );
+                        }
+                    } else {
+                        push_voice_with_timed_events(
+                            &mut out,
+                            segs,
+                            m0,
+                            score.divisions,
+                            losses,
+                            &part.name,
+                            None,
+                            &timed,
+                        );
+                    }
                 }
             }
             if let Some(b) = p_attrs
@@ -1941,68 +2292,158 @@ pub fn to_musicxml_version(
                     out.push_str("      </attributes>\n");
                 }
             }
-            if let Some(b) = s_attrs.and_then(|a| a.barline_left.as_deref()) {
-                write_barline_xml(&mut out, false, b);
-            }
+            let barline_left = s_attrs.and_then(|a| a.barline_left.as_deref());
+            let volta = s_attrs.and_then(|a| a.volta.as_deref());
+            write_left_barline_xml(&mut out, barline_left, volta);
+            let m0 = windows.get(m).map(|&(a, _)| a).unwrap_or(0);
+            let mut timed1: Vec<(i64, &TimedEvent)> = Vec::new();
+            let mut s_has_timed_dyn = false;
+            let mut s_has_timed_hp = false;
+            let mut p1_has_timed_dyn = false;
+            let mut p1_has_timed_hp = false;
             if let Some(a) = s_attrs {
-                for d in a.all_dynamics() {
-                    write_dyn_direction_xml(&mut out, d, Some(1));
-                }
-                for h in a.all_hairpins() {
-                    write_hairpin_direction_xml(&mut out, h, Some(1));
+                for te in &a.timed_events {
+                    if te.kind == "dynamic" {
+                        s_has_timed_dyn = true;
+                    } else if te.kind == "hairpin" {
+                        s_has_timed_hp = true;
+                    }
+                    let tick = (te.onset_beats * score.divisions as f64).round() as i64;
+                    timed1.push((tick.max(0), te));
                 }
             }
             if let Some(a) = p1_attrs {
-                for d in a.all_dynamics() {
-                    write_dyn_direction_xml(&mut out, d, Some(1));
+                for te in &a.timed_events {
+                    if te.kind == "dynamic" {
+                        p1_has_timed_dyn = true;
+                    } else if te.kind == "hairpin" {
+                        p1_has_timed_hp = true;
+                    }
+                    let tick = (te.onset_beats * score.divisions as f64).round() as i64;
+                    timed1.push((tick.max(0), te));
                 }
-                for h in a.all_hairpins() {
-                    write_hairpin_direction_xml(&mut out, h, Some(1));
+            }
+            timed1.sort_by_key(|(tick, _)| *tick);
+            if let Some(a) = s_attrs {
+                if !s_has_timed_dyn {
+                    for d in a.all_dynamics() {
+                        write_dyn_direction_xml(&mut out, d, Some(1));
+                    }
+                }
+                if !s_has_timed_hp {
+                    for h in a.all_hairpins() {
+                        write_hairpin_direction_xml(&mut out, h, Some(1));
+                    }
+                }
+            }
+            if let Some(a) = p1_attrs {
+                if !p1_has_timed_dyn {
+                    for d in a.all_dynamics() {
+                        write_dyn_direction_xml(&mut out, d, Some(1));
+                    }
+                }
+                if !p1_has_timed_hp {
+                    for h in a.all_hairpins() {
+                        write_hairpin_direction_xml(&mut out, h, Some(1));
+                    }
                 }
             }
             let voices1 = layout_hi.get(m).map(Vec::as_slice).unwrap_or(&[]);
-            for (vi, (_voice, segs)) in voices1.iter().enumerate() {
-                if vi > 0 {
-                    let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+            if voices1.is_empty() {
+                for &(_, te) in &timed1 {
+                    write_timed_event_xml(&mut out, te, Some(1), None);
                 }
-                for s in segs {
-                    push_note_xml(
-                        &mut out,
-                        s,
-                        score.divisions,
-                        losses,
-                        &part_hi.name,
-                        None,
-                        Some(1),
-                    );
+            } else {
+                for (vi, (_voice, segs)) in voices1.iter().enumerate() {
+                    if vi > 0 {
+                        let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+                        for s in segs {
+                            push_note_xml(
+                                &mut out,
+                                s,
+                                score.divisions,
+                                losses,
+                                &part_hi.name,
+                                None,
+                                Some(1),
+                            );
+                        }
+                    } else {
+                        push_voice_with_timed_events(
+                            &mut out,
+                            segs,
+                            m0,
+                            score.divisions,
+                            losses,
+                            &part_hi.name,
+                            Some(1),
+                            &timed1,
+                        );
+                    }
                 }
             }
             let voices2 = layout_lo.get(m).map(Vec::as_slice).unwrap_or(&[]);
             if !voices1.is_empty() && !voices2.is_empty() {
                 let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
             }
+            let mut timed2: Vec<(i64, &TimedEvent)> = Vec::new();
+            let mut p2_has_timed_dyn = false;
+            let mut p2_has_timed_hp = false;
             if let Some(a) = p2_attrs {
-                for d in a.all_dynamics() {
-                    write_dyn_direction_xml(&mut out, d, Some(2));
-                }
-                for h in a.all_hairpins() {
-                    write_hairpin_direction_xml(&mut out, h, Some(2));
+                for te in &a.timed_events {
+                    if te.kind == "dynamic" {
+                        p2_has_timed_dyn = true;
+                    } else if te.kind == "hairpin" {
+                        p2_has_timed_hp = true;
+                    }
+                    let tick = (te.onset_beats * score.divisions as f64).round() as i64;
+                    timed2.push((tick.max(0), te));
                 }
             }
-            for (vi, (_voice, segs)) in voices2.iter().enumerate() {
-                if vi > 0 {
-                    let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+            timed2.sort_by_key(|(tick, _)| *tick);
+            if let Some(a) = p2_attrs {
+                if !p2_has_timed_dyn {
+                    for d in a.all_dynamics() {
+                        write_dyn_direction_xml(&mut out, d, Some(2));
+                    }
                 }
-                for s in segs {
-                    push_note_xml(
-                        &mut out,
-                        s,
-                        score.divisions,
-                        losses,
-                        &part_lo.name,
-                        None,
-                        Some(2),
-                    );
+                if !p2_has_timed_hp {
+                    for h in a.all_hairpins() {
+                        write_hairpin_direction_xml(&mut out, h, Some(2));
+                    }
+                }
+            }
+            if voices2.is_empty() {
+                for &(_, te) in &timed2 {
+                    write_timed_event_xml(&mut out, te, Some(2), None);
+                }
+            } else {
+                for (vi, (_voice, segs)) in voices2.iter().enumerate() {
+                    if vi > 0 {
+                        let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+                        for s in segs {
+                            push_note_xml(
+                                &mut out,
+                                s,
+                                score.divisions,
+                                losses,
+                                &part_lo.name,
+                                None,
+                                Some(2),
+                            );
+                        }
+                    } else {
+                        push_voice_with_timed_events(
+                            &mut out,
+                            segs,
+                            m0,
+                            score.divisions,
+                            losses,
+                            &part_lo.name,
+                            Some(2),
+                            &timed2,
+                        );
+                    }
                 }
             }
             if let Some(b) = s_attrs.and_then(|a| a.barline_right.as_deref()) {

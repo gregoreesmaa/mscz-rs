@@ -360,6 +360,26 @@ pub fn to_bekern(
     events: &[BekernNote],
     headers: &[StaffHeader],
 ) -> Result<(Vec<String>, usize), String> {
+    to_bekern_inner(events, headers, false)
+}
+
+/// Flatten events + headers to `bekern+v2` tokens: explicit `<staff>`
+/// delimiters in multi-staff measures, cursor-anchored inline dynamics/hairpins/
+/// ottavas/mid-bar context changes, extended 15-token dynamics, 13-token
+/// articulations/ornaments/technical, `cue`, `xstaff-up`/`xstaff-down`, and
+/// `volta-1`/`volta-2`.
+pub fn to_bekern_v2(
+    events: &[BekernNote],
+    headers: &[StaffHeader],
+) -> Result<(Vec<String>, usize), String> {
+    to_bekern_inner(events, headers, true)
+}
+
+fn to_bekern_inner(
+    events: &[BekernNote],
+    headers: &[StaffHeader],
+    v2: bool,
+) -> Result<(Vec<String>, usize), String> {
     let mut heads: Vec<&StaffHeader> = headers.iter().collect();
     heads.sort_by_key(|h| h.staff);
     let mut out = Vec::with_capacity(events.len() * 4 + heads.len() * 3 + 16);
@@ -410,6 +430,10 @@ pub fn to_bekern(
         std::collections::HashMap::new();
     let mut skipped_bright: std::collections::HashMap<u32, String> =
         std::collections::HashMap::new();
+    let mut skipped_ottava: std::collections::HashMap<u32, String> =
+        std::collections::HashMap::new();
+    let mut skipped_volta: std::collections::HashMap<u32, String> =
+        std::collections::HashMap::new();
     let mut stash_skipped = |e: &BekernNote| {
         if let Some(c) = e.clef_change {
             skipped_clef.insert(e.measure, c);
@@ -420,8 +444,24 @@ pub fn to_bekern(
         if let Some(t) = e.time_change {
             skipped_time.insert(e.measure, t);
         }
-        if let Some(d) = &e.dynamic {
+        if v2 {
+            if !e.extra_dynamics.is_empty() {
+                skipped_dyn
+                    .entry(e.measure)
+                    .or_default()
+                    .extend(e.extra_dynamics.iter().cloned());
+            }
+            if let Some(d) = e.v2_dynamic.as_ref().or(e.dynamic.as_ref()) {
+                skipped_dyn.entry(e.measure).or_default().push(d.clone());
+            }
+        } else if let Some(d) = &e.dynamic {
             skipped_dyn.entry(e.measure).or_default().push(d.clone());
+        }
+        if v2 && !e.extra_hairpins.is_empty() {
+            skipped_hairpin
+                .entry(e.measure)
+                .or_default()
+                .extend(e.extra_hairpins.iter().cloned());
         }
         if let Some(h) = &e.hairpin {
             skipped_hairpin
@@ -429,11 +469,17 @@ pub fn to_bekern(
                 .or_default()
                 .push(h.clone());
         }
+        if let Some(o) = &e.ottava {
+            skipped_ottava.insert(e.measure, o.clone());
+        }
         if let Some(b) = &e.barline_left {
             skipped_bleft.insert(e.measure, b.clone());
         }
         if let Some(b) = &e.barline_right {
             skipped_bright.insert(e.measure, b.clone());
+        }
+        if let Some(v) = &e.volta {
+            skipped_volta.insert(e.measure, v.clone());
         }
     };
     for e in events {
@@ -527,6 +573,7 @@ pub fn to_bekern(
     // Without these markers decode cannot invert multi-voice bars.
     let mut seg_of: std::collections::HashMap<(u32, u32), u32> = std::collections::HashMap::new();
     let mut prev_key: Option<(u32, u32)> = None;
+    let mut cur_staff_slot: usize = 0;
     // Closing barline style of the measure being built (last-wins
     // across its events): emitted instead of `bar` at the close.
     let mut pending_right: Option<String> = None;
@@ -584,6 +631,7 @@ pub fn to_bekern(
             seg_of.clear();
             pos.clear();
             prev_key = None;
+            cur_staff_slot = 0;
         }
         // The current event's closing barline (if it carries one)
         // applies to the close of THIS measure, so it is collected
@@ -594,45 +642,84 @@ pub fn to_bekern(
         if let Some(b) = &e.barline_right {
             pending_right = Some(b.clone());
         }
-        // Mid-stream notation state (bekern+): attribute and direction
-        // changes attached to this event emit here, in bound position
-        // before the voice marker, in fixed order. Any marks rescued
-        // from skipped grace/overflow rests in this measure flush first.
-        if let Some((sign, line, oct)) = skipped_clef.remove(&e.measure) {
-            out.push(clef_token(sign, line, oct));
-        }
-        if let Some((sign, line, oct)) = e.clef_change {
-            out.push(clef_token(sign, line, oct));
-        }
-        if let Some(k) = skipped_key.remove(&e.measure) {
-            out.push(key_token(k));
-        }
-        if let Some(k) = e.key_change {
-            out.push(key_token(k));
-        }
-        if let Some((b, t)) = skipped_time.remove(&e.measure) {
-            out.push(format!("time-{b}-{t}"));
-        }
-        if let Some((b, t)) = e.time_change {
-            out.push(format!("time-{b}-{t}"));
-        }
-        if let Some(ds) = skipped_dyn.remove(&e.measure) {
-            out.extend(ds);
-        }
-        if let Some(d) = &e.dynamic {
-            out.push(d.clone());
-        }
-        if let Some(hs) = skipped_hairpin.remove(&e.measure) {
-            out.extend(hs);
-        }
-        if let Some(h) = &e.hairpin {
-            out.push(h.clone());
-        }
+        // Measure-opening barline and volta markers precede staff/voice markers.
         if let Some(b) = skipped_bleft.remove(&e.measure) {
             out.push(b);
         }
         if let Some(b) = &e.barline_left {
             out.push(b.clone());
+        }
+        if v2 {
+            if let Some(v) = skipped_volta.remove(&e.measure) {
+                out.push(v);
+            }
+            if let Some(v) = &e.volta {
+                out.push(v.clone());
+            }
+            if heads.len() > 1 {
+                let target_slot = heads
+                    .iter()
+                    .position(|h| h.staff == e.staff)
+                    .unwrap_or(e.staff as usize);
+                if target_slot > cur_staff_slot {
+                    for _ in cur_staff_slot..target_slot {
+                        out.push("<staff>".to_string());
+                    }
+                    cur_staff_slot = target_slot;
+                    seg_of.clear();
+                    prev_key = None;
+                }
+            }
+        }
+        let is_beat_zero_start = prev_key != Some(key) && e.onset <= GAP_MIN_BEATS;
+        if is_beat_zero_start {
+            // Beat-0 attributes/directions before `voice-N` (canonical legacy order).
+            if let Some((sign, line, oct)) = skipped_clef.remove(&e.measure) {
+                out.push(clef_token(sign, line, oct));
+            }
+            if let Some((sign, line, oct)) = e.clef_change {
+                out.push(clef_token(sign, line, oct));
+            }
+            if let Some(k) = skipped_key.remove(&e.measure) {
+                out.push(key_token(k));
+            }
+            if let Some(k) = e.key_change {
+                out.push(key_token(k));
+            }
+            if let Some((b, t)) = skipped_time.remove(&e.measure) {
+                out.push(format!("time-{b}-{t}"));
+            }
+            if let Some((b, t)) = e.time_change {
+                out.push(format!("time-{b}-{t}"));
+            }
+            if let Some(ds) = skipped_dyn.remove(&e.measure) {
+                out.extend(ds);
+            }
+            if v2 {
+                out.extend(e.extra_dynamics.iter().cloned());
+                if let Some(d) = e.v2_dynamic.as_ref().or(e.dynamic.as_ref()) {
+                    out.push(d.clone());
+                }
+            } else if let Some(d) = &e.dynamic {
+                out.push(d.clone());
+            }
+            if let Some(hs) = skipped_hairpin.remove(&e.measure) {
+                out.extend(hs);
+            }
+            if v2 {
+                out.extend(e.extra_hairpins.iter().cloned());
+            }
+            if let Some(h) = &e.hairpin {
+                out.push(h.clone());
+            }
+            if v2 {
+                if let Some(o) = skipped_ottava.remove(&e.measure) {
+                    out.push(o);
+                }
+                if let Some(o) = &e.ottava {
+                    out.push(o.clone());
+                }
+            }
         }
         if prev_key != Some(key) {
             debug_assert!(
@@ -644,9 +731,56 @@ pub fn to_bekern(
             out.push(format!("voice-{seg}"));
             prev_key = Some(key);
         }
-        // Whole-bar rest: one token, no duration (a corrupt tuplet
-        // marker on one is ignored; open spans auto-close at the end).
+        // Whole-bar rest: emit any remaining state if not already emitted at beat 0.
         if e.measure_rest {
+            if !is_beat_zero_start {
+                if let Some((sign, line, oct)) = skipped_clef.remove(&e.measure) {
+                    out.push(clef_token(sign, line, oct));
+                }
+                if let Some((sign, line, oct)) = e.clef_change {
+                    out.push(clef_token(sign, line, oct));
+                }
+                if let Some(k) = skipped_key.remove(&e.measure) {
+                    out.push(key_token(k));
+                }
+                if let Some(k) = e.key_change {
+                    out.push(key_token(k));
+                }
+                if let Some((b, t)) = skipped_time.remove(&e.measure) {
+                    out.push(format!("time-{b}-{t}"));
+                }
+                if let Some((b, t)) = e.time_change {
+                    out.push(format!("time-{b}-{t}"));
+                }
+                if let Some(ds) = skipped_dyn.remove(&e.measure) {
+                    out.extend(ds);
+                }
+                if v2 {
+                    out.extend(e.extra_dynamics.iter().cloned());
+                    if let Some(d) = e.v2_dynamic.as_ref().or(e.dynamic.as_ref()) {
+                        out.push(d.clone());
+                    }
+                } else if let Some(d) = &e.dynamic {
+                    out.push(d.clone());
+                }
+                if let Some(hs) = skipped_hairpin.remove(&e.measure) {
+                    out.extend(hs);
+                }
+                if v2 {
+                    out.extend(e.extra_hairpins.iter().cloned());
+                }
+                if let Some(h) = &e.hairpin {
+                    out.push(h.clone());
+                }
+                if v2 {
+                    if let Some(o) = skipped_ottava.remove(&e.measure) {
+                        out.push(o);
+                    }
+                    if let Some(o) = &e.ottava {
+                        out.push(o.clone());
+                    }
+                }
+            }
             out.push("bar-rest".to_string());
             prev = Some((e.measure, e.onset, e.staff, e.voice, false, false));
             live.insert(key, measure);
@@ -843,6 +977,57 @@ pub fn to_bekern(
                 out.push("tuplet-stop".to_string());
             }
         }
+        // Inline cursor-anchored notation state (clef/key/time changes,
+        // dynamics, hairpins, ottava): emitted AFTER gap-fill so every mid-bar
+        // mark lands at this event's exact active voice cursor onset.
+        if !is_beat_zero_start {
+            if let Some((sign, line, oct)) = skipped_clef.remove(&e.measure) {
+                out.push(clef_token(sign, line, oct));
+            }
+            if let Some((sign, line, oct)) = e.clef_change {
+                out.push(clef_token(sign, line, oct));
+            }
+            if let Some(k) = skipped_key.remove(&e.measure) {
+                out.push(key_token(k));
+            }
+            if let Some(k) = e.key_change {
+                out.push(key_token(k));
+            }
+            if let Some((b, t)) = skipped_time.remove(&e.measure) {
+                out.push(format!("time-{b}-{t}"));
+            }
+            if let Some((b, t)) = e.time_change {
+                out.push(format!("time-{b}-{t}"));
+            }
+            if let Some(ds) = skipped_dyn.remove(&e.measure) {
+                out.extend(ds);
+            }
+            if v2 {
+                out.extend(e.extra_dynamics.iter().cloned());
+                if let Some(d) = e.v2_dynamic.as_ref().or(e.dynamic.as_ref()) {
+                    out.push(d.clone());
+                }
+            } else if let Some(d) = &e.dynamic {
+                out.push(d.clone());
+            }
+            if let Some(hs) = skipped_hairpin.remove(&e.measure) {
+                out.extend(hs);
+            }
+            if v2 {
+                out.extend(e.extra_hairpins.iter().cloned());
+            }
+            if let Some(h) = &e.hairpin {
+                out.push(h.clone());
+            }
+            if v2 {
+                if let Some(o) = skipped_ottava.remove(&e.measure) {
+                    out.push(o);
+                }
+                if let Some(o) = &e.ottava {
+                    out.push(o.clone());
+                }
+            }
+        }
         if let Some(num) = e.tuplet_start {
             if let Some(ratio) = e.tuplet_ratio {
                 // Same bracket as a reopened cross-bar span (identical ratio
@@ -944,6 +1129,21 @@ pub fn to_bekern(
         }
         for a in &e.articulations {
             out.push(a.clone());
+        }
+        if v2 {
+            for a in &e.v2_articulations {
+                out.push(a.clone());
+            }
+            if e.cue {
+                out.push("cue".to_string());
+            }
+            if let Some(delta) = e.xstaff {
+                if delta < 0 {
+                    out.push("xstaff-up".to_string());
+                } else if delta > 0 {
+                    out.push("xstaff-down".to_string());
+                }
+            }
         }
         if e.pitch.is_some() {
             if e.tie_start {
@@ -1898,6 +2098,9 @@ mod tests {
             slur_start: false,
             slur_stop: false,
             articulations: Vec::new(),
+            v2_articulations: Vec::new(),
+            cue: false,
+            xstaff: None,
             tuplet_ratio: None,
             tuplet_start: None,
             tuplet_stop: None,
@@ -1906,9 +2109,14 @@ mod tests {
             key_change: None,
             time_change: None,
             dynamic: None,
+            v2_dynamic: None,
+            extra_dynamics: Vec::new(),
             hairpin: None,
+            extra_hairpins: Vec::new(),
+            ottava: None,
             barline_left: None,
             barline_right: None,
+            volta: None,
         }
     }
 
@@ -1951,6 +2159,9 @@ mod tests {
                 slur_start: false,
                 slur_stop: false,
                 articulations: Vec::new(),
+                v2_articulations: Vec::new(),
+                cue: false,
+                xstaff: None,
                 tuplet_ratio: None,
                 tuplet_start: None,
                 tuplet_stop: None,
@@ -1959,9 +2170,14 @@ mod tests {
                 key_change: None,
                 time_change: None,
                 dynamic: None,
+                v2_dynamic: None,
+                extra_dynamics: Vec::new(),
                 hairpin: None,
+                extra_hairpins: Vec::new(),
+                ottava: None,
                 barline_left: None,
                 barline_right: None,
+                volta: None,
             },
             note(1, 0.0, 'E', 4, 1, 0.5, 1, 0),
             tied,

@@ -54,17 +54,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         parts: Vec::new(),
         notes: vec![NoteInput {
             pitch: Some("Z99".to_string()),
-            rest: false,
             onset: -1.0,
             dur: 0.0,
             voice: 0,
-            lyric: None,
-            grace: false,
-            slur_start: false,
-            slur_stop: false,
-            articulations: Vec::new(),
-            tie_start: false,
-            tie_stop: false,
+            ..Default::default()
         }],
         part_name: Some("Broken".to_string()),
         measure_attrs: Vec::new(),

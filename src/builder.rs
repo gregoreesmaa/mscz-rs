@@ -259,13 +259,7 @@ impl PartBuilder {
             onset,
             dur,
             voice: self.current_voice,
-            lyric: None,
-            grace: false,
-            slur_start: false,
-            slur_stop: false,
-            articulations: Vec::new(),
-            tie_start: false,
-            tie_stop: false,
+            ..Default::default()
         });
         self
     }
@@ -330,13 +324,7 @@ impl PartBuilder {
             onset,
             dur,
             voice: self.current_voice,
-            lyric: None,
-            grace: false,
-            slur_start: false,
-            slur_stop: false,
-            articulations: Vec::new(),
-            tie_start: false,
-            tie_stop: false,
+            ..Default::default()
         });
         self
     }

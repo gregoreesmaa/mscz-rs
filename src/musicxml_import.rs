@@ -347,13 +347,7 @@ fn parse_document(xml: &str) -> Result<Doc, String> {
                                 onset: ticks_to_beats(start, dp.divisions),
                                 dur: ticks_to_beats(emit_dur, dp.divisions),
                                 voice,
-                                lyric: None,
-                                grace: false,
-                                slur_start: false,
-                                slur_stop: false,
-                                articulations: Vec::new(),
-                                tie_start: false,
-                                tie_stop: false,
+                                ..Default::default()
                             },
                         });
                         let idx = dp.notes.len() - 1;
@@ -406,6 +400,10 @@ struct NoteEv {
     /// Closed-subset modifiers in fixed order (`stacc`, `accent`,
     /// `tenuto`, `fermata`); unknown children are ignored, never errors.
     articulations: Vec<String>,
+    /// Extended `bekern+v2` articulations/ornaments/technical marks (`art-*`).
+    v2_articulations: Vec<String>,
+    /// Cue-sized note (`<cue/>`).
+    cue: bool,
     /// `(actual, normal)` from `<time-modification>`; `None` = straight.
     tuplet_ratio: Option<(u32, u32)>,
     /// Tuplet `number` attribute of a `<tuplet type="start">` marker.
@@ -416,23 +414,24 @@ struct NoteEv {
     measure_rest: bool,
 }
 
-/// Measure-level dynamic mark (`dyn-pp` … `dyn-ff`, `dyn-sfz`) and/or
-/// hairpin wedge event (`hairpin-cresc-start`, `hairpin-dim-start`,
-/// `hairpin-stop`) from a `<direction>` block. Last wins per block.
-/// `notation_dynamic` carries the extended MusicXML dynamic set for
-/// `notation_events`, while `dynamic` stays on bekern's closed subset.
+/// Measure-level dynamic mark (`dyn-pp` … `dyn-ff`, `dyn-sfz`), extended
+/// `bekern+v2` dynamic mark, hairpin wedge event, and octave-shift event.
 struct DirEv {
     dynamic: Option<String>,
+    v2_dynamic: Option<String>,
     notation_dynamic: Option<String>,
     wedge: Option<String>,
+    ottava: Option<String>,
 }
 
 /// A `<barline>` element: `left` is the `location="left"` attribute,
-/// `style` the `<bar-style>` text, `repeat` the `<repeat>` direction.
+/// `style` the `<bar-style>` text, `repeat` the `<repeat>` direction,
+/// `volta` the `<ending number="1|2" type="start"/>` token.
 struct BarEv {
     left: bool,
     style: Option<String>,
     repeat: Option<String>,
+    volta: Option<String>,
 }
 
 struct AttrEv {
@@ -884,6 +883,12 @@ pub struct BekernNote {
     pub slur_stop: bool,
     /// Closed-subset modifiers (`stacc`, `accent`, `tenuto`, `fermata`).
     pub articulations: Vec<String>,
+    /// Extended `bekern+v2` articulations/ornaments/technical (`art-*`).
+    pub v2_articulations: Vec<String>,
+    /// Cue-sized note (`<cue/>`).
+    pub cue: bool,
+    /// Relative cross-staff shift (`-1` = `xstaff-up`, `+1` = `xstaff-down`).
+    pub xstaff: Option<i8>,
     /// `(actual, normal)` tuplet ratio of this note, if any.
     pub tuplet_ratio: Option<(u32, u32)>,
     /// Tuplet `number` of a span starting on this note, if any.
@@ -898,14 +903,24 @@ pub struct BekernNote {
     pub key_change: Option<i32>,
     /// Mid-stream time change (`beats`, `beat-type`), if any.
     pub time_change: Option<(u32, u32)>,
-    /// Measure dynamic (`dyn-*` token spelling), if any.
+    /// Measure/inline dynamic (`dyn-*` legacy 7-token subset), if any.
     pub dynamic: Option<String>,
+    /// Extended `bekern+v2` dynamic (`dyn-ppp`, `dyn-sf`, `dyn-fp`, ...), if any.
+    pub v2_dynamic: Option<String>,
+    /// Additional dynamics at the same onset when multiple `<direction>` blocks precede this note.
+    pub extra_dynamics: Vec<String>,
     /// Hairpin event (`hairpin-*-start|stop` token spelling), if any.
     pub hairpin: Option<String>,
+    /// Additional hairpin events at the same onset.
+    pub extra_hairpins: Vec<String>,
+    /// Octave-shift event (`ottava-8va` | `ottava-8vb` | `ottava-stop`), if any.
+    pub ottava: Option<String>,
     /// Opening repeat (`bar-repeat-left`), if any.
     pub barline_left: Option<String>,
     /// Closing barline style token, if any.
     pub barline_right: Option<String>,
+    /// Opening volta bracket (`volta-1` | `volta-2`), if any.
+    pub volta: Option<String>,
 }
 
 /// Flatten a Partwise 3.1 document to [`BekernNote`]s: same cursors,
@@ -941,12 +956,17 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
         let mut cur_clefs: HashMap<u32, (char, u32, Option<i32>)> = HashMap::new();
         let mut cur_key: Option<i32> = None;
         let mut cur_time: Option<(u32, u32)> = None;
-        let mut pend_clef: Option<(char, u32, Option<i32>)> = None;
+        let mut pend_clef: HashMap<u32, (char, u32, Option<i32>)> = HashMap::new();
         let mut pend_key: Option<i32> = None;
         let mut pend_time: Option<(u32, u32)> = None;
         let mut pend_dyn: Option<String> = None;
+        let mut pend_v2_dyn: Option<String> = None;
+        let mut pend_extra_dyns: Vec<String> = Vec::new();
         let mut pend_hair: Option<String> = None;
+        let mut pend_extra_hairpins: Vec<String> = Vec::new();
+        let mut pend_ottava: Option<String> = None;
         let mut pend_bleft: Option<String> = None;
+        let mut pend_volta: Option<String> = None;
         // A closing barline seen before any carrier event of its measure
         // (unusual order): held until the measure's next event arrives.
         let mut held_bright: Option<(u32, String)> = None;
@@ -981,17 +1001,37 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                         if let Some(tok) = pend_dyn.take() {
                             out[idx].dynamic = Some(tok);
                         }
+                        if let Some(tok) = pend_v2_dyn.take() {
+                            out[idx].v2_dynamic = Some(tok);
+                        }
+                        if !pend_extra_dyns.is_empty() {
+                            out[idx].extra_dynamics.append(&mut pend_extra_dyns);
+                        }
                         if let Some(tok) = pend_hair.take() {
                             out[idx].hairpin = Some(tok);
+                        }
+                        if !pend_extra_hairpins.is_empty() {
+                            out[idx].extra_hairpins.append(&mut pend_extra_hairpins);
+                        }
+                        if let Some(tok) = pend_ottava.take() {
+                            out[idx].ottava = Some(tok);
                         }
                         if let Some(tok) = pend_bleft.take() {
                             out[idx].barline_left = Some(tok);
                         }
+                        if let Some(tok) = pend_volta.take() {
+                            out[idx].volta = Some(tok);
+                        }
                     }
                 }
                 pend_dyn = None;
+                pend_v2_dyn = None;
+                pend_extra_dyns.clear();
                 pend_hair = None;
+                pend_extra_hairpins.clear();
+                pend_ottava = None;
                 pend_bleft = None;
+                pend_volta = None;
             }
             let div = divisions as f64;
             let mut cursor = 0i64;
@@ -1003,7 +1043,7 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                         for (n, sign, line, oct) in a.clefs {
                             if cur_clefs.get(&n).copied() != Some((sign, line, oct)) {
                                 if cur_clefs.contains_key(&n) {
-                                    pend_clef = Some((sign, line, oct));
+                                    pend_clef.insert(n, (sign, line, oct));
                                 }
                                 cur_clefs.insert(n, (sign, line, oct));
                             }
@@ -1028,16 +1068,29 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                     }
                     Item::NewPage(_) | Item::NewSystem => {}
                     Item::Direction(d) => {
-                        if d.dynamic.is_some() {
-                            pend_dyn = d.dynamic;
+                        if let Some(tok) = d.dynamic {
+                            pend_dyn = Some(tok);
                         }
-                        if d.wedge.is_some() {
-                            pend_hair = d.wedge;
+                        if let Some(tok) = d.v2_dynamic {
+                            if let Some(prev_tok) = pend_v2_dyn.replace(tok) {
+                                pend_extra_dyns.push(prev_tok);
+                            }
+                        }
+                        if let Some(tok) = d.wedge {
+                            if let Some(prev_tok) = pend_hair.replace(tok) {
+                                pend_extra_hairpins.push(prev_tok);
+                            }
+                        }
+                        if let Some(tok) = d.ottava {
+                            pend_ottava = Some(tok);
                         }
                     }
                     Item::Barline(b) => {
                         if let Some(tok) = left_barline_token(&b) {
                             pend_bleft = Some(tok);
+                        }
+                        if let Some(tok) = b.volta.clone() {
+                            pend_volta = Some(tok);
                         }
                         if let Some(tok) = right_barline_token(&b) {
                             // Right barlines close the current measure:
@@ -1064,14 +1117,6 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                         if n.grace {
                             dur = (grace_beats(&n.grace_type) * div).round() as i64;
                         }
-                        // Tuplet members carry performed ticks; recover the
-                        // written duration as an exact float quotient.
-                        // Tick-exactness is the wrong gate (a
-                        // double-dotted-eighth triplet at divisions=12
-                        // performs 7 ticks for a written 10.5 ticks):
-                        // quotients that hit the duration table are
-                        // exactly representable, everything else fails
-                        // loudly at `duration_token`.
                         let written_beats = match n.tuplet_ratio {
                             Some((actual, normal)) => {
                                 dur as f64 * actual as f64 / (normal as f64 * div)
@@ -1087,10 +1132,6 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                             onset: round3(onset as f64 / div),
                             // NoteEv stores (step, alter, octave); normalize.
                             pitch: n.pitch.map(|(s, a, o)| (s, o, a)),
-                            // No round3: decimal rounding mangles 64ths
-                            // (0.0625 -> 0.062) and dotted 32nds. Exact
-                            // tick quotients hit the duration table dead
-                            // on; onsets keep round3 for scorer parity.
                             dur_beats: written_beats,
                             voice: n.voice,
                             staff: staff_base + local - 1,
@@ -1100,6 +1141,9 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                             slur_start: n.slur_start,
                             slur_stop: n.slur_stop,
                             articulations: n.articulations,
+                            v2_articulations: n.v2_articulations,
+                            cue: n.cue,
+                            xstaff: None,
                             tuplet_ratio: n.tuplet_ratio,
                             tuplet_start: n.tuplet_start,
                             tuplet_stop: n.tuplet_stop,
@@ -1108,19 +1152,33 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                             key_change: None,
                             time_change: None,
                             dynamic: None,
+                            v2_dynamic: None,
+                            extra_dynamics: Vec::new(),
                             hairpin: None,
+                            extra_hairpins: Vec::new(),
+                            ottava: None,
                             barline_left: None,
                             barline_right: None,
+                            volta: None,
                         };
                         // State changes attach to the next non-chord
                         // event, keeping chord runs token-adjacent.
                         if !n.chord {
-                            ev.clef_change = pend_clef.take();
+                            ev.clef_change = pend_clef.remove(&local);
                             ev.key_change = pend_key.take();
                             ev.time_change = pend_time.take();
                             ev.dynamic = pend_dyn.take();
+                            ev.v2_dynamic = pend_v2_dyn.take();
+                            if !pend_extra_dyns.is_empty() {
+                                ev.extra_dynamics = std::mem::take(&mut pend_extra_dyns);
+                            }
                             ev.hairpin = pend_hair.take();
+                            if !pend_extra_hairpins.is_empty() {
+                                ev.extra_hairpins = std::mem::take(&mut pend_extra_hairpins);
+                            }
+                            ev.ottava = pend_ottava.take();
                             ev.barline_left = pend_bleft.take();
+                            ev.volta = pend_volta.take();
                             if let Some((hm, tok)) = held_bright.take() {
                                 if hm == measure {
                                     ev.barline_right = Some(tok);
@@ -1131,10 +1189,6 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                         if !n.chord {
                             last_plain = Some(out.len() - 1);
                             last_onset = cursor;
-                            // Grace notes steal no time (mirrors
-                            // `score_events`, whose grace durations are
-                            // zero): the cursor holds so the following
-                            // note keeps the grace's onset.
                             if !n.grace {
                                 cursor += dur;
                             }
@@ -1150,11 +1204,26 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                 if let Some(tok) = pend_dyn.take() {
                     out[idx].dynamic = Some(tok);
                 }
+                if let Some(tok) = pend_v2_dyn.take() {
+                    out[idx].v2_dynamic = Some(tok);
+                }
+                if !pend_extra_dyns.is_empty() {
+                    out[idx].extra_dynamics.append(&mut pend_extra_dyns);
+                }
                 if let Some(tok) = pend_hair.take() {
                     out[idx].hairpin = Some(tok);
                 }
+                if !pend_extra_hairpins.is_empty() {
+                    out[idx].extra_hairpins.append(&mut pend_extra_hairpins);
+                }
+                if let Some(tok) = pend_ottava.take() {
+                    out[idx].ottava = Some(tok);
+                }
                 if let Some(tok) = pend_bleft.take() {
                     out[idx].barline_left = Some(tok);
+                }
+                if let Some(tok) = pend_volta.take() {
+                    out[idx].volta = Some(tok);
                 }
             }
         }
@@ -1721,6 +1790,7 @@ fn parse_attributes(s: &str) -> AttrEv {
 
 fn parse_note(s: &str) -> NoteEv {
     let grace = has_open(s, "grace");
+    let cue = has_open(s, "cue");
     let chord = has_open(s, "chord");
     let rest = has_open(s, "rest");
     // Whole-bar rest (`<rest measure="yes"/>`): a single `bar-rest`
@@ -1794,7 +1864,7 @@ fn parse_note(s: &str) -> NoteEv {
     }
     let duration = tag_text(s, "duration").and_then(|v| v.parse::<i64>().ok());
     let grace_type = if grace { tag_text(s, "type") } else { None };
-    let (slur_start, slur_stop, articulations) = parse_notations(s);
+    let (slur_start, slur_stop, articulations, v2_articulations) = parse_notations(s);
     let voice = tag_text(s, "voice")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(1);
@@ -1820,6 +1890,8 @@ fn parse_note(s: &str) -> NoteEv {
         slur_start,
         slur_stop,
         articulations,
+        v2_articulations,
+        cue,
         tuplet_ratio,
         tuplet_start,
         tuplet_stop,
@@ -1827,12 +1899,11 @@ fn parse_note(s: &str) -> NoteEv {
     }
 }
 
-/// Slur endpoints + closed-subset modifiers from a note body. Unknown
-/// articulation children are ignored (never errors); modifiers emit in
-/// fixed order (`stacc`, `accent`, `tenuto`, `fermata`) for determinism.
-fn parse_notations(s: &str) -> (bool, bool, Vec<String>) {
+/// Slur endpoints + closed-subset modifiers (`stacc`, `accent`, `tenuto`,
+/// `fermata`) + extended `bekern+v2` modifiers (`art-*`) from a note body.
+fn parse_notations(s: &str) -> (bool, bool, Vec<String>, Vec<String>) {
     let Some(block) = block_inclusive(s, "notations") else {
-        return (false, false, Vec::new());
+        return (false, false, Vec::new(), Vec::new());
     };
     let mut start = false;
     let mut stop = false;
@@ -1850,6 +1921,7 @@ fn parse_notations(s: &str) -> (bool, bool, Vec<String>) {
         pos += p + end;
     }
     let mut arts = Vec::new();
+    let mut v2_arts = Vec::new();
     if let Some(ab) = block_inclusive(block, "articulations") {
         if ab.contains("<staccato") {
             arts.push("stacc".to_string());
@@ -1860,15 +1932,45 @@ fn parse_notations(s: &str) -> (bool, bool, Vec<String>) {
         if ab.contains("<tenuto") {
             arts.push("tenuto".to_string());
         }
+        if ab.contains("<staccatissimo") {
+            v2_arts.push("art-staccatissimo".to_string());
+        }
+        if ab.contains("<soft-accent") {
+            v2_arts.push("art-soft-accent".to_string());
+        }
+    }
+    if let Some(ob) = block_inclusive(block, "ornaments") {
+        if ob.contains("<trill-mark") {
+            v2_arts.push("art-trill".to_string());
+        }
+        if ob.contains("<tremolo") {
+            v2_arts.push("art-tremolo".to_string());
+        }
+        if ob.contains("<mordent") || ob.contains("<inverted-mordent") {
+            v2_arts.push("art-mordent".to_string());
+        }
+        if ob.contains("<turn") || ob.contains("<inverted-turn") || ob.contains("<delayed-turn") {
+            v2_arts.push("art-turn".to_string());
+        }
+    }
+    if let Some(tb) = block_inclusive(block, "technical") {
+        if tb.contains("<up-bow") {
+            v2_arts.push("art-up-bow".to_string());
+        }
+        if tb.contains("<down-bow") {
+            v2_arts.push("art-down-bow".to_string());
+        }
     }
     if block.contains("<fermata") {
         arts.push("fermata".to_string());
     }
-    (start, stop, arts)
+    if block.contains("<arpeggiate") {
+        v2_arts.push("art-arpeggiate".to_string());
+    }
+    (start, stop, arts, v2_arts)
 }
 
-/// Closed dynamic level spellings (`<f/>` -> `dyn-f`); anything else
-/// (`<other-dynamics>`, …) is not in the vocabulary and stays `None`.
+/// Closed dynamic level spellings (`<f/>` -> `dyn-f`) for legacy `bekern+`.
 fn dyn_token_name(tag: &str) -> Option<&'static str> {
     match tag {
         "pp" => Some("dyn-pp"),
@@ -1878,6 +1980,24 @@ fn dyn_token_name(tag: &str) -> Option<&'static str> {
         "f" => Some("dyn-f"),
         "ff" => Some("dyn-ff"),
         "sfz" => Some("dyn-sfz"),
+        _ => None,
+    }
+}
+
+/// Extended `bekern+v2` dynamic level spellings (15 tokens: legacy 7 + 8 new).
+fn v2_dyn_token_name(tag: &str) -> Option<&'static str> {
+    if let Some(t) = dyn_token_name(tag) {
+        return Some(t);
+    }
+    match tag {
+        "ppp" => Some("dyn-ppp"),
+        "fff" => Some("dyn-fff"),
+        "fp" => Some("dyn-fp"),
+        "sf" => Some("dyn-sf"),
+        "sfp" => Some("dyn-sfp"),
+        "fz" => Some("dyn-fz"),
+        "rfz" => Some("dyn-rfz"),
+        "sffz" => Some("dyn-sffz"),
         _ => None,
     }
 }
@@ -1897,6 +2017,7 @@ fn notation_dyn_token_name(tag: &str) -> Option<String> {
 
 fn parse_direction(s: &str) -> DirEv {
     let mut dynamic = None;
+    let mut v2_dynamic = None;
     let mut notation_dynamic = None;
     if let Some(dd) = block_inclusive(s, "dynamics") {
         let open_end = dd.find('>').map(|q| q + 1).unwrap_or(dd.len());
@@ -1908,6 +2029,7 @@ fn parse_direction(s: &str) -> DirEv {
                 .collect();
             if name != "/dynamics" {
                 dynamic = dyn_token_name(&name).map(str::to_string);
+                v2_dynamic = v2_dyn_token_name(&name).map(str::to_string);
                 notation_dynamic = notation_dyn_token_name(&name);
             }
         }
@@ -1927,10 +2049,27 @@ fn parse_direction(s: &str) -> DirEv {
         }
         pos += p + end;
     }
+    let mut ottava = None;
+    let mut opos = 0;
+    while let Some(p) = s[opos..].find("<octave-shift") {
+        let tag = &s[opos + p..];
+        let end = tag.find('>').map(|q| q + 1).unwrap_or(tag.len());
+        let t = &tag[..end];
+        if t.contains("type=\"down\"") {
+            ottava = Some("ottava-8va".to_string());
+        } else if t.contains("type=\"up\"") {
+            ottava = Some("ottava-8vb".to_string());
+        } else if t.contains("type=\"stop\"") {
+            ottava = Some("ottava-stop".to_string());
+        }
+        opos += p + end;
+    }
     DirEv {
         dynamic,
+        v2_dynamic,
         notation_dynamic,
         wedge,
+        ottava,
     }
 }
 
@@ -1948,10 +2087,26 @@ fn parse_barline(open_tag: &str, body: &str) -> BarEv {
             repeat = Some("backward".to_string());
         }
     }
+    let mut volta = None;
+    if let Some(p) = body.find("<ending") {
+        let tag = &body[p..];
+        let end = tag.find('>').map(|q| q + 1).unwrap_or(tag.len());
+        let t = &tag[..end];
+        if t.contains("type=\"start\"") {
+            if let Some(num) = attr_value(t, "number") {
+                match num.trim() {
+                    "1" => volta = Some("volta-1".to_string()),
+                    "2" => volta = Some("volta-2".to_string()),
+                    _ => {}
+                }
+            }
+        }
+    }
     BarEv {
         left,
         style,
         repeat,
+        volta,
     }
 }
 
