@@ -16,7 +16,9 @@
 use std::cell::RefCell;
 use std::slice;
 
-use crate::{decode, pack_mscz, parse_score, to_mscx, to_musicxml};
+use crate::{
+    decode, is_empty_score_input, pack_mscz, parse_score, to_empty_musicxml, to_mscx, to_musicxml,
+};
 
 thread_local! {
     static LAST_RESULT: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
@@ -210,6 +212,11 @@ pub fn compile_bekern_to_musicxml(
     let mut decoded = decode::decode_bekern_unmerged(&cleaned)?;
     if let Some(t) = title.map(str::trim).filter(|t| !t.is_empty()) {
         decoded.title = Some(t.to_string());
+    }
+    if is_empty_score_input(&decoded) {
+        return Ok(to_empty_musicxml(
+            decoded.title.as_deref().unwrap_or("Untitled"),
+        ));
     }
     let (score, mut losses) = parse_score(&decoded)?;
     Ok(to_musicxml(&score, &mut losses))

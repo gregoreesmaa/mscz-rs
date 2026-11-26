@@ -16,8 +16,8 @@ use mscz::{
         split_measures, staff_headers, staff_headers_at_measure, system_breaks,
     },
     pack_mscz, parse_score, score_pitched_count, score_stem, score_symbols, ser_for_symbols,
-    to_mscx, to_musicxml, validate_mscz, validate_musicxml, validate_notes, LossTable, Score,
-    ScoreInput,
+    to_empty_mscx, to_empty_musicxml, to_mscx, to_musicxml, validate_mscz, validate_musicxml,
+    validate_notes, LossTable, Score, ScoreInput,
 };
 
 #[derive(Parser, Debug)]
@@ -424,12 +424,40 @@ fn cmd_bekern2musicxml(a: &Bekern2MusicxmlArgs) -> Result<(), Err> {
     // Link-faithful decode: the strict-xml oracle compares tie
     // segments, so every tie link must render as its own note.
     let input = decode_bekern_unmerged(&text).map_err(|e| format!("{}: {e}", a.input.display()))?;
-    let (score, mut losses) =
-        parse_score(&input).map_err(|e| format!("{}: {e}", a.input.display()))?;
     let stem = a
         .stem
         .clone()
         .unwrap_or_else(|| bekern_default_stem(&a.input));
+    if is_empty_score_input(&input) {
+        fs::create_dir_all(&a.out).map_err(|e| format!("mkdir {}: {e}", a.out.display()))?;
+        let title = input.title.as_deref().unwrap_or(&stem);
+        let xml = to_empty_musicxml(title);
+        let mscx = to_empty_mscx(title);
+        let empty_score = Score {
+            title: title.to_string(),
+            composer: input.composer.clone(),
+            divisions: input.divisions,
+            beats: input.time.map(|t| t.beats).unwrap_or(4),
+            beat_type: input.time.map(|t| t.beat_type).unwrap_or(4),
+            key_fifths: input.key_fifths,
+            parts: Vec::new(),
+            measure_attrs: Vec::new(),
+        };
+        let mscz = pack_mscz(&empty_score, &mscx)?;
+        let losses = LossTable::default();
+        write_file(&a.out.join(format!("{stem}.musicxml")), xml.as_bytes())?;
+        write_file(&a.out.join(format!("{stem}.mscx")), mscx.as_bytes())?;
+        write_file(&a.out.join(format!("{stem}.mscz")), &mscz)?;
+        write_file(
+            &a.out.join("loss.json"),
+            serde_json::to_string_pretty(&losses)?.as_bytes(),
+        )?;
+        write_file(&a.out.join("validation.json"), b"[]")?;
+        println!("wrote empty {stem}.musicxml (0 measures; abstained zero-note page)");
+        return write_lattice_sidecar(a.lattice_in.as_deref(), &stem, &a.out);
+    }
+    let (score, mut losses) =
+        parse_score(&input).map_err(|e| format!("{}: {e}", a.input.display()))?;
     write_pack_outputs(&score, &mut losses, &input, &stem, &a.out)?;
     write_lattice_sidecar(a.lattice_in.as_deref(), &stem, &a.out)
 }
@@ -955,5 +983,28 @@ mod cli_tests {
             err.to_string().contains("confidence"),
             "names the violation: {err}"
         );
+    }
+
+    #[test]
+    fn bekern2musicxml_zero_note_bar_rest_page_writes_empty_zero_measure_musicxml() {
+        let dir = scratch_dir("abstain-empty");
+        let input = dir.join("blank-bekern.txt");
+        fs::write(
+            &input,
+            "clef-G-2 key+0 time-4-4 voice-1 bar-rest bar voice-1 bar-rest bar voice-1 bar-rest bar voice-1 bar-rest bar",
+        )
+        .expect("write blank fixture");
+        let out = dir.join("out");
+        cmd_bekern2musicxml(&Bekern2MusicxmlArgs {
+            input,
+            out: out.clone(),
+            stem: Some("blank".to_string()),
+            lattice_in: None,
+        })
+        .expect("bekern2musicxml abstains cleanly on zero-note all-bar-rest page");
+        let xml = fs::read_to_string(out.join("blank.musicxml")).expect("read musicxml");
+        assert!(xml.contains("<score-partwise version=\"3.1\">"));
+        assert!(!xml.contains("<measure"));
+        assert!(!xml.contains("<note"));
     }
 }

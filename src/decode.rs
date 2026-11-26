@@ -186,6 +186,38 @@ fn parse_clef_token(t: &str) -> Result<(char, u32, Option<i32>), String> {
     Ok((sign, line, oct))
 }
 
+/// Resolve the 0-based voice segment owning a mid-stream clef/dynamic/hairpin token.
+///
+/// `to_bekern` emits bound attributes/directions immediately BEFORE the `voice-N`
+/// marker of the segment they attach to, while hand-authored or model-predicted
+/// streams may place them AFTER `voice-N`. Scanning past adjacent bound tokens for
+/// an immediately following `voice-N` handles both orders accurately.
+fn resolve_target_seg(toks: &[&str], idx_after: usize, current_seg: usize) -> usize {
+    let mut j = idx_after;
+    while let Some(&tok) = toks.get(j) {
+        if let Some(rest) = tok.strip_prefix("voice-") {
+            if let Ok(n) = rest.parse::<usize>() {
+                if n >= 1 {
+                    return n - 1;
+                }
+            }
+            break;
+        }
+        if tok.starts_with("clef-")
+            || tok.starts_with("key")
+            || tok.starts_with("time-")
+            || tok.starts_with("dyn-")
+            || tok.starts_with("hairpin-")
+            || tok == "bar-repeat-left"
+        {
+            j += 1;
+            continue;
+        }
+        break;
+    }
+    current_seg
+}
+
 /// Closing-barline short style for a `bar-*` variant token.
 fn barline_right_of(t: &str) -> Option<&'static str> {
     match t {
@@ -463,11 +495,17 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
 
     let mut tagged_notes: Vec<(u32, NoteInput)> = Vec::new();
     let mut measure_attrs: Vec<MeasureAttr> = Vec::new();
-    if let Some((sign, line, oct)) = leading_clef_oct {
-        let a = attr_for(&mut measure_attrs, 1);
-        a.clef_sign = Some(sign);
-        a.clef_line = Some(line);
-        a.clef_octave_change = Some(oct);
+    let mut seg_clefs: Vec<(u32, usize, char, u32, Option<i32>)> = Vec::new();
+    let mut seg_dyns: Vec<(u32, usize, String)> = Vec::new();
+    let mut seg_hairpins: Vec<(u32, usize, String)> = Vec::new();
+    let mut bar_rest_count: usize = 0;
+    if leading_clefs.len() <= 1 {
+        if let Some((sign, line, oct)) = leading_clef_oct {
+            let a = attr_for(&mut measure_attrs, 1);
+            a.clef_sign = Some(sign);
+            a.clef_line = Some(line);
+            a.clef_octave_change = Some(oct);
+        }
     }
     let mut measure = 0u32;
     // Per-measure voice cursors (offsets within the measure); segment 0
@@ -583,21 +621,26 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             if !seen_event && measure == 0 {
                 leading_clefs.push((sign, line, oct));
                 // Effectively leading: preserve octave-transposing clefs
-                // (8vb/8va) on measure 1; plain clefs keep default layout.
-                if let Some(o) = oct {
-                    let a = attr_for(&mut measure_attrs, 1);
-                    a.clef_sign = Some(sign);
-                    a.clef_line = Some(line);
-                    a.clef_octave_change = Some(o);
+                // (8vb/8va) on measure 1 for single-staff streams.
+                if leading_clefs.len() <= 1 {
+                    if let Some(o) = oct {
+                        let a = attr_for(&mut measure_attrs, 1);
+                        a.clef_sign = Some(sign);
+                        a.clef_line = Some(line);
+                        a.clef_octave_change = Some(o);
+                    }
                 }
             } else if leading_clefs.len() <= 1 {
                 // Single-staff score: apply mid-stream clef change directly.
-                // (In multi-staff scores, a single mid-stream clef token belongs
-                // to one staff only, so we avoid clobbering all staves.)
                 let a = attr_for(&mut measure_attrs, measure + 1);
                 a.clef_sign = Some(sign);
                 a.clef_line = Some(line);
                 a.clef_octave_change = oct;
+            } else {
+                // Multi-staff score: record per-segment clef change so it attaches
+                // only to its owning staff after voice->staff assignment.
+                let target_seg = resolve_target_seg(&toks, i + 1, seg);
+                seg_clefs.push((measure, target_seg, sign, line, oct));
             }
             i += 1;
             continue;
@@ -642,7 +685,12 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         if let Some(short) = t.strip_prefix("dyn-") {
             match short {
                 "pp" | "p" | "mp" | "mf" | "f" | "ff" | "sfz" => {
-                    attr_for(&mut measure_attrs, measure + 1).push_dynamic(short);
+                    if leading_clefs.len() <= 1 {
+                        attr_for(&mut measure_attrs, measure + 1).push_dynamic(short);
+                    } else {
+                        let target_seg = resolve_target_seg(&toks, i + 1, seg);
+                        seg_dyns.push((measure, target_seg, short.to_string()));
+                    }
                 }
                 _ => return Err(format!("unexpected token {t:?} in measure {measure}")),
             }
@@ -650,17 +698,17 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             continue;
         }
         if let Some(short) = t.strip_prefix("hairpin-") {
-            match short {
-                "cresc-start" => {
-                    attr_for(&mut measure_attrs, measure + 1).push_hairpin("cresc")
-                }
-                "dim-start" => {
-                    attr_for(&mut measure_attrs, measure + 1).push_hairpin("dim")
-                }
-                "stop" => {
-                    attr_for(&mut measure_attrs, measure + 1).push_hairpin("stop")
-                }
+            let hp = match short {
+                "cresc-start" => "cresc",
+                "dim-start" => "dim",
+                "stop" => "stop",
                 _ => return Err(format!("unexpected token {t:?} in measure {measure}")),
+            };
+            if leading_clefs.len() <= 1 {
+                attr_for(&mut measure_attrs, measure + 1).push_hairpin(hp);
+            } else {
+                let target_seg = resolve_target_seg(&toks, i + 1, seg);
+                seg_hairpins.push((measure, target_seg, hp.to_string()));
             }
             i += 1;
             continue;
@@ -750,6 +798,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                 &NoteMods::default(),
                 false,
             );
+            bar_rest_count += 1;
             voices[seg] = barlen;
             last_onset[seg] = None;
             spans[seg].append(&mut pending_spans);
@@ -961,6 +1010,21 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             tagged_notes.push((sm, note));
         }
     }
+    // Zero-note all-bar-rest page abstention: if a decoded page contains zero
+    // pitched notes across all staves (only `bar-rest` tokens, e.g. blank-staff
+    // or text-only negative controls), abstain with an empty 0-note score rather
+    // than emitting hallucinated empty rest measures.
+    let has_pitched = tagged_notes
+        .iter()
+        .any(|(_, n)| !n.rest && n.pitch.is_some());
+    if !has_pitched && (tagged_notes.is_empty() || bar_rest_count == tagged_notes.len()) {
+        tagged_notes.clear();
+        measure_attrs.clear();
+        seg_clefs.clear();
+        seg_dyns.clear();
+        seg_hairpins.clear();
+    }
+
     measure_attrs.sort_by_key(|a| a.measure);
 
     let parts = if leading_clefs.len() <= 1 {
@@ -974,6 +1038,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             clef_sign,
             clef_line,
             clef_octave_change,
+            measure_attrs: Vec::new(),
         }]
     } else {
         let k = leading_clefs.len();
@@ -1019,6 +1084,33 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             part_notes[staff_idx].push(n);
         }
 
+        let mut part_measure_attrs: Vec<Vec<MeasureAttr>> = vec![Vec::new(); k];
+        let staff_of = |m: u32, seg_idx: usize| -> usize {
+            measure_maps
+                .get(&m)
+                .and_then(|map| map.get(seg_idx).copied())
+                .map(|(st, _)| st)
+                .unwrap_or_else(|| seg_idx.min(k - 1))
+        };
+        for (m, s_idx, sign, line, oct) in seg_clefs {
+            let st = staff_of(m, s_idx);
+            let a = attr_for(&mut part_measure_attrs[st], m + 1);
+            a.clef_sign = Some(sign);
+            a.clef_line = Some(line);
+            a.clef_octave_change = oct;
+        }
+        for (m, s_idx, d) in seg_dyns {
+            let st = staff_of(m, s_idx);
+            attr_for(&mut part_measure_attrs[st], m + 1).push_dynamic(d);
+        }
+        for (m, s_idx, h) in seg_hairpins {
+            let st = staff_of(m, s_idx);
+            attr_for(&mut part_measure_attrs[st], m + 1).push_hairpin(h);
+        }
+        for attrs in &mut part_measure_attrs {
+            attrs.sort_by_key(|a| a.measure);
+        }
+
         // Preserve all K staves even if one staff had zero events on this page.
         if total_notes > 0 {
             for pnotes in &mut part_notes {
@@ -1031,13 +1123,15 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         leading_clefs
             .iter()
             .zip(part_notes)
+            .zip(part_measure_attrs)
             .enumerate()
-            .map(|(idx, (&(s, l, o), notes))| PartInput {
+            .map(|(idx, ((&(s, l, o), notes), p_attrs))| PartInput {
                 name: format!("Staff {}", idx + 1),
                 notes,
                 clef_sign: Some(s),
                 clef_line: Some(l),
                 clef_octave_change: o,
+                measure_attrs: p_attrs,
             })
             .collect()
     };
@@ -2313,5 +2407,205 @@ mod tests {
         assert!(mscx.matches("<Spanner type=\"HairPin\">").count() >= 4);
         let mscz_bytes = pack_mscz(&score, &mscx).unwrap();
         assert!(!has_errors(&validate_mscz(&mscz_bytes)));
+    }
+
+    #[test]
+    fn multistaff_midpiece_clefs_emit_on_exact_staff_without_clobbering() {
+        use super::super::{has_errors, parse_score, to_musicxml, validate_musicxml, LossTable};
+        use super::decode_bekern_unmerged;
+
+        // 1) 2-staff piano grand staff: LH (staff 2) switches to G-2 in measure 2
+        //    (emitted in to_bekern bound order right before `voice-2`), while RH stays G-2.
+        let piano = concat!(
+            "clef-G-2 key+0 time-4-4 clef-F-4 key+0 time-4-4 ",
+            "voice-1 whole C 5 voice-2 whole C 3 bar ",
+            "voice-1 whole D 5 clef-G-2 voice-2 whole G 4 bar-light-heavy"
+        );
+        let dec = decode_bekern_unmerged(piano).unwrap();
+        assert!(
+            dec.parts[0].measure_attrs.is_empty(),
+            "RH (staff 1) must not receive LH's mid-piece clef"
+        );
+        let lh_m2 = dec.parts[1]
+            .measure_attrs
+            .iter()
+            .find(|a| a.measure == 2)
+            .expect("LH (staff 2) must record mid-piece clef at measure 2");
+        assert_eq!((lh_m2.clef_sign, lh_m2.clef_line), (Some('G'), Some(2)));
+
+        let (score, mut losses) = parse_score(&dec).unwrap();
+        let xml = to_musicxml(&score, &mut losses);
+        assert!(!has_errors(&validate_musicxml(&xml)));
+        // Measure 2 of the grand-staff part must emit <clef number="2"><sign>G</sign><line>2</line></clef>
+        // and must NOT emit a redundant <clef number="1"> in measure 2.
+        let m2_start = xml.find("<measure number=\"2\">").expect("measure 2");
+        let m2_body = &xml[m2_start..];
+        assert!(
+            m2_body.contains("<clef number=\"2\"><sign>G</sign><line>2</line></clef>"),
+            "measure 2 must emit staff-2 clef change:\n{m2_body}"
+        );
+        assert!(
+            !m2_body.contains("<clef number=\"1\">"),
+            "measure 2 must not clobber staff 1 clef:\n{m2_body}"
+        );
+
+        // 2) 4-staff string quartet: Cello (staff 4) switches to tenor clef (C-4) in measure 2
+        //    (placed after `voice-4`), while Vln1/Vln2/Vla keep their clefs.
+        let quartet = concat!(
+            "clef-G-2 key+0 time-4-4 clef-G-2 key+0 time-4-4 ",
+            "clef-C-3 key+0 time-4-4 clef-F-4 key+0 time-4-4 ",
+            "voice-1 whole G 5 voice-2 whole D 5 voice-3 whole G 4 voice-4 whole G 2 bar ",
+            "voice-1 whole A 5 voice-2 whole E 5 voice-3 whole A 4 voice-4 clef-C-4 whole D 4 bar-light-heavy"
+        );
+        let qdec = decode_bekern_unmerged(quartet).unwrap();
+        assert!(qdec.parts[0].measure_attrs.is_empty());
+        assert!(qdec.parts[1].measure_attrs.is_empty());
+        assert!(qdec.parts[2].measure_attrs.is_empty());
+        let vc_m2 = qdec.parts[3]
+            .measure_attrs
+            .iter()
+            .find(|a| a.measure == 2)
+            .expect("Cello (staff 4) must record mid-piece C-4 clef at measure 2");
+        assert_eq!((vc_m2.clef_sign, vc_m2.clef_line), (Some('C'), Some(4)));
+
+        let (qscore, _) = parse_score(&qdec).unwrap();
+        let qxml = to_musicxml(&qscore, &mut LossTable::default());
+        assert!(!has_errors(&validate_musicxml(&qxml)));
+        assert_eq!(
+            qxml.matches("<clef><sign>C</sign><line>4</line></clef>").count(),
+            1,
+            "mid-piece tenor clef must emit exactly once on Cello (P4), not broadcast to all parts"
+        );
+    }
+
+    #[test]
+    fn multistaff_dynamics_and_hairpins_attach_only_to_owning_part() {
+        use super::super::{has_errors, parse_score, to_musicxml, validate_musicxml, LossTable};
+        use super::decode_bekern_unmerged;
+
+        // 4-staff string quartet: `dyn-f` on Violin 1 (before voice-1) and `hairpin-cresc-start`
+        // + `dyn-p` on Cello (before voice-4). Neither may broadcast 4x across all parts!
+        let quartet = concat!(
+            "clef-G-2 key+0 time-4-4 clef-G-2 key+0 time-4-4 ",
+            "clef-C-3 key+0 time-4-4 clef-F-4 key+0 time-4-4 ",
+            "dyn-f voice-1 whole E 5 voice-2 whole C 5 voice-3 whole G 4 ",
+            "dyn-p hairpin-cresc-start voice-4 whole C 3 bar-light-heavy"
+        );
+        let dec = decode_bekern_unmerged(quartet).unwrap();
+        assert!(
+            dec.measure_attrs.iter().all(|a| a.all_dynamics().is_empty() && a.all_hairpins().is_empty()),
+            "multi-staff dynamics/hairpins must live on owning parts, not score-wide measure_attrs"
+        );
+        assert_eq!(dec.parts[0].measure_attrs[0].all_dynamics(), vec!["f"]);
+        assert!(dec.parts[1].measure_attrs.is_empty());
+        assert!(dec.parts[2].measure_attrs.is_empty());
+        assert_eq!(dec.parts[3].measure_attrs[0].all_dynamics(), vec!["p"]);
+        assert_eq!(dec.parts[3].measure_attrs[0].all_hairpins(), vec!["cresc"]);
+
+        let (score, _) = parse_score(&dec).unwrap();
+        let xml = to_musicxml(&score, &mut LossTable::default());
+        assert!(!has_errors(&validate_musicxml(&xml)));
+        assert_eq!(
+            xml.matches("<dynamics><f/></dynamics>").count(),
+            1,
+            "dyn-f must emit exactly 1x (not 4x broadcast)"
+        );
+        assert_eq!(
+            xml.matches("<dynamics><p/></dynamics>").count(),
+            1,
+            "dyn-p must emit exactly 1x (not 4x broadcast)"
+        );
+        assert_eq!(
+            xml.matches("<wedge type=\"crescendo\"/>").count(),
+            1,
+            "hairpin-cresc-start must emit exactly 1x (not 4x broadcast)"
+        );
+    }
+
+    #[test]
+    fn zero_note_all_bar_rest_page_abstains_to_empty_score() {
+        use super::super::{is_empty_score_input, to_empty_musicxml};
+        use super::decode_bekern_unmerged;
+
+        // Single-staff 8-bar all-bar-rest negative control (e.g. blank staff paper)
+        let single_blank = concat!(
+            "clef-G-2 key+0 time-4-4 ",
+            "voice-1 bar-rest bar voice-1 bar-rest bar voice-1 bar-rest bar voice-1 bar-rest bar ",
+            "voice-1 bar-rest bar voice-1 bar-rest bar voice-1 bar-rest bar voice-1 bar-rest bar"
+        );
+        let dec1 = decode_bekern_unmerged(single_blank).unwrap();
+        assert!(
+            is_empty_score_input(&dec1),
+            "all-bar-rest single-staff page must abstain to empty ScoreInput"
+        );
+
+        // Multi-staff 6-bar all-bar-rest negative control
+        let multi_blank = concat!(
+            "clef-G-2 key+0 time-4-4 clef-F-4 key+0 time-4-4 ",
+            "voice-1 bar-rest voice-2 bar-rest bar ",
+            "voice-1 bar-rest voice-2 bar-rest bar ",
+            "voice-1 bar-rest voice-2 bar-rest bar ",
+            "voice-1 bar-rest voice-2 bar-rest bar ",
+            "voice-1 bar-rest voice-2 bar-rest bar ",
+            "voice-1 bar-rest voice-2 bar-rest bar"
+        );
+        let dec2 = decode_bekern_unmerged(multi_blank).unwrap();
+        assert!(
+            is_empty_score_input(&dec2),
+            "all-bar-rest multi-staff page must abstain to empty ScoreInput"
+        );
+
+        let empty_xml = to_empty_musicxml("Blank");
+        assert!(empty_xml.contains("<score-partwise version=\"3.1\">"));
+        assert!(!empty_xml.contains("<measure"));
+        assert!(!empty_xml.contains("<note"));
+    }
+
+    #[test]
+    fn grand_staff_grouping_emits_staves_2_for_piano_and_voice_piano_not_quartet() {
+        use super::super::{has_errors, parse_score, to_musicxml, validate_musicxml, LossTable};
+        use super::decode_bekern_unmerged;
+
+        // 1) Solo piano (G2, F4) -> 1 <part> with <staves>2</staves>, <staff>1</staff>, <staff>2</staff>, <backup>
+        let piano = concat!(
+            "clef-G-2 key+0 time-4-4 clef-F-4 key+0 time-4-4 ",
+            "voice-1 half C 5 half E 5 voice-2 whole C 3 bar-light-heavy"
+        );
+        let p_dec = decode_bekern_unmerged(piano).unwrap();
+        let (p_score, _) = parse_score(&p_dec).unwrap();
+        let p_xml = to_musicxml(&p_score, &mut LossTable::default());
+        assert!(!has_errors(&validate_musicxml(&p_xml)));
+        assert_eq!(p_xml.matches("<part id=").count(), 1, "piano must emit 1 <part>");
+        assert!(p_xml.contains("<staves>2</staves>"));
+        assert!(p_xml.contains("<clef number=\"1\"><sign>G</sign><line>2</line></clef>"));
+        assert!(p_xml.contains("<clef number=\"2\"><sign>F</sign><line>4</line></clef>"));
+        assert!(p_xml.contains("<staff>1</staff>"));
+        assert!(p_xml.contains("<staff>2</staff>"));
+        assert!(p_xml.contains("<backup><duration>1920</duration></backup>"));
+
+        // 2) Voice + Piano (G2, G2, F4) -> 2 <part>s: P1 (1-staff Voice) + P2 (2-staff Piano)
+        let vp = concat!(
+            "clef-G-2 key+0 time-4-4 clef-G-2 key+0 time-4-4 clef-F-4 key+0 time-4-4 ",
+            "voice-1 whole A 4 voice-2 whole C 5 voice-3 whole C 3 bar-light-heavy"
+        );
+        let vp_dec = decode_bekern_unmerged(vp).unwrap();
+        let (vp_score, _) = parse_score(&vp_dec).unwrap();
+        let vp_xml = to_musicxml(&vp_score, &mut LossTable::default());
+        assert!(!has_errors(&validate_musicxml(&vp_xml)));
+        assert_eq!(vp_xml.matches("<part id=").count(), 2, "voice+piano must emit 2 <part>s");
+        assert_eq!(vp_xml.matches("<staves>2</staves>").count(), 1);
+
+        // 3) String quartet (G2, G2, C3, F4) -> 4 separate 1-staff <part>s, NO <staves>2</staves>
+        let sq = concat!(
+            "clef-G-2 key+0 time-4-4 clef-G-2 key+0 time-4-4 ",
+            "clef-C-3 key+0 time-4-4 clef-F-4 key+0 time-4-4 ",
+            "voice-1 whole E 5 voice-2 whole C 5 voice-3 whole G 4 voice-4 whole C 3 bar-light-heavy"
+        );
+        let sq_dec = decode_bekern_unmerged(sq).unwrap();
+        let (sq_score, _) = parse_score(&sq_dec).unwrap();
+        let sq_xml = to_musicxml(&sq_score, &mut LossTable::default());
+        assert!(!has_errors(&validate_musicxml(&sq_xml)));
+        assert_eq!(sq_xml.matches("<part id=").count(), 4, "string quartet must keep 4 separate <part>s");
+        assert!(!sq_xml.contains("<staves>2</staves>"));
     }
 }

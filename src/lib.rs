@@ -215,6 +215,9 @@ pub struct PartInput {
     pub clef_line: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clef_octave_change: Option<i32>,
+    /// Part/staff-scoped measure overrides (mid-piece clefs, dynamics, hairpins).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub measure_attrs: Vec<MeasureAttr>,
 }
 
 impl Default for PartInput {
@@ -225,6 +228,7 @@ impl Default for PartInput {
             clef_sign: None,
             clef_line: None,
             clef_octave_change: None,
+            measure_attrs: Vec::new(),
         }
     }
 }
@@ -401,6 +405,7 @@ pub struct Part {
     pub clef_sign: Option<char>,
     pub clef_line: Option<u32>,
     pub clef_octave_change: Option<i32>,
+    pub measure_attrs: Vec<MeasureAttr>,
 }
 
 /// Fully resolved score plus the loss table accumulated while building it.
@@ -771,7 +776,14 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
         return Err(format!("unsupported beat_type {beat_type}"));
     }
 
-    type RawPart<'a> = (String, &'a [NoteInput], Option<char>, Option<u32>, Option<i32>);
+    type RawPart<'a> = (
+        String,
+        &'a [NoteInput],
+        Option<char>,
+        Option<u32>,
+        Option<i32>,
+        &'a [MeasureAttr],
+    );
     let raw_parts: Vec<RawPart<'_>> = if !input.parts.is_empty() {
         input
             .parts
@@ -787,6 +799,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                     p.clef_sign,
                     p.clef_line,
                     p.clef_octave_change,
+                    p.measure_attrs.as_slice(),
                 )
             })
             .collect()
@@ -800,15 +813,16 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
             None,
             None,
             None,
+            &[],
         )]
     };
-    if raw_parts.iter().all(|(_, n, _, _, _)| n.is_empty()) {
+    if raw_parts.iter().all(|(_, n, _, _, _, _)| n.is_empty()) {
         return Err("score has no notes".to_string());
     }
 
     let mut losses = LossTable::default();
     let mut parts = Vec::new();
-    for (pname, notes, clef_sign, clef_line, clef_octave_change) in &raw_parts {
+    for (pname, notes, clef_sign, clef_line, clef_octave_change, part_attrs) in &raw_parts {
         if notes.is_empty() {
             continue;
         }
@@ -1008,6 +1022,10 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
         let mut voices: Vec<u32> = groups.iter().map(|g| g.voice).collect();
         voices.sort();
         voices.dedup();
+        let mut p_measure_attrs = part_attrs.to_vec();
+        if !p_measure_attrs.is_sorted_by_key(|a| a.measure) {
+            p_measure_attrs.sort_by_key(|a| a.measure);
+        }
         parts.push(Part {
             name: pname.clone(),
             groups,
@@ -1016,6 +1034,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
             clef_sign: *clef_sign,
             clef_line: *clef_line,
             clef_octave_change: *clef_octave_change,
+            measure_attrs: p_measure_attrs,
         });
     }
 
@@ -1291,7 +1310,10 @@ fn push_note_xml(
     divisions: u32,
     losses: &mut LossTable,
     part_name: &str,
+    voice_override: Option<u32>,
+    staff_num: Option<u32>,
 ) {
+    let voice_num = voice_override.unwrap_or(seg.note.voice);
     // Grace notes occupy no time: `<grace/>` plus the engraved `<type>`
     // for display, and no `<duration>` (which is also what the scorer
     // reads, so grace round-trips as zero-duration events).
@@ -1325,7 +1347,7 @@ fn push_note_xml(
                 None,
             );
         }
-        let _ = writeln!(out, "        <voice>{}</voice>", seg.note.voice);
+        let _ = writeln!(out, "        <voice>{voice_num}</voice>");
         let _ = writeln!(out, "        <type>{typename}</type>");
         for _ in 0..dots {
             out.push_str("        <dot/>\n");
@@ -1334,6 +1356,9 @@ fn push_note_xml(
             if let Some(acc) = accidental_name(seg.note.alter) {
                 let _ = writeln!(out, "        <accidental>{acc}</accidental>");
             }
+        }
+        if let Some(st) = staff_num {
+            let _ = writeln!(out, "        <staff>{st}</staff>");
         }
         write_notations_xml(out, seg);
         out.push_str("      </note>\n");
@@ -1385,7 +1410,7 @@ fn push_note_xml(
     if tie_stop {
         out.push_str("        <tie type=\"stop\"/>\n");
     }
-    let _ = writeln!(out, "        <voice>{}</voice>", seg.note.voice);
+    let _ = writeln!(out, "        <voice>{voice_num}</voice>");
     let _ = writeln!(out, "        <type>{typename}</type>");
     for _ in 0..dots {
         out.push_str("        <dot/>\n");
@@ -1400,6 +1425,9 @@ fn push_note_xml(
             out,
             "        <time-modification><actual-notes>{actual}</actual-notes><normal-notes>{normal}</normal-notes></time-modification>"
         );
+    }
+    if let Some(st) = staff_num {
+        let _ = writeln!(out, "        <staff>{st}</staff>");
     }
     if !seg.note.rest {
         write_notations_xml(out, seg);
@@ -1417,8 +1445,18 @@ fn push_note_xml(
 /// Write `<clef>` element for a recorded sign/line directly into `out`.
 /// The token spelling for a percussion clef is `p` (single char); MusicXML
 /// spells it `percussion`, and the pair re-parses to the same token.
-fn write_clef_xml(out: &mut String, sign: char, line: u32, octave_change: Option<i32>) {
-    out.push_str("        <clef><sign>");
+fn write_clef_xml(
+    out: &mut String,
+    sign: char,
+    line: u32,
+    octave_change: Option<i32>,
+    number: Option<u32>,
+) {
+    if let Some(n) = number {
+        let _ = write!(out, "        <clef number=\"{n}\"><sign>");
+    } else {
+        out.push_str("        <clef><sign>");
+    }
     if sign == 'p' {
         out.push_str("percussion");
     } else {
@@ -1433,9 +1471,8 @@ fn write_clef_xml(out: &mut String, sign: char, line: u32, octave_change: Option
     out.push_str("</clef>\n");
 }
 
-/// Measure-scoped override for one 1-based measure number, if any (last-wins).
-fn measure_attr(score: &Score, measure: u32) -> Option<&MeasureAttr> {
-    let attrs = &score.measure_attrs;
+/// Measure-scoped override for one 1-based measure number in a sorted slice (last-wins).
+fn measure_attr_in(attrs: &[MeasureAttr], measure: u32) -> Option<&MeasureAttr> {
     if attrs.is_empty() {
         return None;
     }
@@ -1447,25 +1484,67 @@ fn measure_attr(score: &Score, measure: u32) -> Option<&MeasureAttr> {
     }
 }
 
+/// Measure-scoped override for one 1-based measure number, if any (last-wins).
+fn measure_attr(score: &Score, measure: u32) -> Option<&MeasureAttr> {
+    measure_attr_in(&score.measure_attrs, measure)
+}
+
+/// Part-scoped measure override for one 1-based measure number, if any (last-wins).
+fn part_measure_attr(part: &Part, measure: u32) -> Option<&MeasureAttr> {
+    measure_attr_in(&part.measure_attrs, measure)
+}
+
+/// True when the last two parts form a standard piano grand-staff pair
+/// (`clef-G-2` followed by `clef-F-4`, neither octave-transposing) so MusicXML
+/// emits them as one `<part>` with `<staves>2</staves>` without breaking
+/// string quartets `(G2, G2, C3, F4)`.
+fn has_trailing_grand_staff(parts: &[Part]) -> bool {
+    if parts.len() < 2 {
+        return false;
+    }
+    let hi = &parts[parts.len() - 2];
+    let lo = &parts[parts.len() - 1];
+    hi.clef_sign == Some('G')
+        && hi.clef_line.unwrap_or(2) == 2
+        && hi.clef_octave_change.is_none()
+        && lo.clef_sign == Some('F')
+        && lo.clef_line.unwrap_or(4) == 4
+        && lo.clef_octave_change.is_none()
+}
+
 /// Write `<direction>` carrying one measure-level dynamic mark.
-fn write_dyn_direction_xml(out: &mut String, dynamic: &str) {
-    let _ = writeln!(
-        out,
-        "      <direction placement=\"below\"><direction-type><dynamics><{dynamic}/></dynamics></direction-type></direction>"
-    );
+fn write_dyn_direction_xml(out: &mut String, dynamic: &str, staff_num: Option<u32>) {
+    if let Some(st) = staff_num {
+        let _ = writeln!(
+            out,
+            "      <direction placement=\"below\"><direction-type><dynamics><{dynamic}/></dynamics></direction-type><staff>{st}</staff></direction>"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "      <direction placement=\"below\"><direction-type><dynamics><{dynamic}/></dynamics></direction-type></direction>"
+        );
+    }
 }
 
 /// Write `<direction>` carrying one hairpin wedge event.
-fn write_hairpin_direction_xml(out: &mut String, hairpin: &str) {
+fn write_hairpin_direction_xml(out: &mut String, hairpin: &str, staff_num: Option<u32>) {
     let wedge = match hairpin {
         "cresc" => "crescendo",
         "dim" => "diminuendo",
         _ => "stop",
     };
-    let _ = writeln!(
-        out,
-        "      <direction placement=\"below\"><direction-type><wedge type=\"{wedge}\"/></direction-type></direction>"
-    );
+    if let Some(st) = staff_num {
+        let _ = writeln!(
+            out,
+            "      <direction placement=\"below\"><direction-type><wedge type=\"{wedge}\"/></direction-type><staff>{st}</staff></direction>"
+        );
+    } else {
+        let _ = writeln!(
+            out,
+            "      <direction placement=\"below\"><direction-type><wedge type=\"{wedge}\"/></direction-type></direction>"
+        );
+    }
 }
 
 /// Write `<barline>` for a recorded bar style. The rendering re-parses to the
@@ -1527,6 +1606,57 @@ pub fn to_musicxml(score: &Score, losses: &mut LossTable) -> String {
     to_musicxml_version(score, MusicXmlVersion::V31, losses)
 }
 
+/// Render a clean empty 0-measure MusicXML 3.1 `<score-partwise>` document
+/// (used when a page has 0 pitched notes and abstains, e.g. blank-staff or
+/// text-only negative controls).
+pub fn to_empty_musicxml(title: &str) -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str("<!DOCTYPE score-partwise PUBLIC \"-//Recordare//DTD MusicXML 3.1 Partwise//EN\" \"http://www.musicxml.org/dtds/partwise.dtd\">\n");
+    out.push_str("<score-partwise version=\"3.1\">\n");
+    out.push_str("  <work><work-title>");
+    write_escaped_xml(&mut out, title);
+    out.push_str("</work-title></work>\n");
+    out.push_str("  <part-list>\n");
+    out.push_str("    <score-part id=\"P1\"><part-name>Part 1</part-name></score-part>\n");
+    out.push_str("  </part-list>\n");
+    out.push_str("  <part id=\"P1\">\n");
+    out.push_str("  </part>\n");
+    out.push_str("</score-partwise>\n");
+    out
+}
+
+/// Render a clean empty 0-measure MuseScore 4 `.mscx` document for abstained
+/// zero-note pages.
+pub fn to_empty_mscx(title: &str) -> String {
+    let mut out = String::with_capacity(512);
+    out.push_str("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n");
+    out.push_str("<museScore version=\"4.20\">\n");
+    out.push_str("  <programVersion>4.2.0</programVersion>\n");
+    out.push_str("  <Score>\n");
+    let _ = writeln!(out, "    <Division>{SCORE_DIVISIONS}</Division>");
+    out.push_str("    <metaTag name=\"workTitle\">");
+    write_escaped_xml(&mut out, title);
+    out.push_str("</metaTag>\n");
+    out.push_str("    <Part id=\"1\">\n");
+    out.push_str("      <Staff>\n");
+    out.push_str("        <StaffType group=\"pitched\">\n");
+    out.push_str("          <name>stdNormal</name>\n");
+    out.push_str("          </StaffType>\n");
+    out.push_str("        </Staff>\n");
+    out.push_str("      <trackName>Part 1</trackName>\n");
+    out.push_str("      <Instrument>\n");
+    out.push_str("        <longName>Part 1</longName>\n");
+    out.push_str("        <trackName>Part 1</trackName>\n");
+    out.push_str("        </Instrument>\n");
+    out.push_str("      </Part>\n");
+    out.push_str("    <Staff id=\"1\">\n");
+    out.push_str("      </Staff>\n");
+    out.push_str("    </Score>\n");
+    out.push_str("  </museScore>\n");
+    out
+}
+
 /// Render the score as MusicXML partwise at the requested [`MusicXmlVersion`]
 /// (`3.1` or `4.0`).
 pub fn to_musicxml_version(
@@ -1558,16 +1688,36 @@ pub fn to_musicxml_version(
         write_escaped_xml(&mut out, c);
         out.push_str("</creator>\n  </identification>\n");
     }
+
+    let grand_staff = has_trailing_grand_staff(&score.parts);
+    let single_count = if grand_staff {
+        score.parts.len() - 2
+    } else {
+        score.parts.len()
+    };
+
     out.push_str("  <part-list>\n");
-    for (i, part) in score.parts.iter().enumerate() {
+    for (i, part) in score.parts.iter().take(single_count).enumerate() {
         let _ = write!(out, "    <score-part id=\"P{}\"><part-name>", i + 1);
         write_escaped_xml(&mut out, &part.name);
+        out.push_str("</part-name></score-part>\n");
+    }
+    if grand_staff {
+        let p_id = single_count + 1;
+        let hi_name = &score.parts[single_count].name;
+        let gs_name = if hi_name.starts_with("Staff ") {
+            "Piano"
+        } else {
+            hi_name.as_str()
+        };
+        let _ = write!(out, "    <score-part id=\"P{p_id}\"><part-name>");
+        write_escaped_xml(&mut out, gs_name);
         out.push_str("</part-name></score-part>\n");
     }
     out.push_str("  </part-list>\n");
 
     let windows = score.measure_windows();
-    for (i, part) in score.parts.iter().enumerate() {
+    for (i, part) in score.parts.iter().take(single_count).enumerate() {
         let _ = writeln!(out, "  <part id=\"P{}\">", i + 1);
         let layout = layout_part(score, part, losses);
         for (m, voices) in layout.iter().enumerate() {
@@ -1576,12 +1726,14 @@ pub fn to_musicxml_version(
                 .map(|&(a, b)| b - a)
                 .unwrap_or_else(|| score.measure_ticks());
             let _ = writeln!(out, "    <measure number=\"{}\">", m + 1);
-            let attrs = measure_attr(score, m as u32 + 1);
+            let m1 = m as u32 + 1;
+            let s_attrs = measure_attr(score, m1);
+            let p_attrs = part_measure_attr(part, m1);
             if m == 0 {
                 let (clef_s, clef_l, clef_oct) = if let Some(s) = part.clef_sign {
                     (s, part.clef_line.unwrap_or(2), part.clef_octave_change)
                 } else {
-                    match attrs {
+                    match p_attrs.or(s_attrs) {
                         Some(a) => (
                             a.clef_sign.unwrap_or('G'),
                             a.clef_line.unwrap_or(2),
@@ -1590,8 +1742,14 @@ pub fn to_musicxml_version(
                         None => ('G', 2, None),
                     }
                 };
-                let key = attrs.and_then(|a| a.key_fifths).unwrap_or(score.key_fifths);
-                let (beats, beat_type) = match attrs.and_then(|a| a.time) {
+                let key = p_attrs
+                    .and_then(|a| a.key_fifths)
+                    .or_else(|| s_attrs.and_then(|a| a.key_fifths))
+                    .unwrap_or(score.key_fifths);
+                let (beats, beat_type) = match p_attrs
+                    .and_then(|a| a.time)
+                    .or_else(|| s_attrs.and_then(|a| a.time))
+                {
                     Some(t) => (t.beats, t.beat_type),
                     None => (score.beats, score.beat_type),
                 };
@@ -1602,44 +1760,72 @@ pub fn to_musicxml_version(
                     out,
                     "        <time><beats>{beats}</beats><beat-type>{beat_type}</beat-type></time>"
                 );
-                write_clef_xml(&mut out, clef_s, clef_l, clef_oct);
+                write_clef_xml(&mut out, clef_s, clef_l, clef_oct, None);
                 out.push_str("      </attributes>\n");
-            } else if let Some(a) = attrs {
-                let has_clef = a.clef_sign.is_some()
-                    || a.clef_line.is_some()
-                    || a.clef_octave_change.is_some();
-                if has_clef || a.key_fifths.is_some() || a.time.is_some() {
+            } else {
+                let p_has_clef = p_attrs.is_some_and(|a| {
+                    a.clef_sign.is_some() || a.clef_line.is_some() || a.clef_octave_change.is_some()
+                });
+                let s_has_clef = s_attrs.is_some_and(|a| {
+                    a.clef_sign.is_some() || a.clef_line.is_some() || a.clef_octave_change.is_some()
+                });
+                let clef_src = if p_has_clef {
+                    p_attrs
+                } else if s_has_clef {
+                    s_attrs
+                } else {
+                    None
+                };
+                let key_change = p_attrs
+                    .and_then(|a| a.key_fifths)
+                    .or_else(|| s_attrs.and_then(|a| a.key_fifths));
+                let time_change = p_attrs
+                    .and_then(|a| a.time)
+                    .or_else(|| s_attrs.and_then(|a| a.time));
+                if clef_src.is_some() || key_change.is_some() || time_change.is_some() {
                     out.push_str("      <attributes>\n");
-                    if has_clef {
-                        write_clef_xml(
-                            &mut out,
-                            a.clef_sign.unwrap_or('G'),
-                            a.clef_line.unwrap_or(2),
-                            a.clef_octave_change,
-                        );
-                    }
-                    if let Some(k) = a.key_fifths {
+                    if let Some(k) = key_change {
                         let _ = writeln!(out, "        <key><fifths>{k}</fifths></key>");
                     }
-                    if let Some(t) = a.time {
+                    if let Some(t) = time_change {
                         let _ = writeln!(
                             out,
                             "        <time><beats>{}</beats><beat-type>{}</beat-type></time>",
                             t.beats, t.beat_type
                         );
                     }
+                    if let Some(a) = clef_src {
+                        write_clef_xml(
+                            &mut out,
+                            a.clef_sign.unwrap_or('G'),
+                            a.clef_line.unwrap_or(2),
+                            a.clef_octave_change,
+                            None,
+                        );
+                    }
                     out.push_str("      </attributes>\n");
                 }
             }
-            if let Some(b) = attrs.and_then(|a| a.barline_left.as_deref()) {
+            if let Some(b) = p_attrs
+                .and_then(|a| a.barline_left.as_deref())
+                .or_else(|| s_attrs.and_then(|a| a.barline_left.as_deref()))
+            {
                 write_barline_xml(&mut out, false, b);
             }
-            if let Some(a) = attrs {
+            if let Some(a) = s_attrs {
                 for d in a.all_dynamics() {
-                    write_dyn_direction_xml(&mut out, d);
+                    write_dyn_direction_xml(&mut out, d, None);
                 }
                 for h in a.all_hairpins() {
-                    write_hairpin_direction_xml(&mut out, h);
+                    write_hairpin_direction_xml(&mut out, h, None);
+                }
+            }
+            if let Some(a) = p_attrs {
+                for d in a.all_dynamics() {
+                    write_dyn_direction_xml(&mut out, d, None);
+                }
+                for h in a.all_hairpins() {
+                    write_hairpin_direction_xml(&mut out, h, None);
                 }
             }
             for (vi, (_voice, segs)) in voices.iter().enumerate() {
@@ -1647,16 +1833,186 @@ pub fn to_musicxml_version(
                     let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
                 }
                 for s in segs {
-                    push_note_xml(&mut out, s, score.divisions, losses, &part.name);
+                    push_note_xml(&mut out, s, score.divisions, losses, &part.name, None, None);
                 }
             }
-            if let Some(b) = attrs.and_then(|a| a.barline_right.as_deref()) {
+            if let Some(b) = p_attrs
+                .and_then(|a| a.barline_right.as_deref())
+                .or_else(|| s_attrs.and_then(|a| a.barline_right.as_deref()))
+            {
                 write_barline_xml(&mut out, true, b);
             }
             out.push_str("    </measure>\n");
         }
         out.push_str("  </part>\n");
     }
+
+    if grand_staff {
+        let p_id = single_count + 1;
+        let part_hi = &score.parts[single_count];
+        let part_lo = &score.parts[single_count + 1];
+        let layout_hi = layout_part(score, part_hi, losses);
+        let layout_lo = layout_part(score, part_lo, losses);
+        let n_measures = layout_hi.len().max(layout_lo.len());
+
+        let _ = writeln!(out, "  <part id=\"P{p_id}\">");
+        for m in 0..n_measures {
+            let mlen = windows
+                .get(m)
+                .map(|&(a, b)| b - a)
+                .unwrap_or_else(|| score.measure_ticks());
+            let _ = writeln!(out, "    <measure number=\"{}\">", m + 1);
+            let m1 = m as u32 + 1;
+            let s_attrs = measure_attr(score, m1);
+            let p1_attrs = part_measure_attr(part_hi, m1);
+            let p2_attrs = part_measure_attr(part_lo, m1);
+            if m == 0 {
+                let key = s_attrs.and_then(|a| a.key_fifths).unwrap_or(score.key_fifths);
+                let (beats, beat_type) = match s_attrs.and_then(|a| a.time) {
+                    Some(t) => (t.beats, t.beat_type),
+                    None => (score.beats, score.beat_type),
+                };
+                out.push_str("      <attributes>\n");
+                let _ = writeln!(out, "        <divisions>{}</divisions>", score.divisions);
+                let _ = writeln!(out, "        <key><fifths>{key}</fifths></key>");
+                let _ = writeln!(
+                    out,
+                    "        <time><beats>{beats}</beats><beat-type>{beat_type}</beat-type></time>"
+                );
+                out.push_str("        <staves>2</staves>\n");
+                write_clef_xml(
+                    &mut out,
+                    part_hi.clef_sign.unwrap_or('G'),
+                    part_hi.clef_line.unwrap_or(2),
+                    part_hi.clef_octave_change,
+                    Some(1),
+                );
+                write_clef_xml(
+                    &mut out,
+                    part_lo.clef_sign.unwrap_or('F'),
+                    part_lo.clef_line.unwrap_or(4),
+                    part_lo.clef_octave_change,
+                    Some(2),
+                );
+                out.push_str("      </attributes>\n");
+            } else {
+                let p1_clef = p1_attrs.filter(|a| {
+                    a.clef_sign.is_some() || a.clef_line.is_some() || a.clef_octave_change.is_some()
+                });
+                let p2_clef = p2_attrs.filter(|a| {
+                    a.clef_sign.is_some() || a.clef_line.is_some() || a.clef_octave_change.is_some()
+                });
+                let key_change = s_attrs.and_then(|a| a.key_fifths);
+                let time_change = s_attrs.and_then(|a| a.time);
+                if p1_clef.is_some()
+                    || p2_clef.is_some()
+                    || key_change.is_some()
+                    || time_change.is_some()
+                {
+                    out.push_str("      <attributes>\n");
+                    if let Some(k) = key_change {
+                        let _ = writeln!(out, "        <key><fifths>{k}</fifths></key>");
+                    }
+                    if let Some(t) = time_change {
+                        let _ = writeln!(
+                            out,
+                            "        <time><beats>{}</beats><beat-type>{}</beat-type></time>",
+                            t.beats, t.beat_type
+                        );
+                    }
+                    if let Some(a) = p1_clef {
+                        write_clef_xml(
+                            &mut out,
+                            a.clef_sign.unwrap_or('G'),
+                            a.clef_line.unwrap_or(2),
+                            a.clef_octave_change,
+                            Some(1),
+                        );
+                    }
+                    if let Some(a) = p2_clef {
+                        write_clef_xml(
+                            &mut out,
+                            a.clef_sign.unwrap_or('F'),
+                            a.clef_line.unwrap_or(4),
+                            a.clef_octave_change,
+                            Some(2),
+                        );
+                    }
+                    out.push_str("      </attributes>\n");
+                }
+            }
+            if let Some(b) = s_attrs.and_then(|a| a.barline_left.as_deref()) {
+                write_barline_xml(&mut out, false, b);
+            }
+            if let Some(a) = s_attrs {
+                for d in a.all_dynamics() {
+                    write_dyn_direction_xml(&mut out, d, Some(1));
+                }
+                for h in a.all_hairpins() {
+                    write_hairpin_direction_xml(&mut out, h, Some(1));
+                }
+            }
+            if let Some(a) = p1_attrs {
+                for d in a.all_dynamics() {
+                    write_dyn_direction_xml(&mut out, d, Some(1));
+                }
+                for h in a.all_hairpins() {
+                    write_hairpin_direction_xml(&mut out, h, Some(1));
+                }
+            }
+            let voices1 = layout_hi.get(m).map(Vec::as_slice).unwrap_or(&[]);
+            for (vi, (_voice, segs)) in voices1.iter().enumerate() {
+                if vi > 0 {
+                    let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+                }
+                for s in segs {
+                    push_note_xml(
+                        &mut out,
+                        s,
+                        score.divisions,
+                        losses,
+                        &part_hi.name,
+                        None,
+                        Some(1),
+                    );
+                }
+            }
+            let voices2 = layout_lo.get(m).map(Vec::as_slice).unwrap_or(&[]);
+            if !voices1.is_empty() && !voices2.is_empty() {
+                let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+            }
+            if let Some(a) = p2_attrs {
+                for d in a.all_dynamics() {
+                    write_dyn_direction_xml(&mut out, d, Some(2));
+                }
+                for h in a.all_hairpins() {
+                    write_hairpin_direction_xml(&mut out, h, Some(2));
+                }
+            }
+            for (vi, (_voice, segs)) in voices2.iter().enumerate() {
+                if vi > 0 {
+                    let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+                }
+                for s in segs {
+                    push_note_xml(
+                        &mut out,
+                        s,
+                        score.divisions,
+                        losses,
+                        &part_lo.name,
+                        None,
+                        Some(2),
+                    );
+                }
+            }
+            if let Some(b) = s_attrs.and_then(|a| a.barline_right.as_deref()) {
+                write_barline_xml(&mut out, true, b);
+            }
+            out.push_str("    </measure>\n");
+        }
+        out.push_str("  </part>\n");
+    }
+
     out.push_str("</score-partwise>\n");
     out
 }
@@ -1942,34 +2298,40 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
         let mut hp_stop_end: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
         let mut open_hp: Option<(usize, u8)> = None;
         for m in 0..n_measures {
-            if let Some(a) = measure_attr(score, m as u32 + 1) {
-                for h in a.all_hairpins() {
-                    match h {
-                        "cresc" | "dim" => {
-                            if let Some((sm, sub)) = open_hp.take() {
-                                if m > sm {
-                                    let dm = m as i64 - sm as i64;
-                                    hp_start.entry(sm).or_default().push((sub, dm, 0));
-                                    hp_stop_start.entry(m).or_default().push((-dm, 0));
-                                }
+            let m1 = m as u32 + 1;
+            let mut m_hps: Vec<&str> = Vec::new();
+            if let Some(a) = measure_attr(score, m1) {
+                m_hps.extend(a.all_hairpins());
+            }
+            if let Some(a) = part_measure_attr(part, m1) {
+                m_hps.extend(a.all_hairpins());
+            }
+            for h in m_hps {
+                match h {
+                    "cresc" | "dim" => {
+                        if let Some((sm, sub)) = open_hp.take() {
+                            if m > sm {
+                                let dm = m as i64 - sm as i64;
+                                hp_start.entry(sm).or_default().push((sub, dm, 0));
+                                hp_stop_start.entry(m).or_default().push((-dm, 0));
                             }
-                            let sub = if h == "cresc" { 0 } else { 1 };
-                            open_hp = Some((m, sub));
                         }
-                        _ => {
-                            if let Some((sm, sub)) = open_hp.take() {
-                                if m > sm {
-                                    let dm = m as i64 - sm as i64;
-                                    hp_start.entry(sm).or_default().push((sub, dm, 0));
-                                    hp_stop_start.entry(m).or_default().push((-dm, 0));
-                                } else {
-                                    let mlen = windows
-                                        .get(m)
-                                        .map(|&(a, b)| b - a)
-                                        .unwrap_or_else(|| score.measure_ticks());
-                                    hp_start.entry(sm).or_default().push((sub, 0, mlen));
-                                    hp_stop_end.entry(m).or_default().push((0, -mlen));
-                                }
+                        let sub = if h == "cresc" { 0 } else { 1 };
+                        open_hp = Some((m, sub));
+                    }
+                    _ => {
+                        if let Some((sm, sub)) = open_hp.take() {
+                            if m > sm {
+                                let dm = m as i64 - sm as i64;
+                                hp_start.entry(sm).or_default().push((sub, dm, 0));
+                                hp_stop_start.entry(m).or_default().push((-dm, 0));
+                            } else {
+                                let mlen = windows
+                                    .get(m)
+                                    .map(|&(a, b)| b - a)
+                                    .unwrap_or_else(|| score.measure_ticks());
+                                hp_start.entry(sm).or_default().push((sub, 0, mlen));
+                                hp_stop_end.entry(m).or_default().push((0, -mlen));
                             }
                         }
                     }
@@ -1993,7 +2355,9 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
         let mut cur_key = score.key_fifths;
 
         for (m, voices) in grouped.iter().enumerate() {
-            let attrs = measure_attr(score, m as u32 + 1);
+            let m1 = m as u32 + 1;
+            let attrs = measure_attr(score, m1);
+            let p_attrs = part_measure_attr(part, m1);
             if let Some(a) = attrs {
                 if let Some(t) = a.time {
                     cur_sig = (t.beats, t.beat_type);
@@ -2051,11 +2415,21 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                         let _ = writeln!(out, "            <sigN>{}</sigN>", cur_sig.0);
                         let _ = writeln!(out, "            <sigD>{}</sigD>", cur_sig.1);
                         out.push_str("            </TimeSig>\n");
-                    } else if let Some(a) = attrs {
-                        if a.clef_sign.is_some()
-                            || a.clef_line.is_some()
-                            || a.clef_octave_change.is_some()
-                        {
+                    } else {
+                        let clef_src = p_attrs
+                            .filter(|a| {
+                                a.clef_sign.is_some()
+                                    || a.clef_line.is_some()
+                                    || a.clef_octave_change.is_some()
+                            })
+                            .or_else(|| {
+                                attrs.filter(|a| {
+                                    a.clef_sign.is_some()
+                                        || a.clef_line.is_some()
+                                        || a.clef_octave_change.is_some()
+                                })
+                            });
+                        if let Some(a) = clef_src {
                             let ct = mscx_clef_type(
                                 a.clef_sign.unwrap_or('G'),
                                 a.clef_line.unwrap_or(2),
@@ -2072,12 +2446,12 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                             );
                             out.push_str("            </Clef>\n");
                         }
-                        if a.key_fifths.is_some() {
+                        if attrs.is_some_and(|a| a.key_fifths.is_some()) {
                             out.push_str("          <KeySig>\n");
                             let _ = writeln!(out, "            <concertKey>{cur_key}</concertKey>");
                             out.push_str("            </KeySig>\n");
                         }
-                        if a.time.is_some() {
+                        if attrs.is_some_and(|a| a.time.is_some()) {
                             out.push_str("          <TimeSig>\n");
                             let _ = writeln!(out, "            <sigN>{}</sigN>", cur_sig.0);
                             let _ = writeln!(out, "            <sigD>{}</sigD>", cur_sig.1);
@@ -2086,6 +2460,13 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                     }
 
                     if let Some(a) = attrs {
+                        for d in a.all_dynamics() {
+                            out.push_str("          <Dynamic>\n            <subtype>");
+                            write_escaped_xml(&mut out, d);
+                            out.push_str("</subtype>\n            </Dynamic>\n");
+                        }
+                    }
+                    if let Some(a) = p_attrs {
                         for d in a.all_dynamics() {
                             out.push_str("          <Dynamic>\n            <subtype>");
                             write_escaped_xml(&mut out, d);
