@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use mscz::{
-    bekern::to_bekern,
+    bekern::{to_bekern, to_bekern_v2},
     decode::{decode_bekern, decode_bekern_unmerged},
     example_input, has_errors, is_empty_score_input,
     lattice::{rank_measures, read_lattice},
@@ -151,6 +151,10 @@ struct BekernArgs {
     /// Output file stem, e.g. `ds0001-1` for page image `ds0001-1.png`.
     #[arg(long)]
     stem: String,
+    /// Emit `bekern+v2` (explicit `<staff>`, cursor-anchored dynamics/hairpins/
+    /// ottavas, extended Phase A dynamics/articulations, `tup-open`/`tup-close`).
+    #[arg(long, default_value_t = false)]
+    v2: bool,
 }
 
 #[derive(Args, Debug)]
@@ -640,8 +644,12 @@ fn cmd_bekern(a: &BekernArgs) -> Result<(), Err> {
     } else {
         staff_headers(&xml).map_err(|e| format!("{}: {e}", a.input.display()))?
     };
-    let (toks, graces) =
-        to_bekern(&events, &headers).map_err(|e| format!("{} {scope}: {e}", a.input.display()))?;
+    let (toks, graces) = if a.v2 {
+        to_bekern_v2(&events, &headers)
+    } else {
+        to_bekern(&events, &headers)
+    }
+    .map_err(|e| format!("{} {scope}: {e}", a.input.display()))?;
     fs::create_dir_all(&a.out).map_err(|e| format!("mkdir {}: {e}", a.out.display()))?;
     write_file(
         &a.out.join(format!("{}-bekern.txt", a.stem)),

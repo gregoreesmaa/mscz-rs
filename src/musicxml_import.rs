@@ -954,6 +954,7 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
         // the first attributes block) versus pending changes (diffs that
         // ride on the next non-chord event).
         let mut cur_clefs: HashMap<u32, (char, u32, Option<i32>)> = HashMap::new();
+        let mut voice_home_staff: HashMap<u32, u32> = HashMap::new();
         let mut cur_key: Option<i32> = None;
         let mut cur_time: Option<(u32, u32)> = None;
         let mut pend_clef: HashMap<u32, (char, u32, Option<i32>)> = HashMap::new();
@@ -1127,6 +1128,12 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                         let local = n.staff.unwrap_or(last_staff).max(1);
                         last_staff = local;
                         part_staves = part_staves.max(local);
+                        let home_staff = *voice_home_staff.entry(n.voice).or_insert(local);
+                        let xstaff = if local != home_staff {
+                            Some((local as i32 - home_staff as i32).clamp(-1, 1) as i8)
+                        } else {
+                            None
+                        };
                         let mut ev = BekernNote {
                             measure,
                             onset: round3(onset as f64 / div),
@@ -1143,7 +1150,7 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                             articulations: n.articulations,
                             v2_articulations: n.v2_articulations,
                             cue: n.cue,
-                            xstaff: None,
+                            xstaff,
                             tuplet_ratio: n.tuplet_ratio,
                             tuplet_start: n.tuplet_start,
                             tuplet_stop: n.tuplet_stop,

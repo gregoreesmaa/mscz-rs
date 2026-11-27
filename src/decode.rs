@@ -329,9 +329,15 @@ fn clef_center_midi(sign: char, line: u32, oct: Option<i32>) -> f64 {
 /// - When `v > k`, a small DP finds the minimum-cost monotonic contiguous
 ///   partition of `0..v` into `k` non-empty staff blocks matching each staff's
 ///   clef register, numbering local voices `1..=4` within each staff.
+/// - When multiple staves share identical clef centers (e.g. 6-staff SATB+Piano
+///   all in `clef-G-2`, or 3-staff voice+piano `G-2, G-2, F-4`), excess
+///   polyphonic voices are spread quadratically and biased toward the bottom /
+///   later staves (e.g. piano RH/LH) rather than collapsing into Staff 1, with
+///   gentle cross-measure pitch continuity from `prev_staff_midi`.
 fn assign_segments_to_staves(
     seg_mean_midi: &[Option<f64>],
     clefs: &[(char, u32, Option<i32>)],
+    prev_staff_midi: &[Option<f64>],
 ) -> Vec<(usize, u32)> {
     let v = seg_mean_midi.len();
     let k = clefs.len();
@@ -355,21 +361,31 @@ fn assign_segments_to_staves(
 
     for s in 1..=k {
         let center = centers[s - 1];
+        let prev_midi = prev_staff_midi.get(s - 1).copied().flatten();
         for i in s..=(v - (k - s)) {
             let mut seg_cost = 0.0;
             for j in (s - 1..i).rev() {
                 if let Some(m) = seg_mean_midi[j] {
                     seg_cost += (m - center).abs();
+                    if let Some(pm) = prev_midi {
+                        seg_cost += (m - pm).abs() * 0.15;
+                    }
                 }
                 let block_len = i - j;
-                // Gentle preference for balanced voice counts & staying <= 4 voices/staff.
+                let extra = (block_len - 1) as f64;
+                // Hard preference for staying <= 4 voices/staff (MuseScore track limit).
                 let over_cap = if block_len > 4 {
                     (block_len - 4) as f64 * 500.0
                 } else {
                     0.0
                 };
-                let balance = (block_len as f64 - 1.0) * 0.25;
-                let cand = dp[s - 1][j] + seg_cost + balance + over_cap;
+                // Convex balance penalty (quadratic so spreading excess voices across
+                // staves strictly beats piling them into one staff) + bottom-staff bias
+                // so same-clef scores (e.g. SATB+Piano or Voice+Piano) merge extra
+                // polyphonic voices onto the lower/piano staves instead of Staff 1.
+                let balance = extra * extra * 0.5;
+                let staff_pos_bias = extra * ((k - s) as f64) * 0.35;
+                let cand = dp[s - 1][j] + seg_cost + balance + staff_pos_bias + over_cap;
                 if cand < dp[s][i] {
                     dp[s][i] = cand;
                     prev[s][i] = j;
@@ -507,6 +523,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
     };
     let mut time_set = false;
     let mut leading_clefs: Vec<(char, u32, Option<i32>)> = Vec::new();
+    let mut leading_keys: Vec<Option<i32>> = Vec::new();
     let mut leading_clef_oct: Option<(char, u32, i32)> = None;
     let mut i = 0;
     while i < toks.len() {
@@ -514,6 +531,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         if t.starts_with("clef-") {
             let (sign, line, oct) = parse_clef_token(t)?;
             leading_clefs.push((sign, line, oct));
+            leading_keys.push(None);
             if let Some(o) = oct {
                 if leading_clef_oct.is_none() {
                     leading_clef_oct = Some((sign, line, o));
@@ -521,10 +539,16 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             }
             i += 1;
         } else if let Some(rest) = t.strip_prefix("key") {
-            if !time_set {
-                key_fifths = rest
-                    .parse::<i32>()
-                    .map_err(|_| format!("bad key token {t:?}"))?;
+            let fifths = rest
+                .parse::<i32>()
+                .map_err(|_| format!("bad key token {t:?}"))?;
+            if let Some(slot) = leading_keys.last_mut() {
+                *slot = Some(fifths);
+                if leading_keys.len() == 1 {
+                    key_fifths = fifths;
+                }
+            } else {
+                key_fifths = fifths;
             }
             i += 1;
         } else if let Some(rest) = t.strip_prefix("time-") {
@@ -550,6 +574,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
     let mut tagged_notes: Vec<(u32, usize, NoteInput)> = Vec::new();
     let mut measure_attrs: Vec<MeasureAttr> = Vec::new();
     let mut seg_clefs: Vec<(u32, Option<usize>, usize, char, u32, Option<i32>)> = Vec::new();
+    let mut seg_keys: Vec<(u32, Option<usize>, usize, i32)> = Vec::new();
     let mut seg_dyns: Vec<(u32, Option<usize>, usize, f64, String)> = Vec::new();
     let mut seg_hairpins: Vec<(u32, Option<usize>, usize, f64, String)> = Vec::new();
     let mut seg_timed: Vec<(u32, Option<usize>, usize, TimedEvent)> = Vec::new();
@@ -729,6 +754,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             let explicit_st = has_explicit_staff.then_some(cur_staff_idx);
             if !seen_event && measure == 0 {
                 leading_clefs.push((sign, line, oct));
+                leading_keys.push(None);
                 if leading_clefs.len() <= 1 {
                     if let Some(o) = oct {
                         let a = attr_for(&mut measure_attrs, 1);
@@ -772,18 +798,39 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                 .map_err(|_| format!("bad key token {t:?}"))?;
             let target_seg = resolve_target_seg(&toks, i + 1, seg);
             let onset_beats = voices.get(target_seg).copied().unwrap_or(0.0);
+            let explicit_st = has_explicit_staff.then_some(cur_staff_idx);
             if !seen_event && measure == 0 {
-                key_fifths = fifths;
+                if let Some(slot) = leading_keys.last_mut() {
+                    *slot = Some(fifths);
+                    if leading_keys.len() == 1 {
+                        key_fifths = fifths;
+                    }
+                } else {
+                    key_fifths = fifths;
+                }
             } else if onset_beats > 1e-6 {
-                attr_for(&mut measure_attrs, measure + 1)
-                    .timed_events
-                    .push(TimedEvent {
-                        onset_beats,
-                        kind: "key".to_string(),
-                        value: fifths.to_string(),
-                    });
+                let te = TimedEvent {
+                    onset_beats,
+                    kind: "key".to_string(),
+                    value: fifths.to_string(),
+                };
+                if leading_clefs.len() <= 1 && !has_explicit_staff {
+                    attr_for(&mut measure_attrs, measure + 1)
+                        .timed_events
+                        .push(te);
+                } else {
+                    seg_timed.push((measure, explicit_st, target_seg, te));
+                }
             } else {
-                attr_for(&mut measure_attrs, measure + 1).key_fifths = Some(fifths);
+                let has_distinct_keys = {
+                    let first = leading_keys.iter().flatten().next().copied();
+                    first.is_some_and(|fk| leading_keys.iter().flatten().any(|&k| k != fk))
+                };
+                if (leading_clefs.len() > 1 || has_explicit_staff) && has_distinct_keys {
+                    seg_keys.push((measure, explicit_st, target_seg, fifths));
+                } else {
+                    attr_for(&mut measure_attrs, measure + 1).key_fifths = Some(fifths);
+                }
             }
             i += 1;
             continue;
@@ -1214,6 +1261,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         tagged_notes.clear();
         measure_attrs.clear();
         seg_clefs.clear();
+        seg_keys.clear();
         seg_dyns.clear();
         seg_hairpins.clear();
         seg_timed.clear();
@@ -1232,6 +1280,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             clef_sign,
             clef_line,
             clef_octave_change,
+            key_fifths: leading_keys.first().copied().flatten(),
             measure_attrs: Vec::new(),
         }]
     } else if has_explicit_staff {
@@ -1257,6 +1306,10 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             a.clef_sign = Some(sign);
             a.clef_line = Some(line);
             a.clef_octave_change = oct;
+        }
+        for (m, explicit_st, _s_idx, fifths) in seg_keys {
+            let st = explicit_st.unwrap_or(0).min(k - 1);
+            attr_for(&mut part_measure_attrs[st], m + 1).key_fifths = Some(fifths);
         }
         for (m, explicit_st, _s_idx, onset_beats, d) in seg_dyns {
             let st = explicit_st.unwrap_or(0).min(k - 1);
@@ -1305,6 +1358,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                 clef_sign: Some(s),
                 clef_line: Some(l),
                 clef_octave_change: o,
+                key_fifths: leading_keys.get(idx).copied().flatten(),
                 measure_attrs: p_attrs,
             })
             .collect()
@@ -1332,12 +1386,31 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         }
         let mut measure_maps: std::collections::BTreeMap<u32, Vec<(usize, u32)>> =
             std::collections::BTreeMap::new();
+        let mut running_staff_midi: Vec<Option<f64>> = vec![None; k];
         for (m, stats) in by_measure {
             let means: Vec<Option<f64>> = stats
-                .into_iter()
-                .map(|(sum, cnt)| if cnt > 0 { Some(sum / cnt as f64) } else { None })
+                .iter()
+                .map(|&(sum, cnt)| if cnt > 0 { Some(sum / cnt as f64) } else { None })
                 .collect();
-            measure_maps.insert(m, assign_segments_to_staves(&means, &leading_clefs));
+            let map = assign_segments_to_staves(&means, &leading_clefs, &running_staff_midi);
+            // Update per-staff running mean MIDI for cross-measure continuity.
+            let mut staff_acc = vec![(0.0f64, 0usize); k];
+            for (seg_idx, &(st, _)) in map.iter().enumerate() {
+                if st < k && seg_idx < stats.len() {
+                    staff_acc[st].0 += stats[seg_idx].0;
+                    staff_acc[st].1 += stats[seg_idx].1;
+                }
+            }
+            for st in 0..k {
+                if staff_acc[st].1 > 0 {
+                    let cur_mean = staff_acc[st].0 / staff_acc[st].1 as f64;
+                    running_staff_midi[st] = Some(match running_staff_midi[st] {
+                        Some(prev) => 0.7 * prev + 0.3 * cur_mean,
+                        None => cur_mean,
+                    });
+                }
+            }
+            measure_maps.insert(m, map);
         }
 
         let total_notes = tagged_notes.len();
@@ -1366,6 +1439,10 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             a.clef_sign = Some(sign);
             a.clef_line = Some(line);
             a.clef_octave_change = oct;
+        }
+        for (m, _est, s_idx, fifths) in seg_keys {
+            let st = staff_of(m, s_idx);
+            attr_for(&mut part_measure_attrs[st], m + 1).key_fifths = Some(fifths);
         }
         for (m, _est, s_idx, onset_beats, d) in seg_dyns {
             let st = staff_of(m, s_idx);
@@ -1416,6 +1493,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                 clef_sign: Some(s),
                 clef_line: Some(l),
                 clef_octave_change: o,
+                key_fifths: leading_keys.get(idx).copied().flatten(),
                 measure_attrs: p_attrs,
             })
             .collect()
@@ -3028,13 +3106,18 @@ mod tests {
             "art-down-bow",
             "art-soft-accent",
             "cue",
-            "tuplet-start-6-4",
+            "tup-open",
+            "tup-close",
         ] {
             assert!(
                 toks_v2.iter().any(|t| t == tok),
                 "expected {tok} in v2 tokens: {joined}"
             );
         }
+        assert!(
+            joined.contains("tup-open 6 4"),
+            "expected rational tup-open 6 4 in v2 tokens: {joined}"
+        );
         let dec2 = decode_bekern_unmerged(&joined).unwrap();
         let (score2, _) = parse_score(&dec2).unwrap();
         let xml2 = to_musicxml(&score2, &mut LossTable::default());
@@ -3042,5 +3125,299 @@ mod tests {
         assert!(xml2.contains("<actual-notes>6</actual-notes><normal-notes>4</normal-notes>"));
         assert!(xml2.contains("<arpeggiate/>"));
         assert!(xml2.contains("<dynamics><rfz/></dynamics>"));
+    }
+
+    #[test]
+    fn all_treble_six_staff_dp_prefers_bottom_piano_staves_not_staff_one() {
+        use super::assign_segments_to_staves;
+
+        // 6-staff SATB+Piano all in clef-G-2 (like beach-prayer):
+        // 7 segments (1 extra polyphonic voice) -> must NOT pack into Staff 1 (idx 0);
+        // extra voice goes to bottom staff (idx 5), keeping staves 0..4 aligned 1-to-1.
+        let six_treble = vec![('G', 2, None); 6];
+        let seven_segs = vec![
+            Some(74.0),
+            Some(69.0),
+            Some(64.0),
+            Some(60.0),
+            Some(72.0),
+            Some(67.0),
+            Some(62.0),
+        ];
+        let map7 = assign_segments_to_staves(&seven_segs, &six_treble, &[]);
+        assert_eq!(map7[0], (0, 1), "Staff 1 stays 1-voice");
+        assert_eq!(map7[1], (1, 1), "Staff 2 stays 1-voice");
+        assert_eq!(map7[2], (2, 1), "Staff 3 stays 1-voice");
+        assert_eq!(map7[3], (3, 1), "Staff 4 stays 1-voice");
+        assert_eq!(map7[4], (4, 1), "Staff 5 stays 1-voice");
+        assert_eq!(map7[5], (5, 1), "Staff 6 voice 1");
+        assert_eq!(map7[6], (5, 2), "Staff 6 voice 2");
+
+        // 8 segments (2 extra polyphonic voices) -> spread across Piano RH (idx 4) & LH (idx 5),
+        // leaving SATB staves 0..3 strictly 1-voice each.
+        let eight_segs = vec![
+            Some(74.0),
+            Some(69.0),
+            Some(64.0),
+            Some(60.0),
+            Some(72.0),
+            Some(67.0),
+            Some(62.0),
+            Some(57.0),
+        ];
+        let map8 = assign_segments_to_staves(&eight_segs, &six_treble, &[]);
+        assert_eq!(map8[0], (0, 1));
+        assert_eq!(map8[1], (1, 1));
+        assert_eq!(map8[2], (2, 1));
+        assert_eq!(map8[3], (3, 1));
+        assert_eq!(map8[4], (4, 1));
+        assert_eq!(map8[5], (4, 2));
+        assert_eq!(map8[6], (5, 1));
+        assert_eq!(map8[7], (5, 2));
+
+        // 3-staff Voice+Piano (G-2, G-2, F-4, like schumann-dichterliebe-2) with 4 voices:
+        // extra treble voice belongs on Staff 2 (Piano RH, idx 1), not Staff 1 (Voice, idx 0).
+        let vp_clefs = vec![('G', 2, None), ('G', 2, None), ('F', 4, None)];
+        let vp_segs = vec![Some(72.0), Some(71.0), Some(68.0), Some(48.0)];
+        let vp_map = assign_segments_to_staves(&vp_segs, &vp_clefs, &[]);
+        assert_eq!(vp_map, vec![(0, 1), (1, 1), (1, 2), (2, 1)]);
+    }
+
+    #[test]
+    fn per_staff_transposing_key_signatures_roundtrip() {
+        use super::super::{
+            has_errors, parse_score, to_mscx, to_musicxml, validate_musicxml, LossTable,
+        };
+        use super::decode_bekern_unmerged;
+
+        // Transposing score (Weber Concertino): Clarinet in Bb (key-1) + Piano RH/LH (key-3).
+        let stream = concat!(
+            "clef-G-2 key-1 time-4-4 ",
+            "clef-G-2 key-3 time-4-4 ",
+            "clef-F-4 key-3 time-4-4 ",
+            "voice-1 whole D 5 ",
+            "voice-2 whole C 5 ",
+            "voice-3 whole C 3 bar"
+        );
+        let dec = decode_bekern_unmerged(stream).unwrap();
+        assert_eq!(dec.parts.len(), 3);
+        assert_eq!(dec.parts[0].key_fifths, Some(-1));
+        assert_eq!(dec.parts[1].key_fifths, Some(-3));
+        assert_eq!(dec.parts[2].key_fifths, Some(-3));
+
+        let (score, _) = parse_score(&dec).unwrap();
+        let xml = to_musicxml(&score, &mut LossTable::default());
+        assert!(!has_errors(&validate_musicxml(&xml)));
+        let p1_start = xml.find("<part id=\"P1\">").expect("P1");
+        let p2_start = xml.find("<part id=\"P2\">").expect("P2");
+        let p1_xml = &xml[p1_start..p2_start];
+        let p2_xml = &xml[p2_start..];
+        assert!(
+            p1_xml.contains("<key><fifths>-1</fifths></key>"),
+            "P1 (Clarinet) must have key-1: {p1_xml}"
+        );
+        assert!(
+            p2_xml.contains("<key><fifths>-3</fifths></key>"),
+            "P2 (Piano) must have key-3: {p2_xml}"
+        );
+
+        let mscx = to_mscx(&score, &mut LossTable::default());
+        assert!(mscx.contains("<concertKey>-1</concertKey>"));
+        assert!(mscx.contains("<concertKey>-3</concertKey>"));
+    }
+
+    #[test]
+    fn sparse_secondary_polyphonic_voice_uses_forward_not_visible_rest() {
+        use super::super::{has_errors, parse_score, to_musicxml, validate_musicxml, LossTable};
+        use super::decode_bekern_unmerged;
+
+        // 3-measure score:
+        // - m1: voice-1 only (no voice-2)
+        // - m2: voice-1 + voice-2 with explicit `rest quarter`, `quarter E 4`, and implicit trailing gap (beats 3..4)
+        // - m3: voice-1 only (no voice-2)
+        let stream = concat!(
+            "clef-G-2 key+0 time-4-4 ",
+            "voice-1 whole C 5 bar ",
+            "voice-1 whole D 5 voice-2 rest quarter quarter E 4 bar ",
+            "voice-1 whole F 5 bar"
+        );
+        let dec = decode_bekern_unmerged(stream).unwrap();
+        let (score, _) = parse_score(&dec).unwrap();
+        let xml = to_musicxml(&score, &mut LossTable::default());
+        assert!(
+            !has_errors(&validate_musicxml(&xml)),
+            "MusicXML must validate cleanly: {xml}"
+        );
+
+        // Only 1 visible <rest/> across the whole 3-measure score (the explicit `rest quarter` in m2).
+        let rest_count = xml.matches("<rest/>").count();
+        assert_eq!(
+            rest_count, 1,
+            "expected only the 1 explicit rest, not spurious secondary-voice padding: {xml}"
+        );
+        // Measure 2 pads voice 2's implicit trailing half-measure gap with <forward> (960 ticks).
+        assert!(
+            xml.contains("<forward><duration>960</duration><voice>2</voice></forward>"),
+            "expected <forward> padding for sparse secondary voice: {xml}"
+        );
+        // Only measure 2 should contain a <backup>.
+        assert_eq!(
+            xml.matches("<backup>").count(),
+            1,
+            "measures 1 and 3 must omit empty secondary voice: {xml}"
+        );
+    }
+
+    #[test]
+    fn bekern_v2_emits_all_28_phase_a_tokens() {
+        use super::super::bekern::to_bekern_v2;
+        use super::super::musicxml_import::{bekern_events, staff_headers};
+        use super::super::{has_errors, parse_score, to_musicxml, validate_musicxml, LossTable};
+        use super::decode_bekern_unmerged;
+
+        // Build a valid MusicXML containing every single one of the 28 bekern+v2 Phase A tokens.
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>480</divisions>
+        <key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <staves>2</staves>
+        <clef number="1"><sign>G</sign><line>2</line></clef>
+        <clef number="2"><sign>F</sign><line>4</line></clef>
+      </attributes>
+      <barline location="left"><ending number="1" type="start"/></barline>
+      <direction><direction-type><dynamics><ppp/></dynamics></direction-type><staff>1</staff></direction>
+      <direction><direction-type><octave-shift type="down" size="8"/></direction-type><staff>1</staff></direction>
+      <note>
+        <pitch><step>C</step><octave>5</octave></pitch>
+        <duration>480</duration><voice>1</voice><type>quarter</type><staff>1</staff>
+        <notations>
+          <arpeggiate/>
+          <ornaments><trill-mark/><tremolo>3</tremolo><inverted-mordent/><turn/></ornaments>
+          <articulations><staccatissimo/><soft-accent/></articulations>
+          <technical><up-bow/><down-bow/></technical>
+        </notations>
+      </note>
+      <direction><direction-type><dynamics><fff/></dynamics></direction-type><staff>1</staff></direction>
+      <direction><direction-type><octave-shift type="stop" size="8"/></direction-type><staff>1</staff></direction>
+      <note>
+        <cue/>
+        <pitch><step>D</step><octave>5</octave></pitch>
+        <duration>480</duration><voice>1</voice><type>quarter</type><staff>1</staff>
+      </note>
+      <direction><direction-type><dynamics><fp/></dynamics></direction-type><staff>1</staff></direction>
+      <direction><direction-type><octave-shift type="up" size="8"/></direction-type><staff>1</staff></direction>
+      <note>
+        <pitch><step>E</step><octave>5</octave></pitch>
+        <duration>320</duration><voice>1</voice><type>quarter</type>
+        <time-modification><actual-notes>3</actual-notes><normal-notes>2</normal-notes></time-modification>
+        <staff>1</staff>
+        <notations><tuplet type="start" number="1"/></notations>
+      </note>
+      <note>
+        <pitch><step>F</step><octave>5</octave></pitch>
+        <duration>320</duration><voice>1</voice><type>quarter</type>
+        <time-modification><actual-notes>3</actual-notes><normal-notes>2</normal-notes></time-modification>
+        <staff>1</staff>
+      </note>
+      <note>
+        <pitch><step>G</step><octave>5</octave></pitch>
+        <duration>320</duration><voice>1</voice><type>quarter</type>
+        <time-modification><actual-notes>3</actual-notes><normal-notes>2</normal-notes></time-modification>
+        <staff>1</staff>
+        <notations><tuplet type="stop" number="1"/></notations>
+      </note>
+      <backup><duration>1920</duration></backup>
+      <direction><direction-type><dynamics><sf/></dynamics></direction-type><staff>2</staff></direction>
+      <note>
+        <pitch><step>C</step><octave>3</octave></pitch>
+        <duration>960</duration><voice>5</voice><type>half</type><staff>2</staff>
+      </note>
+      <direction><direction-type><dynamics><sfp/></dynamics></direction-type><staff>2</staff></direction>
+      <note>
+        <pitch><step>G</step><octave>3</octave></pitch>
+        <duration>960</duration><voice>5</voice><type>half</type><staff>1</staff>
+      </note>
+    </measure>
+    <measure number="2">
+      <barline location="left"><ending number="2" type="start"/></barline>
+      <direction><direction-type><dynamics><fz/></dynamics></direction-type><staff>1</staff></direction>
+      <note>
+        <pitch><step>C</step><octave>5</octave></pitch>
+        <duration>960</duration><voice>1</voice><type>half</type><staff>1</staff>
+      </note>
+      <direction><direction-type><dynamics><rfz/></dynamics></direction-type><staff>1</staff></direction>
+      <note>
+        <pitch><step>B</step><octave>4</octave></pitch>
+        <duration>960</duration><voice>1</voice><type>half</type><staff>2</staff>
+      </note>
+      <backup><duration>1920</duration></backup>
+      <direction><direction-type><dynamics><sffz/></dynamics></direction-type><staff>2</staff></direction>
+      <note>
+        <pitch><step>C</step><octave>3</octave></pitch>
+        <duration>1920</duration><voice>5</voice><type>whole</type><staff>2</staff>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#;
+
+        let evs = bekern_events(xml).unwrap();
+        let hdrs = staff_headers(xml).unwrap();
+        let (toks_v2, _) = to_bekern_v2(&evs, &hdrs).unwrap();
+        let joined = toks_v2.join(" ");
+
+        let phase_a_28 = [
+            // 8 extended dynamics
+            "dyn-ppp",
+            "dyn-fff",
+            "dyn-fp",
+            "dyn-sf",
+            "dyn-sfp",
+            "dyn-fz",
+            "dyn-rfz",
+            "dyn-sffz",
+            // 9 articulations / ornaments / technical
+            "art-arpeggiate",
+            "art-trill",
+            "art-tremolo",
+            "art-mordent",
+            "art-turn",
+            "art-staccatissimo",
+            "art-up-bow",
+            "art-down-bow",
+            "art-soft-accent",
+            // 11 structural markers
+            "<staff>",
+            "xstaff-up",
+            "xstaff-down",
+            "ottava-8va",
+            "ottava-8vb",
+            "ottava-stop",
+            "cue",
+            "volta-1",
+            "volta-2",
+            "tup-open",
+            "tup-close",
+        ];
+        assert_eq!(phase_a_28.len(), 28);
+        for tok in phase_a_28 {
+            assert!(
+                toks_v2.iter().any(|t| t == tok),
+                "missing Phase A token {tok:?} in v2 output: {joined}"
+            );
+        }
+
+        // Round-trip decode -> MusicXML must validate with zero errors.
+        let dec = decode_bekern_unmerged(&joined).unwrap();
+        let (score, _) = parse_score(&dec).unwrap();
+        let out_xml = to_musicxml(&score, &mut LossTable::default());
+        assert!(
+            !has_errors(&validate_musicxml(&out_xml)),
+            "v2 round-trip MusicXML failed validation"
+        );
     }
 }

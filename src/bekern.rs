@@ -328,20 +328,35 @@ fn span_scale_an(open: &TupletSpans, key: (u32, u32)) -> f64 {
     })
 }
 
-/// Emit a deferred `tuplet-stop`: pop the key's span (validating the
-/// number the stop was deferred with) and push the token. Decode sees
-/// the token while positioned in the stopped note's chord-run segment,
-/// so the pop routes to the right stack.
+fn emit_tuplet_start(out: &mut Vec<String>, ratio: (u32, u32), v2: bool) {
+    if v2 {
+        out.push("tup-open".to_string());
+        out.push(ratio.0.to_string());
+        out.push(ratio.1.to_string());
+    } else {
+        out.push(format!("tuplet-start-{}-{}", ratio.0, ratio.1));
+    }
+}
+
+fn emit_tuplet_stop(out: &mut Vec<String>, v2: bool) {
+    out.push(if v2 { "tup-close" } else { "tuplet-stop" }.to_string());
+}
+
+/// Emit a deferred `tuplet-stop` (or `tup-close` in `v2`): pop the key's span
+/// (validating the number the stop was deferred with) and push the token. Decode
+/// sees the token while positioned in the stopped note's chord-run segment, so
+/// the pop routes to the right stack.
 fn flush_stop(
     out: &mut Vec<String>,
     open: &mut TupletSpans,
     key: (u32, u32),
     num: u32,
     measure: u32,
+    v2: bool,
 ) -> Result<(), String> {
     match open.get_mut(&key).and_then(|s| s.pop()) {
         Some((_, open_num)) if open_num == num => {
-            out.push("tuplet-stop".to_string());
+            emit_tuplet_stop(out, v2);
             Ok(())
         }
         _ => Err(format!(
@@ -590,7 +605,7 @@ fn to_bekern_inner(
         let mut flushed_key: Option<(u32, u32)> = None;
         if !continues_chord {
             if let Some((dkey, dnum)) = deferred_stop.take() {
-                flush_stop(&mut out, &mut open, dkey, dnum, e.measure)?;
+                flush_stop(&mut out, &mut open, dkey, dnum, e.measure, v2)?;
                 flushed_key = Some(dkey);
             }
             // A new chord-run root ends visual-marker idempotence for the
@@ -611,7 +626,7 @@ fn to_bekern_inner(
                 if let Some(stack) = open.remove(&pk) {
                     if !stack.is_empty() {
                         for _ in &stack {
-                            out.push("tuplet-stop".to_string());
+                            emit_tuplet_stop(&mut out, v2);
                         }
                         reopen.insert(pk, stack);
                     }
@@ -845,7 +860,7 @@ fn to_bekern_inner(
                 if !stale {
                     for (ratio, num) in &stack {
                         open.entry(key).or_default().push((*ratio, *num));
-                        out.push(format!("tuplet-start-{}-{}", ratio.0, ratio.1));
+                        emit_tuplet_start(&mut out, *ratio, v2);
                     }
                     restored_this_event = true;
                 }
@@ -932,7 +947,7 @@ fn to_bekern_inner(
                                 ));
                             }
                         };
-                        out.push(format!("tuplet-start-{}-{}", r.0, r.1));
+                        emit_tuplet_start(&mut out, r, v2);
                         open.entry(key).or_default().push((r, n));
                         // Round from the unrounded gap (0.667 x 3/2 is
                         // exactly a quarter; rounding `written` first
@@ -948,7 +963,7 @@ fn to_bekern_inner(
                         )
                         .map_err(|inner_err| format!("{inner_err} | {}", emit_ctx()));
                         open.get_mut(&key).and_then(|s| s.pop());
-                        out.push("tuplet-stop".to_string());
+                        emit_tuplet_stop(&mut out, v2);
                         inner?;
                     }
                 }
@@ -974,7 +989,7 @@ fn to_bekern_inner(
                 && open.get(&key).is_some_and(|s| !s.is_empty())
             {
                 open.get_mut(&key).and_then(|s| s.pop());
-                out.push("tuplet-stop".to_string());
+                emit_tuplet_stop(&mut out, v2);
             }
         }
         // Inline cursor-anchored notation state (clef/key/time changes,
@@ -1054,12 +1069,12 @@ fn to_bekern_inner(
                         Some(((a, n), 1)) if (a, n) != ratio)
                 {
                     open.get_mut(&key).and_then(|s| s.pop());
-                    out.push("tuplet-stop".to_string());
+                    emit_tuplet_stop(&mut out, v2);
                 }
                 let top = open.get(&key).and_then(|s| s.last().copied());
                 if top != Some((ratio, num)) {
                     open.entry(key).or_default().push((ratio, num));
-                    out.push(format!("tuplet-start-{}-{}", ratio.0, ratio.1));
+                    emit_tuplet_start(&mut out, ratio, v2);
                 }
             } else {
                 // Visual-only bracket start (no time-modification): the
@@ -1080,7 +1095,7 @@ fn to_bekern_inner(
             let top = open.get(&key).and_then(|s| s.last().map(|t| t.0));
             if top != Some(ratio) {
                 open.entry(key).or_default().push((ratio, 1));
-                out.push(format!("tuplet-start-{}-{}", ratio.0, ratio.1));
+                emit_tuplet_start(&mut out, ratio, v2);
             }
         }
         // NOTE: no fallback decomposition (e.g. breve = 2 x whole):
@@ -1200,11 +1215,11 @@ fn to_bekern_inner(
                     if let Some(ratio) = e.tuplet_ratio {
                         if deferred_stop != Some((key, num)) {
                             if let Some((dkey, dnum)) = deferred_stop.take() {
-                                flush_stop(&mut out, &mut open, dkey, dnum, e.measure)?;
+                                flush_stop(&mut out, &mut open, dkey, dnum, e.measure, v2)?;
                             }
                             debug_assert!(deferred_stop.is_none());
                             open.entry(key).or_default().push((ratio, num));
-                            out.push(format!("tuplet-start-{}-{}", ratio.0, ratio.1));
+                            emit_tuplet_start(&mut out, ratio, v2);
                             deferred_stop = Some((key, num));
                         }
                     } else {
@@ -1236,7 +1251,7 @@ fn to_bekern_inner(
                     // stop, so skip instead of flushing mid-chord.
                     if deferred_stop != Some((key, num)) {
                         if let Some((dkey, dnum)) = deferred_stop.take() {
-                            flush_stop(&mut out, &mut open, dkey, dnum, e.measure)?;
+                            flush_stop(&mut out, &mut open, dkey, dnum, e.measure, v2)?;
                         }
                         // Single-slot invariant: the take above cleared
                         // any pending stop, so two keys never have stops
@@ -1265,7 +1280,7 @@ fn to_bekern_inner(
     }
     // A stop deferred past the final event's chord run flushes here.
     if let Some((dkey, dnum)) = deferred_stop.take() {
-        flush_stop(&mut out, &mut open, dkey, dnum, measure)?;
+        flush_stop(&mut out, &mut open, dkey, dnum, measure, v2)?;
     }
     // Page-cut leftovers stay open: no stops are emitted here. A stop
     // would need the key's current segment for routing, but keys with

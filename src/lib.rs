@@ -229,6 +229,10 @@ pub struct PartInput {
     pub clef_line: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub clef_octave_change: Option<i32>,
+    /// Optional per-part initial key signature in fifths (overrides `ScoreInput.key_fifths`
+    /// for transposing instruments such as Bb clarinet + piano).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_fifths: Option<i32>,
     /// Part/staff-scoped measure overrides (mid-piece clefs, dynamics, hairpins).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub measure_attrs: Vec<MeasureAttr>,
@@ -242,6 +246,7 @@ impl Default for PartInput {
             clef_sign: None,
             clef_line: None,
             clef_octave_change: None,
+            key_fifths: None,
             measure_attrs: Vec::new(),
         }
     }
@@ -438,6 +443,7 @@ pub struct Part {
     pub clef_sign: Option<char>,
     pub clef_line: Option<u32>,
     pub clef_octave_change: Option<i32>,
+    pub key_fifths: Option<i32>,
     pub measure_attrs: Vec<MeasureAttr>,
 }
 
@@ -815,6 +821,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
         Option<char>,
         Option<u32>,
         Option<i32>,
+        Option<i32>,
         &'a [MeasureAttr],
     );
     let raw_parts: Vec<RawPart<'_>> = if !input.parts.is_empty() {
@@ -832,6 +839,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                     p.clef_sign,
                     p.clef_line,
                     p.clef_octave_change,
+                    p.key_fifths,
                     p.measure_attrs.as_slice(),
                 )
             })
@@ -846,16 +854,19 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
             None,
             None,
             None,
+            None,
             &[],
         )]
     };
-    if raw_parts.iter().all(|(_, n, _, _, _, _)| n.is_empty()) {
+    if raw_parts.iter().all(|(_, n, _, _, _, _, _)| n.is_empty()) {
         return Err("score has no notes".to_string());
     }
 
     let mut losses = LossTable::default();
     let mut parts = Vec::new();
-    for (pname, notes, clef_sign, clef_line, clef_octave_change, part_attrs) in &raw_parts {
+    for (pname, notes, clef_sign, clef_line, clef_octave_change, part_key_fifths, part_attrs) in
+        &raw_parts
+    {
         if notes.is_empty() {
             continue;
         }
@@ -1073,6 +1084,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
             clef_sign: *clef_sign,
             clef_line: *clef_line,
             clef_octave_change: *clef_octave_change,
+            key_fifths: *part_key_fifths,
             measure_attrs: p_measure_attrs,
         });
     }
@@ -1155,11 +1167,16 @@ struct Segment {
     dur_ticks: i64,
     tie_in: bool,  // continues a previous segment -> <tie type="stop"/>
     tie_out: bool, // continues into the next segment -> <tie type="start"/>
+    /// True for implicit gap padding inserted in secondary polyphonic voices
+    /// (`vi > 0`): emitted as hidden `<forward>` in MusicXML instead of a
+    /// visible `<rest>` so sparse inner voices do not inflate rest counts.
+    forward: bool,
 }
 
 /// Split a part's chord groups into per-measure, per-voice segments.
 /// Groups crossing a barline are split with ties (lossless). Gaps are
-/// filled with rests; every voice sums to exactly `measure_ticks`.
+/// filled with rests in the primary voice and hidden `<forward>` skips
+/// in secondary polyphonic voices; every emitted voice sums to `measure_ticks`.
 fn layout_part(
     score: &Score,
     part: &Part,
@@ -1170,7 +1187,7 @@ fn layout_part(
     let mut result: Vec<Vec<(u32, Vec<Segment>)>> = Vec::new();
     for (m, &(m0, m1)) in windows.iter().enumerate() {
         let mut voices: Vec<(u32, Vec<Segment>)> = Vec::new();
-        for v in &part.voices {
+        for (vi, v) in part.voices.iter().enumerate() {
             let mut segs: Vec<Segment> = Vec::new();
             for g in part.groups.iter().filter(|g| g.voice == *v) {
                 // Grace groups are zero-width: they render in the one
@@ -1198,11 +1215,19 @@ fn layout_part(
                         dur_ticks: ge - gs,
                         tie_in: gs > g.start_ticks,
                         tie_out: ge < total,
+                        forward: false,
                     });
                 }
             }
+            // Sparse secondary polyphonic voices with no events in this measure
+            // are omitted rather than padded with spurious full-bar visible rests.
+            if vi > 0 && segs.is_empty() {
+                continue;
+            }
             segs.sort_by_key(|s| (s.note.start_ticks.max(m0), s.chord));
-            // Fill gaps with rests so the voice sums to mlen.
+            // Fill gaps with rests (primary voice) or hidden `<forward>` skips
+            // (secondary polyphonic voices) so every emitted voice sums to mlen.
+            let is_secondary = vi > 0;
             let mut filled: Vec<Segment> = Vec::new();
             let mut cursor = m0;
             let mut rest_inserted = false;
@@ -1234,8 +1259,11 @@ fn layout_part(
                         dur_ticks: ss - cursor,
                         tie_in: false,
                         tie_out: false,
+                        forward: is_secondary,
                     });
-                    rest_inserted = true;
+                    if !is_secondary {
+                        rest_inserted = true;
+                    }
                 }
                 cursor = cursor.max(ss + s.dur_ticks);
                 filled.push(s);
@@ -1266,8 +1294,11 @@ fn layout_part(
                     dur_ticks: m1 - cursor,
                     tie_in: false,
                     tie_out: false,
+                    forward: is_secondary,
                 });
-                rest_inserted = true;
+                if !is_secondary {
+                    rest_inserted = true;
+                }
             }
             if rest_inserted {
                 losses.push(
@@ -1396,6 +1427,17 @@ fn write_notations_xml(out: &mut String, seg: &Segment) {
         out.push_str("<arpeggiate/>");
     }
     out.push_str("</notations>\n");
+}
+
+fn push_forward_xml(out: &mut String, dur_ticks: i64, voice_num: u32, staff_num: Option<u32>) {
+    let _ = write!(
+        out,
+        "      <forward><duration>{dur_ticks}</duration><voice>{voice_num}</voice>"
+    );
+    if let Some(st) = staff_num {
+        let _ = write!(out, "<staff>{st}</staff>");
+    }
+    out.push_str("</forward>\n");
 }
 
 fn push_note_xml(
@@ -2032,6 +2074,7 @@ pub fn to_musicxml_version(
                 };
                 let key = p_attrs
                     .and_then(|a| a.key_fifths)
+                    .or(part.key_fifths)
                     .or_else(|| s_attrs.and_then(|a| a.key_fifths))
                     .unwrap_or(score.key_fifths);
                 let (beats, beat_type) = match p_attrs
@@ -2163,15 +2206,19 @@ pub fn to_musicxml_version(
                     if vi > 0 {
                         let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
                         for s in segs {
-                            push_note_xml(
-                                &mut out,
-                                s,
-                                score.divisions,
-                                losses,
-                                &part.name,
-                                None,
-                                None,
-                            );
+                            if s.forward {
+                                push_forward_xml(&mut out, s.dur_ticks, s.note.voice, None);
+                            } else {
+                                push_note_xml(
+                                    &mut out,
+                                    s,
+                                    score.divisions,
+                                    losses,
+                                    &part.name,
+                                    None,
+                                    None,
+                                );
+                            }
                         }
                     } else {
                         push_voice_with_timed_events(
@@ -2218,7 +2265,12 @@ pub fn to_musicxml_version(
             let p1_attrs = part_measure_attr(part_hi, m1);
             let p2_attrs = part_measure_attr(part_lo, m1);
             if m == 0 {
-                let key = s_attrs.and_then(|a| a.key_fifths).unwrap_or(score.key_fifths);
+                let key = p1_attrs
+                    .and_then(|a| a.key_fifths)
+                    .or(part_hi.key_fifths)
+                    .or(part_lo.key_fifths)
+                    .or_else(|| s_attrs.and_then(|a| a.key_fifths))
+                    .unwrap_or(score.key_fifths);
                 let (beats, beat_type) = match s_attrs.and_then(|a| a.time) {
                     Some(t) => (t.beats, t.beat_type),
                     None => (score.beats, score.beat_type),
@@ -2253,7 +2305,10 @@ pub fn to_musicxml_version(
                 let p2_clef = p2_attrs.filter(|a| {
                     a.clef_sign.is_some() || a.clef_line.is_some() || a.clef_octave_change.is_some()
                 });
-                let key_change = s_attrs.and_then(|a| a.key_fifths);
+                let key_change = p1_attrs
+                    .and_then(|a| a.key_fifths)
+                    .or_else(|| p2_attrs.and_then(|a| a.key_fifths))
+                    .or_else(|| s_attrs.and_then(|a| a.key_fifths));
                 let time_change = s_attrs.and_then(|a| a.time);
                 if p1_clef.is_some()
                     || p2_clef.is_some()
@@ -2358,15 +2413,19 @@ pub fn to_musicxml_version(
                     if vi > 0 {
                         let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
                         for s in segs {
-                            push_note_xml(
-                                &mut out,
-                                s,
-                                score.divisions,
-                                losses,
-                                &part_hi.name,
-                                None,
-                                Some(1),
-                            );
+                            if s.forward {
+                                push_forward_xml(&mut out, s.dur_ticks, s.note.voice, Some(1));
+                            } else {
+                                push_note_xml(
+                                    &mut out,
+                                    s,
+                                    score.divisions,
+                                    losses,
+                                    &part_hi.name,
+                                    None,
+                                    Some(1),
+                                );
+                            }
                         }
                     } else {
                         push_voice_with_timed_events(
@@ -2422,15 +2481,19 @@ pub fn to_musicxml_version(
                     if vi > 0 {
                         let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
                         for s in segs {
-                            push_note_xml(
-                                &mut out,
-                                s,
-                                score.divisions,
-                                losses,
-                                &part_lo.name,
-                                None,
-                                Some(2),
-                            );
+                            if s.forward {
+                                push_forward_xml(&mut out, s.dur_ticks, s.note.voice, Some(2));
+                            } else {
+                                push_note_xml(
+                                    &mut out,
+                                    s,
+                                    score.divisions,
+                                    losses,
+                                    &part_lo.name,
+                                    None,
+                                    Some(2),
+                                );
+                            }
                         }
                     } else {
                         push_voice_with_timed_events(
@@ -2793,7 +2856,7 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
         }
 
         let mut cur_sig = (score.beats, score.beat_type);
-        let mut cur_key = score.key_fifths;
+        let mut cur_key = part.key_fifths.unwrap_or(score.key_fifths);
 
         for (m, voices) in grouped.iter().enumerate() {
             let m1 = m as u32 + 1;
@@ -2803,6 +2866,11 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                 if let Some(t) = a.time {
                     cur_sig = (t.beats, t.beat_type);
                 }
+                if let Some(k) = a.key_fifths {
+                    cur_key = k;
+                }
+            }
+            if let Some(a) = p_attrs {
                 if let Some(k) = a.key_fifths {
                     cur_key = k;
                 }
@@ -2887,7 +2955,9 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                             );
                             out.push_str("            </Clef>\n");
                         }
-                        if attrs.is_some_and(|a| a.key_fifths.is_some()) {
+                        if p_attrs.is_some_and(|a| a.key_fifths.is_some())
+                            || attrs.is_some_and(|a| a.key_fifths.is_some())
+                        {
                             out.push_str("          <KeySig>\n");
                             let _ = writeln!(out, "            <concertKey>{cur_key}</concertKey>");
                             out.push_str("            </KeySig>\n");
