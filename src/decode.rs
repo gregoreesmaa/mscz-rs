@@ -484,6 +484,34 @@ fn tie_note(
     ))
 }
 
+/// Structured warning counts emitted during loss-tolerant (`lenient`) decoding
+/// of a `bekern+` / `bekern+v2` token stream.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct DecodeWarnings {
+    /// Malformed header tokens (`clef-*`, `key*`, `time-*`) that fell back to valid defaults.
+    pub malformed_headers: usize,
+    /// Unclosed spans (`tup-open`/`tuplet-start-*`, `slur-*`, `hairpin-*`, `<txt>`)
+    /// auto-closed at `bar`, `<staff>`, `<sys>`, or `<eos>` / end of stream.
+    pub unclosed_spans: usize,
+    /// Orphan closing tokens (`tup-close`, `tuplet-stop`, `slur-stop`, `hairpin-stop`, `</txt>`)
+    /// dropped because no matching span was open.
+    pub orphan_closers: usize,
+    /// Unknown, malformed, or truncated tokens/events skipped instead of failing the page.
+    pub skipped_tokens: usize,
+}
+
+impl DecodeWarnings {
+    /// Total number of recovery actions taken while decoding.
+    pub fn total(&self) -> usize {
+        self.malformed_headers + self.unclosed_spans + self.orphan_closers + self.skipped_tokens
+    }
+
+    /// True when the stream decoded cleanly with zero recovery warnings.
+    pub fn is_empty(&self) -> bool {
+        self.total() == 0
+    }
+}
+
 /// Decode a bekern page to a single-part [`ScoreInput`], merging tie
 /// chains into single notes (link-faithful input stays link-faithful:
 /// each chain keeps every link's slur/modifier marks by union).
@@ -499,7 +527,7 @@ fn tie_note(
 /// order per measure); a stream with missing markers degrades to
 /// single-segment accumulation.
 pub fn decode_bekern(tokens: &str) -> Result<ScoreInput, String> {
-    decode_inner(tokens, true)
+    decode_inner(tokens, true, false).map(|(s, _)| s)
 }
 
 /// Decode a bekern page to a single-part [`ScoreInput`] preserving
@@ -508,15 +536,46 @@ pub fn decode_bekern(tokens: &str) -> Result<ScoreInput, String> {
 /// duration only). Used by `bekern2musicxml`, whose strict-xml oracle
 /// compares tie segments rather than merged notes.
 pub fn decode_bekern_unmerged(tokens: &str) -> Result<ScoreInput, String> {
-    decode_inner(tokens, false)
+    decode_inner(tokens, false, false).map(|(s, _)| s)
+}
+
+/// Loss-tolerant recovery decoder (merged ties): never fails a whole page on a
+/// malformed or truncated OMR token. Auto-closes unclosed `tup-open`, `slur-*`,
+/// `hairpin-*`, and `<txt>` spans at `bar`/`<sys>`/`<eos>`, drops orphan closers,
+/// falls back malformed header tokens to valid defaults, and skips unknown tokens
+/// while returning structured [`DecodeWarnings`] counts.
+pub fn decode_bekern_lenient(tokens: &str) -> Result<(ScoreInput, DecodeWarnings), String> {
+    decode_inner(tokens, true, true)
+}
+
+/// Loss-tolerant recovery decoder preserving every tie link as its own note
+/// (unmerged ties, matching [`decode_bekern_unmerged`]).
+pub fn decode_bekern_unmerged_lenient(
+    tokens: &str,
+) -> Result<(ScoreInput, DecodeWarnings), String> {
+    decode_inner(tokens, false, true)
+}
+
+/// Configurable decoder entrypoint supporting explicit `merge_ties` and
+/// `lenient` flags.
+pub fn decode_bekern_with_options(
+    tokens: &str,
+    merge_ties: bool,
+    lenient: bool,
+) -> Result<(ScoreInput, DecodeWarnings), String> {
+    decode_inner(tokens, merge_ties, lenient)
 }
 
 /// Shared decode core: `merge_ties` selects the note-list semantics
 /// ([`decode_bekern`]) vs the notation-faithful semantics
-/// ([`decode_bekern_unmerged`]). Token parsing, cursors, spans,
-/// measure attributes and error behavior are identical.
-fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
+/// ([`decode_bekern_unmerged`]); `lenient` enables loss-tolerant recovery.
+fn decode_inner(
+    tokens: &str,
+    merge_ties: bool,
+    lenient: bool,
+) -> Result<(ScoreInput, DecodeWarnings), String> {
     let toks: Vec<&str> = tokens.split_whitespace().collect();
+    let mut warnings = DecodeWarnings::default();
     let mut key_fifths = 0i32;
     let mut time = TimeSig {
         beats: 4,
@@ -529,8 +588,19 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
     let mut i = 0;
     while i < toks.len() {
         let t = toks[i];
+        if lenient && matches!(t, "<bos>" | "<pad>") {
+            i += 1;
+            continue;
+        }
         if t.starts_with("clef-") {
-            let (sign, line, oct) = parse_clef_token(t)?;
+            let (sign, line, oct) = match parse_clef_token(t) {
+                Ok(c) => c,
+                Err(_) if lenient => {
+                    warnings.malformed_headers += 1;
+                    ('G', 2, None)
+                }
+                Err(e) => return Err(e),
+            };
             leading_clefs.push((sign, line, oct));
             leading_keys.push(None);
             if let Some(o) = oct {
@@ -540,9 +610,18 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             }
             i += 1;
         } else if let Some(rest) = t.strip_prefix("key") {
-            let fifths = rest
-                .parse::<i32>()
-                .map_err(|_| format!("bad key token {t:?}"))?;
+            let fifths = match rest.parse::<i32>() {
+                Ok(f) if !lenient || (-7..=7).contains(&f) => f,
+                Ok(f) => {
+                    warnings.malformed_headers += 1;
+                    f.clamp(-7, 7)
+                }
+                Err(_) if lenient => {
+                    warnings.malformed_headers += 1;
+                    0
+                }
+                Err(_) => return Err(format!("bad key token {t:?}")),
+            };
             if let Some(slot) = leading_keys.last_mut() {
                 *slot = Some(fifths);
                 if leading_keys.len() == 1 {
@@ -555,16 +634,26 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         } else if let Some(rest) = t.strip_prefix("time-") {
             if !time_set {
                 let mut parts = rest.split('-');
-                let beats: u32 = parts
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| format!("bad time token {t:?}"))?;
-                let beat_type: u32 = parts
-                    .next()
-                    .and_then(|s| s.parse().ok())
-                    .ok_or_else(|| format!("bad time token {t:?}"))?;
-                time = TimeSig { beats, beat_type };
-                time_set = true;
+                let beats_opt = parts.next().and_then(|s| s.parse::<u32>().ok());
+                let beat_type_opt = parts.next().and_then(|s| s.parse::<u32>().ok());
+                let extra = parts.next().is_some();
+                match (beats_opt, beat_type_opt) {
+                    (Some(beats), Some(beat_type))
+                        if !lenient || (beats > 0 && beat_type > 0 && !extra) =>
+                    {
+                        time = TimeSig { beats, beat_type };
+                        time_set = true;
+                    }
+                    _ if lenient => {
+                        warnings.malformed_headers += 1;
+                        time = TimeSig {
+                            beats: 4,
+                            beat_type: 4,
+                        };
+                        time_set = true;
+                    }
+                    _ => return Err(format!("bad time token {t:?}")),
+                }
             }
             i += 1;
         } else {
@@ -609,6 +698,10 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
     // the drain — latent, no behavior change.
     let mut spans: Vec<Vec<(u32, u32)>> = vec![Vec::new()];
     let mut pending_spans: Vec<(u32, u32)> = Vec::new();
+    // Lenient-mode span tracking for slurs, hairpins, and `<txt>...</txt>`.
+    let mut open_slurs: Vec<usize> = vec![0];
+    let mut open_hairpin = false;
+    let mut in_txt = false;
     // Open tie chain: ((step, octave, alter), seg, onset, dur_acc,
     // marks). Only used when `merge_ties` is set.
     let mut pending_tie: PendingTies = std::collections::BTreeMap::new();
@@ -681,9 +774,107 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
     let mut barlen = initial_barlen;
     while i < toks.len() {
         let t = toks[i];
+        if lenient {
+            if in_txt {
+                if t == "</txt>" {
+                    in_txt = false;
+                    i += 1;
+                    continue;
+                }
+                if t == "bar"
+                    || barline_right_of(t).is_some()
+                    || t == "<staff>"
+                    || t == "<sys>"
+                    || t == "<eos>"
+                {
+                    in_txt = false;
+                    warnings.unclosed_spans += 1;
+                    // Fall through to handle the boundary token itself.
+                } else {
+                    i += 1;
+                    continue;
+                }
+            } else {
+                if t == "<txt>" {
+                    in_txt = true;
+                    i += 1;
+                    continue;
+                }
+                if t == "</txt>" {
+                    warnings.orphan_closers += 1;
+                    i += 1;
+                    continue;
+                }
+                if t == "<bos>" || t == "<pad>" {
+                    i += 1;
+                    continue;
+                }
+                if t == "<eos>" {
+                    break;
+                }
+                if t == "<sys>" {
+                    if grace_pending {
+                        grace_pending = false;
+                        warnings.skipped_tokens += 1;
+                    }
+                    let unclosed_tups: usize =
+                        spans.iter().map(Vec::len).sum::<usize>() + pending_spans.len();
+                    if unclosed_tups > 0 {
+                        warnings.unclosed_spans += unclosed_tups;
+                        pending_spans.clear();
+                    }
+                    let unclosed_slurs: usize = open_slurs.iter().sum();
+                    if unclosed_slurs > 0 {
+                        warnings.unclosed_spans += unclosed_slurs;
+                        for s in &mut open_slurs {
+                            *s = 0;
+                        }
+                    }
+                    if open_hairpin {
+                        open_hairpin = false;
+                        warnings.unclosed_spans += 1;
+                    }
+                    if voices.iter().any(|&v| v > 0.0) {
+                        bar_start += barlen;
+                        measure += 1;
+                    }
+                    cur_staff_idx = 0;
+                    voices.clear();
+                    voices.push(0.0);
+                    seg = 0;
+                    last_onset.clear();
+                    last_onset.push(None);
+                    for s in &mut spans {
+                        s.clear();
+                    }
+                    spans.truncate(1);
+                    if spans.is_empty() {
+                        spans.push(Vec::new());
+                    }
+                    open_slurs.clear();
+                    open_slurs.push(0);
+                    grace_run = false;
+                    i += 1;
+                    continue;
+                }
+            }
+        }
         if t == "bar" || barline_right_of(t).is_some() {
             if grace_pending {
-                return Err(format!("dangling grace marker in measure {measure}"));
+                if lenient {
+                    grace_pending = false;
+                    warnings.skipped_tokens += 1;
+                } else {
+                    return Err(format!("dangling grace marker in measure {measure}"));
+                }
+            }
+            if lenient {
+                let unclosed_tups: usize =
+                    spans.iter().map(Vec::len).sum::<usize>() + pending_spans.len();
+                if unclosed_tups > 0 {
+                    warnings.unclosed_spans += unclosed_tups;
+                    pending_spans.clear();
+                }
             }
             if let Some(style) = barline_right_of(t) {
                 attr_for(&mut measure_attrs, measure + 1).barline_right = Some(style.to_string());
@@ -709,7 +900,20 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         }
         if t == "<staff>" {
             if grace_pending {
-                return Err(format!("dangling grace marker before <staff> in measure {measure}"));
+                if lenient {
+                    grace_pending = false;
+                    warnings.skipped_tokens += 1;
+                } else {
+                    return Err(format!("dangling grace marker before <staff> in measure {measure}"));
+                }
+            }
+            if lenient {
+                let unclosed_tups: usize =
+                    spans.iter().map(Vec::len).sum::<usize>() + pending_spans.len();
+                if unclosed_tups > 0 {
+                    warnings.unclosed_spans += unclosed_tups;
+                    pending_spans.clear();
+                }
             }
             has_explicit_staff = true;
             cur_staff_idx += 1;
@@ -744,6 +948,11 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         }
         if t == "grace" {
             if grace_pending {
+                if lenient {
+                    warnings.skipped_tokens += 1;
+                    i += 1;
+                    continue;
+                }
                 return Err(format!("double grace marker in measure {measure}"));
             }
             grace_pending = true;
@@ -751,7 +960,19 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             continue;
         }
         if t.starts_with("clef-") {
-            let (sign, line, oct) = parse_clef_token(t)?;
+            let (sign, line, oct) = match parse_clef_token(t) {
+                Ok(c) => c,
+                Err(_) if lenient => {
+                    warnings.malformed_headers += 1;
+                    if !seen_event && measure == 0 {
+                        ('G', 2, None)
+                    } else {
+                        i += 1;
+                        continue;
+                    }
+                }
+                Err(e) => return Err(e),
+            };
             let target_seg = resolve_target_seg(&toks, i + 1, seg);
             let onset_beats = voices.get(target_seg).copied().unwrap_or(0.0);
             let explicit_st = has_explicit_staff.then_some(cur_staff_idx);
@@ -796,9 +1017,19 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             continue;
         }
         if let Some(rest) = t.strip_prefix("key") {
-            let fifths = rest
-                .parse::<i32>()
-                .map_err(|_| format!("bad key token {t:?}"))?;
+            let fifths = match rest.parse::<i32>() {
+                Ok(f) if !lenient || (-7..=7).contains(&f) => f,
+                Ok(f) => {
+                    warnings.malformed_headers += 1;
+                    f.clamp(-7, 7)
+                }
+                Err(_) if lenient => {
+                    warnings.malformed_headers += 1;
+                    i += 1;
+                    continue;
+                }
+                Err(_) => return Err(format!("bad key token {t:?}")),
+            };
             let target_seg = resolve_target_seg(&toks, i + 1, seg);
             let onset_beats = voices.get(target_seg).copied().unwrap_or(0.0);
             let explicit_st = has_explicit_staff.then_some(cur_staff_idx);
@@ -840,17 +1071,17 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         }
         if let Some(rest) = t.strip_prefix("time-") {
             let mut parts = rest.split('-');
-            let beats: u32 = parts
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| format!("bad time token {t:?}"))?;
-            let beat_type: u32 = parts
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| format!("bad time token {t:?}"))?;
-            if beats == 0 || beat_type == 0 {
-                return Err(format!("bad time token {t:?}"));
-            }
+            let beats_opt = parts.next().and_then(|s| s.parse::<u32>().ok());
+            let beat_type_opt = parts.next().and_then(|s| s.parse::<u32>().ok());
+            let (beats, beat_type) = match (beats_opt, beat_type_opt) {
+                (Some(b), Some(bt)) if b > 0 && bt > 0 => (b, bt),
+                _ if lenient => {
+                    warnings.malformed_headers += 1;
+                    i += 1;
+                    continue;
+                }
+                _ => return Err(format!("bad time token {t:?}")),
+            };
             let target_seg = resolve_target_seg(&toks, i + 1, seg);
             let onset_beats = voices.get(target_seg).copied().unwrap_or(0.0);
             if !seen_event && measure == 0 {
@@ -890,6 +1121,9 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                         seg_dyns.push((measure, explicit_st, target_seg, onset_beats, short.to_string()));
                     }
                 }
+                _ if lenient => {
+                    warnings.skipped_tokens += 1;
+                }
                 _ => return Err(format!("unexpected token {t:?} in measure {measure}")),
             }
             i += 1;
@@ -897,9 +1131,40 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         }
         if let Some(short) = t.strip_prefix("hairpin-") {
             let hp = match short {
-                "cresc-start" => "cresc",
-                "dim-start" => "dim",
-                "stop" => "stop",
+                "cresc-start" => {
+                    if lenient {
+                        if open_hairpin {
+                            warnings.unclosed_spans += 1;
+                        }
+                        open_hairpin = true;
+                    }
+                    "cresc"
+                }
+                "dim-start" => {
+                    if lenient {
+                        if open_hairpin {
+                            warnings.unclosed_spans += 1;
+                        }
+                        open_hairpin = true;
+                    }
+                    "dim"
+                }
+                "stop" => {
+                    if lenient {
+                        if !open_hairpin {
+                            warnings.orphan_closers += 1;
+                            i += 1;
+                            continue;
+                        }
+                        open_hairpin = false;
+                    }
+                    "stop"
+                }
+                _ if lenient => {
+                    warnings.skipped_tokens += 1;
+                    i += 1;
+                    continue;
+                }
                 _ => return Err(format!("unexpected token {t:?} in measure {measure}")),
             };
             let target_seg = resolve_target_seg(&toks, i + 1, seg);
@@ -924,6 +1189,11 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                 "8va" => "8va",
                 "8vb" => "8vb",
                 "stop" => "stop",
+                _ if lenient => {
+                    warnings.skipped_tokens += 1;
+                    i += 1;
+                    continue;
+                }
                 _ => return Err(format!("unexpected token {t:?} in measure {measure}")),
             };
             let target_seg = resolve_target_seg(&toks, i + 1, seg);
@@ -945,14 +1215,22 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             continue;
         }
         if let Some(rest) = t.strip_prefix("voice-") {
-            let n: usize = rest.parse().map_err(|_| format!("bad voice token {t:?}"))?;
-            if n == 0 {
-                return Err(format!("bad voice token {t:?}"));
-            }
+            let n = match rest.parse::<usize>() {
+                Ok(n) if n > 0 => n,
+                _ if lenient => {
+                    warnings.skipped_tokens += 1;
+                    i += 1;
+                    continue;
+                }
+                _ => return Err(format!("bad voice token {t:?}")),
+            };
             while voices.len() < n {
                 voices.push(0.0);
                 last_onset.push(None);
                 spans.push(Vec::new());
+            }
+            while open_slurs.len() < n {
+                open_slurs.push(0);
             }
             seg = n - 1;
             i += 1;
@@ -960,18 +1238,17 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         }
         if let Some(rest) = t.strip_prefix("tuplet-start-") {
             let mut parts = rest.split('-');
-            let a: u32 = parts
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| format!("bad tuplet token {t:?}"))?;
-            let n: u32 = parts
-                .next()
-                .and_then(|s| s.parse().ok())
-                .ok_or_else(|| format!("bad tuplet token {t:?}"))?;
-            if a == 0 || n == 0 {
-                return Err(format!("bad tuplet token {t:?}"));
+            let a_opt = parts.next().and_then(|s| s.parse::<u32>().ok());
+            let n_opt = parts.next().and_then(|s| s.parse::<u32>().ok());
+            match (a_opt, n_opt) {
+                (Some(a), Some(n)) if a > 0 && n > 0 => {
+                    pending_spans.push((a, n));
+                }
+                _ if lenient => {
+                    warnings.skipped_tokens += 1;
+                }
+                _ => return Err(format!("bad tuplet token {t:?}")),
             }
-            pending_spans.push((a, n));
             i += 1;
             continue;
         }
@@ -987,15 +1264,27 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             if let (Some(a), Some(n)) = (a, n) {
                 pending_spans.push((a, n));
                 i += 3;
+            } else if lenient {
+                warnings.skipped_tokens += 1;
+                i += 1;
             } else {
                 return Err(format!("bad tup-open in measure {measure}: expected A N"));
             }
             continue;
         }
         if t == "tuplet-stop" || t == "tup-close" {
-            spans[seg]
-                .pop()
-                .ok_or_else(|| format!("unmatched {t} in measure {measure}"))?;
+            if spans[seg].pop().is_none() {
+                if lenient {
+                    warnings.orphan_closers += 1;
+                } else {
+                    return Err(format!("unmatched {t} in measure {measure}"));
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if lenient && t == "slur-stop" {
+            warnings.orphan_closers += 1;
             i += 1;
             continue;
         }
@@ -1003,37 +1292,47 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         let mut chord = false;
         if t == "chord" {
             if grace_pending {
-                return Err(format!("grace without duration in measure {measure}"));
+                if lenient {
+                    grace_pending = false;
+                    warnings.skipped_tokens += 1;
+                } else {
+                    return Err(format!("grace without duration in measure {measure}"));
+                }
             }
             chord = true;
             i += 1;
         }
-        seen_event = true;
-        // Event-level grace: the `grace` marker is consumed by the
-        // duration token (chord tones inherit the run's grace and group ID).
-        let is_grace = if chord {
-            grace_run
-        } else {
-            let g = grace_pending;
-            grace_pending = false;
-            grace_run = g;
-            if g {
-                grace_seq = grace_seq.saturating_add(1);
+        let Some(t) = toks.get(i) else {
+            if lenient {
+                warnings.skipped_tokens += 1;
+                break;
             }
-            g
+            return Err(format!("dangling chord marker in measure {measure}"));
         };
-        let t = toks
-            .get(i)
-            .ok_or_else(|| format!("dangling chord marker in measure {measure}"))?;
         let (pitched, written) = if *t == "rest" {
+            seen_event = true;
             i += 1;
             (false, 0.0)
         } else if let Some(w) = written_dur(t) {
+            seen_event = true;
             i += 1;
             (true, w)
         } else if *t == "bar-rest" {
+            seen_event = true;
+            let is_grace = if chord {
+                grace_run
+            } else {
+                let g = grace_pending;
+                grace_pending = false;
+                grace_run = g;
+                g
+            };
             if is_grace {
-                return Err(format!("grace on bar-rest in measure {measure}"));
+                if lenient {
+                    warnings.skipped_tokens += 1;
+                } else {
+                    return Err(format!("grace on bar-rest in measure {measure}"));
+                }
             }
             // Whole-bar rest: emit with full-bar duration (unscored),
             // jump this voice to the bar end.
@@ -1055,29 +1354,60 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             spans[seg].append(&mut pending_spans);
             i += 1;
             continue;
+        } else if lenient {
+            warnings.skipped_tokens += 1;
+            i += 1;
+            continue;
         } else {
             return Err(format!("unexpected token {t:?} in measure {measure}"));
+        };
+        // Event-level grace: the `grace` marker is consumed by the
+        // duration token (chord tones inherit the run's grace and group ID).
+        let is_grace = if chord {
+            grace_run
+        } else {
+            let g = grace_pending;
+            grace_pending = false;
+            grace_run = g;
+            if g {
+                grace_seq = grace_seq.saturating_add(1);
+            }
+            g
         };
         // Step + octave follow the duration token (alter, dots, ties
         // after — see below).
         let (step, octave) = if pitched {
-            let s = toks
-                .get(i)
-                .ok_or_else(|| format!("missing step in measure {measure}"))?;
-            let step = s
-                .chars()
-                .next()
-                .ok_or_else(|| format!("bad step token {s:?} in measure {measure}"))?;
-            if !"ABCDEFG".contains(step) {
+            let Some(s) = toks.get(i) else {
+                if lenient {
+                    warnings.skipped_tokens += 1;
+                    break;
+                }
+                return Err(format!("missing step in measure {measure}"));
+            };
+            let step_char = s.chars().next();
+            let valid_step = step_char.filter(|&c| "ABCDEFG".contains(c));
+            let Some(step) = valid_step else {
+                if lenient {
+                    warnings.skipped_tokens += 1;
+                    continue;
+                }
                 return Err(format!("bad step token {s:?} in measure {measure}"));
-            }
+            };
             i += 1;
-            let o = toks
-                .get(i)
-                .ok_or_else(|| format!("missing octave in measure {measure}"))?;
-            let octave: i32 = o
-                .parse()
-                .map_err(|_| format!("bad octave token {o:?} in measure {measure}"))?;
+            let Some(o) = toks.get(i) else {
+                if lenient {
+                    warnings.skipped_tokens += 1;
+                    break;
+                }
+                return Err(format!("missing octave in measure {measure}"));
+            };
+            let Ok(octave) = o.parse::<i32>() else {
+                if lenient {
+                    warnings.skipped_tokens += 1;
+                    continue;
+                }
+                return Err(format!("bad octave token {o:?} in measure {measure}"));
+            };
             i += 1;
             (Some(step), Some(octave))
         } else {
@@ -1100,6 +1430,10 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                 alter = a[1..]
                     .parse()
                     .map_err(|_| format!("bad alter token {a:?} in measure {measure}"))?;
+                if lenient && !(-2..=2).contains(&alter) {
+                    warnings.skipped_tokens += 1;
+                    alter = alter.clamp(-2, 2);
+                }
                 i += 1;
             }
         }
@@ -1118,11 +1452,21 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         take_tail(&toks, &mut i, &mut mods, &mut tie_start, &mut tie_stop);
         if !pitched {
             // Plain-rest duration token follows the `rest` marker.
-            let d = toks
-                .get(i)
-                .ok_or_else(|| format!("missing rest duration in measure {measure}"))?;
-            dur_written = written_dur(d)
-                .ok_or_else(|| format!("bad rest duration {d:?} in measure {measure}"))?;
+            let Some(d) = toks.get(i) else {
+                if lenient {
+                    warnings.skipped_tokens += 1;
+                    break;
+                }
+                return Err(format!("missing rest duration in measure {measure}"));
+            };
+            let Some(dw) = written_dur(d) else {
+                if lenient {
+                    warnings.skipped_tokens += 1;
+                    continue;
+                }
+                return Err(format!("bad rest duration {d:?} in measure {measure}"));
+            };
+            dur_written = dw;
             i += 1;
             while toks.get(i) == Some(&"dot") {
                 dots += 1;
@@ -1133,6 +1477,22 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             // errors as an unexpected bound token, like the encoder).
             take_tail_rest(&toks, &mut i, &mut mods);
         }
+        if lenient {
+            while open_slurs.len() <= seg {
+                open_slurs.push(0);
+            }
+            if mods.slur_stop {
+                if open_slurs[seg] > 0 {
+                    open_slurs[seg] -= 1;
+                } else {
+                    mods.slur_stop = false;
+                    warnings.orphan_closers += 1;
+                }
+            }
+            if mods.slur_start {
+                open_slurs[seg] += 1;
+            }
+        }
         // Pending spans open on this event's segment (`voice-N`
         // precedes it in the stream, so `seg` is already current).
         spans[seg].append(&mut pending_spans);
@@ -1140,16 +1500,22 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         let cur_tuplet = ratio_of(&spans, seg);
         let performed = dur_written * scale;
         let base = bar_start;
+        if chord && last_onset[seg].is_none() && lenient {
+            warnings.skipped_tokens += 1;
+            chord = false;
+        }
         if chord {
             let onset = last_onset[seg]
                 .ok_or_else(|| format!("dangling chord marker in measure {measure}"))?;
-            let pitch = format!(
-                "{}{}{}",
-                step.ok_or_else(|| format!("chord on rest in measure {measure}"))?,
-                alter_suffix(alter)?,
-                octave.unwrap_or(4)
-            );
-            let key = (step.unwrap(), octave.unwrap_or(4), alter);
+            let Some(st) = step else {
+                if lenient {
+                    warnings.skipped_tokens += 1;
+                    continue;
+                }
+                return Err(format!("chord on rest in measure {measure}"));
+            };
+            let pitch = format!("{}{}{}", st, alter_suffix(alter)?, octave.unwrap_or(4));
+            let key = (st, octave.unwrap_or(4), alter);
             if merge_ties {
                 if !is_grace {
                     if let Some((sm, sst, note)) = tie_note(
@@ -1253,7 +1619,28 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         }
     }
     if grace_pending {
-        return Err("dangling grace marker at end of stream".to_string());
+        if lenient {
+            warnings.skipped_tokens += 1;
+        } else {
+            return Err("dangling grace marker at end of stream".to_string());
+        }
+    }
+    if lenient {
+        if in_txt {
+            warnings.unclosed_spans += 1;
+        }
+        let unclosed_tups: usize =
+            spans.iter().map(Vec::len).sum::<usize>() + pending_spans.len();
+        if unclosed_tups > 0 {
+            warnings.unclosed_spans += unclosed_tups;
+        }
+        let unclosed_slurs: usize = open_slurs.iter().sum();
+        if unclosed_slurs > 0 {
+            warnings.unclosed_spans += unclosed_slurs;
+        }
+        if open_hairpin {
+            warnings.unclosed_spans += 1;
+        }
     }
     for ((s, o, a), stack) in pending_tie {
         for (sm, sst, fseg, onset, acc, fmods, ftup) in stack {
@@ -1536,17 +1923,20 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         }
     }
 
-    Ok(ScoreInput {
-        title: None,
-        composer: None,
-        divisions: divisions as u32,
-        time: Some(time),
-        key_fifths,
-        parts,
-        notes: Vec::new(),
-        part_name: None,
-        measure_attrs,
-    })
+    Ok((
+        ScoreInput {
+            title: None,
+            composer: None,
+            divisions: divisions as u32,
+            time: Some(time),
+            key_fifths,
+            parts,
+            notes: Vec::new(),
+            part_name: None,
+            measure_attrs,
+        },
+        warnings,
+    ))
 }
 
 #[cfg(test)]
@@ -3553,5 +3943,60 @@ mod tests {
         // Each 13:8 16th note is exactly 0.25 * 8/13 * 6240 = 960 ticks.
         assert_eq!(xml.matches("<duration>960</duration>").count(), 13);
         assert!(!has_errors(&validate_musicxml(&xml)));
+    }
+
+    #[test]
+    fn lenient_decode_recovers_malformed_headers_spans_orphans_and_truncation() {
+        use super::{decode_bekern_lenient, decode_bekern_unmerged_lenient, decode_bekern_with_options};
+
+        // 1. Malformed leading headers fall back to valid defaults instead of Err.
+        let bad_hdr = "clef-Z-bad keyXYZ time-0-0 voice-1 quarter C 4 bar";
+        assert!(decode_bekern(bad_hdr).is_err());
+        let (score, w) = decode_bekern_lenient(bad_hdr).expect("lenient never fails on bad headers");
+        assert_eq!(w.malformed_headers, 3);
+        assert_eq!(score.time, Some(crate::TimeSig { beats: 4, beat_type: 4 }));
+        assert_eq!(score.key_fifths, 0);
+        assert_eq!(score.parts[0].notes.len(), 1);
+        assert_eq!(score.parts[0].notes[0].pitch.as_deref(), Some("C4"));
+
+        // 2. Unclosed tup-open, slur-start, hairpin-cresc-start, and <txt> auto-close at bar/<sys>/<eos>.
+        let unclosed = "<bos> clef-G-2 key+0 time-4-4 voice-1 <txt> Allegro \
+            bar voice-1 tup-open 3 2 eighth C 4 eighth D 4 bar \
+            voice-1 hairpin-cresc-start quarter E 4 slur-start <sys> \
+            voice-1 quarter F 4 <eos>";
+        let (score2, w2) =
+            decode_bekern_unmerged_lenient(unclosed).expect("lenient auto-closes spans");
+        // Unclosed: <txt> at bar (1) + tup-open at bar (1) + slur-start at <sys> (1) + hairpin at <sys> (1) = 4
+        assert_eq!(w2.unclosed_spans, 4, "warnings: {w2:?}");
+        assert_eq!(w2.orphan_closers, 0);
+        let pitches: Vec<_> = score2.parts[0]
+            .notes
+            .iter()
+            .filter_map(|n| n.pitch.as_deref())
+            .collect();
+        assert_eq!(pitches, vec!["C4", "D4", "E4", "F4"]);
+
+        // 3. Orphan closers (tup-close, slur-stop, hairpin-stop, </txt>) are dropped,
+        //    and unknown / truncated tokens are skipped cleanly.
+        let messy = "clef-G-2 key+0 time-4-4 </txt> tup-close hairpin-stop \
+            voice-1 BOGUS_TOK quarter G 4 slur-stop quarter A";
+        assert!(decode_bekern(messy).is_err());
+        let (score3, w3) =
+            decode_bekern_with_options(messy, true, true).expect("lenient drops orphans & truncation");
+        assert_eq!(w3.orphan_closers, 4, "warnings: {w3:?}");
+        assert!(w3.skipped_tokens >= 2, "expected skipped BOGUS_TOK + truncated A: {w3:?}");
+        assert_eq!(score3.parts[0].notes.len(), 1);
+        assert_eq!(score3.parts[0].notes[0].pitch.as_deref(), Some("G4"));
+        assert!(!score3.parts[0].notes[0].slur_stop, "orphan slur-stop cleared");
+    }
+
+    #[test]
+    fn lenient_decode_valid_stream_has_zero_warnings() {
+        let valid = "clef-G-2 key+0 time-4-4 voice-1 hairpin-cresc-start \
+            quarter C 4 slur-start quarter D 4 slur-stop hairpin-stop \
+            tup-open 3 2 eighth E 4 eighth F 4 eighth G 4 tup-close bar";
+        let (score, w) = super::decode_bekern_lenient(valid).expect("valid stream decodes");
+        assert!(w.is_empty(), "expected 0 warnings on clean stream, got {w:?}");
+        assert_eq!(score.parts[0].notes.len(), 5);
     }
 }

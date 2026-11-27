@@ -8,7 +8,10 @@ use std::process::ExitCode;
 use clap::{Args, Parser, Subcommand};
 use mscz::{
     bekern::{to_bekern, to_bekern_v2},
-    decode::{decode_bekern, decode_bekern_unmerged},
+    decode::{
+        decode_bekern, decode_bekern_lenient, decode_bekern_unmerged,
+        decode_bekern_unmerged_lenient,
+    },
     example_input, has_errors, is_empty_score_input,
     lattice::{rank_measures, read_lattice},
     musicxml_import::{
@@ -193,6 +196,10 @@ struct BekernDecodeArgs {
     /// Where to write the decoded note-list JSON.
     #[arg(long)]
     out: PathBuf,
+    /// Loss-tolerant recovery mode: auto-close unclosed spans, drop orphan
+    /// closers, fall back malformed headers, and skip unknown tokens.
+    #[arg(long, default_value_t = false)]
+    lenient: bool,
 }
 
 #[derive(Args, Debug)]
@@ -211,6 +218,10 @@ struct Bekern2MusicxmlArgs {
     /// `<out>/<stem>_lattice.json`, ranked for review.
     #[arg(long)]
     lattice_in: Option<PathBuf>,
+    /// Loss-tolerant recovery mode: auto-close unclosed spans, drop orphan
+    /// closers, fall back malformed headers, and skip unknown tokens.
+    #[arg(long, default_value_t = false)]
+    lenient: bool,
 }
 
 #[derive(Args, Debug)]
@@ -427,7 +438,23 @@ fn cmd_bekern2musicxml(a: &Bekern2MusicxmlArgs) -> Result<(), Err> {
         fs::read_to_string(&a.input).map_err(|e| format!("read {}: {e}", a.input.display()))?;
     // Link-faithful decode: the strict-xml oracle compares tie
     // segments, so every tie link must render as its own note.
-    let input = decode_bekern_unmerged(&text).map_err(|e| format!("{}: {e}", a.input.display()))?;
+    let input = if a.lenient {
+        let (decoded, warnings) = decode_bekern_unmerged_lenient(&text)
+            .map_err(|e| format!("{}: {e}", a.input.display()))?;
+        if !warnings.is_empty() {
+            eprintln!(
+                "warning: lenient decode recovered {} issue(s) (malformed_headers={}, unclosed_spans={}, orphan_closers={}, skipped_tokens={})",
+                warnings.total(),
+                warnings.malformed_headers,
+                warnings.unclosed_spans,
+                warnings.orphan_closers,
+                warnings.skipped_tokens
+            );
+        }
+        decoded
+    } else {
+        decode_bekern_unmerged(&text).map_err(|e| format!("{}: {e}", a.input.display()))?
+    };
     let stem = a
         .stem
         .clone()
@@ -703,7 +730,23 @@ fn cmd_split(a: &SplitArgs) -> Result<(), Err> {
 fn cmd_bekern_decode(a: &BekernDecodeArgs) -> Result<(), Err> {
     let text =
         fs::read_to_string(&a.input).map_err(|e| format!("read {}: {e}", a.input.display()))?;
-    let score = decode_bekern(&text).map_err(|e| format!("{}: {e}", a.input.display()))?;
+    let score = if a.lenient {
+        let (decoded, warnings) =
+            decode_bekern_lenient(&text).map_err(|e| format!("{}: {e}", a.input.display()))?;
+        if !warnings.is_empty() {
+            eprintln!(
+                "warning: lenient decode recovered {} issue(s) (malformed_headers={}, unclosed_spans={}, orphan_closers={}, skipped_tokens={})",
+                warnings.total(),
+                warnings.malformed_headers,
+                warnings.unclosed_spans,
+                warnings.orphan_closers,
+                warnings.skipped_tokens
+            );
+        }
+        decoded
+    } else {
+        decode_bekern(&text).map_err(|e| format!("{}: {e}", a.input.display()))?
+    };
     let n: usize = score.parts.iter().map(|p| p.notes.len()).sum();
     write_file(&a.out, serde_json::to_string_pretty(&score)?.as_bytes())?;
     println!(
@@ -775,6 +818,7 @@ mod cli_tests {
             out: out.clone(),
             stem,
             lattice_in: None,
+            lenient: false,
         })
         .expect("bekern2musicxml succeeds");
         (dir, out)
@@ -885,6 +929,7 @@ mod cli_tests {
             out: hyp_out.clone(),
             stem: Some("page".to_string()),
             lattice_in: None,
+            lenient: false,
         })
         .expect("bekern2musicxml succeeds");
 
@@ -921,6 +966,7 @@ mod cli_tests {
             out: dir.join("out"),
             stem: None,
             lattice_in: None,
+            lenient: false,
         })
         .expect_err("truncated stream must fail");
         assert!(
@@ -953,6 +999,7 @@ mod cli_tests {
             out: out.clone(),
             stem: Some("page".to_string()),
             lattice_in: Some(lat),
+            lenient: false,
         })
         .expect("bekern2musicxml with lattice succeeds");
         let text = fs::read_to_string(out.join("page_lattice.json")).expect("sidecar written");
@@ -985,6 +1032,7 @@ mod cli_tests {
             out: dir.join("out"),
             stem: Some("page".to_string()),
             lattice_in: Some(lat),
+            lenient: false,
         })
         .expect_err("bad lattice must fail");
         assert!(
@@ -1008,11 +1056,35 @@ mod cli_tests {
             out: out.clone(),
             stem: Some("blank".to_string()),
             lattice_in: None,
+            lenient: false,
         })
         .expect("bekern2musicxml abstains cleanly on zero-note all-bar-rest page");
         let xml = fs::read_to_string(out.join("blank.musicxml")).expect("read musicxml");
         assert!(xml.contains("<score-partwise version=\"3.1\">"));
         assert!(!xml.contains("<measure"));
         assert!(!xml.contains("<note"));
+    }
+
+    #[test]
+    fn bekern2musicxml_lenient_recovers_malformed_stream() {
+        let dir = scratch_dir("lenient");
+        let input = dir.join("noisy-bekern.txt");
+        fs::write(
+            &input,
+            "clef-Z-bad keyXYZ time-0-0 </txt> voice-1 BOGUS quarter C 4 slur-start quarter D",
+        )
+        .expect("write noisy fixture");
+        let out = dir.join("out");
+        cmd_bekern2musicxml(&Bekern2MusicxmlArgs {
+            input,
+            out: out.clone(),
+            stem: Some("noisy".to_string()),
+            lattice_in: None,
+            lenient: true,
+        })
+        .expect("lenient bekern2musicxml succeeds on noisy stream");
+        let xml = fs::read_to_string(out.join("noisy.musicxml")).expect("read musicxml");
+        assert!(xml.contains("<step>C</step>"));
+        assert!(!has_errors(&validate_musicxml(&xml)));
     }
 }

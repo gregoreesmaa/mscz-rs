@@ -63,6 +63,7 @@ pub mod builder;
 pub mod decode;
 #[cfg(feature = "lattice")]
 pub mod lattice;
+pub mod mscx_import;
 pub mod musicxml_import;
 pub mod pitch;
 #[cfg(feature = "wasm")]
@@ -2675,6 +2676,24 @@ fn group_voice_items(segs: &[Segment]) -> Vec<MscxItem<'_>> {
     items
 }
 
+/// Resolve the tuplet ratio and written base duration for one `MscxItem`,
+/// preferring explicit `NoteInput.tuplet` when present and falling back to
+/// tick-based `tuplet_duration` guessing only when `None`.
+fn resolve_mscx_tuplet(
+    item: &MscxItem<'_>,
+    divisions: u32,
+) -> Option<(&'static str, u8, i64, u32, u32)> {
+    if let Some((actual, normal)) = item.members.iter().find_map(|s| s.note.tuplet) {
+        if actual > 0 && normal > 0 {
+            let written_est =
+                (item.dur_ticks * actual as i64 + normal as i64 / 2) / normal as i64;
+            let (name, dots, base_ticks) = quantize_duration(written_est, divisions);
+            return Some((name, dots, base_ticks, actual, normal));
+        }
+    }
+    tuplet_duration(item.dur_ticks, divisions)
+}
+
 /// Render a MuseScore 4 native `.mscx` document (`version="4.20"`).
 ///
 /// One `<Part id="N">` + `<Staff id="N">` per part, one `<Measure>` per bar,
@@ -2771,7 +2790,9 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
             })
             .collect();
 
-        // Pair ties per (voice_id, midi) and slurs per voice_id across measures.
+        // Pair ties per (voice_id, step, alter, octave) and slurs per voice_id across measures.
+        // Keying ties by `(step, alter, octave)` instead of raw MIDI avoids enharmonic collisions
+        // (e.g. C#4 and Db4 tied independently in the same voice).
         // Keys: (measure_idx, voice_idx, item_idx, note_idx) -> (dm, df_ticks)
         let mut tie_next: BTreeMap<(usize, usize, usize, usize), (i64, i64)> = BTreeMap::new();
         let mut tie_prev: BTreeMap<(usize, usize, usize, usize), (i64, i64)> = BTreeMap::new();
@@ -2781,7 +2802,8 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
 
         let n_voices = grouped.first().map(|v| v.len()).unwrap_or(0);
         for vi in 0..n_voices {
-            let mut open_ties: BTreeMap<i32, (usize, usize, usize, i64)> = BTreeMap::new();
+            let mut open_ties: BTreeMap<(char, i32, i32), (usize, usize, usize, i64)> =
+                BTreeMap::new();
             let mut open_slur: Option<(usize, usize, i64)> = None;
             for (m, voices) in grouped.iter().enumerate() {
                 let Some((_, items)) = voices.get(vi) else {
@@ -2806,8 +2828,9 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                     }
                     for (ni, seg) in item.members.iter().enumerate() {
                         let (t_start, t_stop) = tie_elements(seg);
+                        let tie_key = (seg.note.step, seg.note.alter, seg.note.octave);
                         if t_stop {
-                            if let Some((sm, si, sn, soff)) = open_ties.remove(&seg.note.midi) {
+                            if let Some((sm, si, sn, soff)) = open_ties.remove(&tie_key) {
                                 let dm = m as i64 - sm as i64;
                                 let df = item.off_ticks - soff;
                                 tie_next.insert((sm, vi, si, sn), (dm, df));
@@ -2815,7 +2838,7 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                             }
                         }
                         if t_start {
-                            open_ties.insert(seg.note.midi, (m, ii, ni, item.off_ticks));
+                            open_ties.insert(tie_key, (m, ii, ni, item.off_ticks));
                         }
                     }
                 }
@@ -2881,6 +2904,102 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                 let dm = last as i64 - sm as i64;
                 hp_start.entry(sm).or_default().push((sub, dm, mlen));
                 hp_stop_end.entry(last).or_default().push((-dm, -mlen));
+            }
+        }
+
+        // Pair ottava spanners across measures (on voice 0), preserving `8va`/`8vb`/`stop`.
+        let mut ott_start: BTreeMap<usize, Vec<(String, i64, i64)>> = BTreeMap::new();
+        let mut ott_stop_start: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
+        let mut ott_stop_end: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
+        let mut open_ott: Option<(usize, String)> = None;
+        for m in 0..n_measures {
+            let m1 = m as u32 + 1;
+            let mut m_otts: Vec<&str> = Vec::new();
+            if let Some(a) = measure_attr(score, m1) {
+                for te in &a.timed_events {
+                    if te.kind == "ottava" {
+                        m_otts.push(te.value.as_str());
+                    }
+                }
+            }
+            if let Some(a) = part_measure_attr(part, m1) {
+                for te in &a.timed_events {
+                    if te.kind == "ottava" {
+                        m_otts.push(te.value.as_str());
+                    }
+                }
+            }
+            for o in m_otts {
+                match o {
+                    "8va" | "8vb" => {
+                        if let Some((sm, sub)) = open_ott.take() {
+                            if m > sm {
+                                let dm = m as i64 - sm as i64;
+                                ott_start.entry(sm).or_default().push((sub, dm, 0));
+                                ott_stop_start.entry(m).or_default().push((-dm, 0));
+                            }
+                        }
+                        open_ott = Some((m, o.to_string()));
+                    }
+                    _ => {
+                        if let Some((sm, sub)) = open_ott.take() {
+                            if m > sm {
+                                let dm = m as i64 - sm as i64;
+                                ott_start.entry(sm).or_default().push((sub, dm, 0));
+                                ott_stop_start.entry(m).or_default().push((-dm, 0));
+                            } else {
+                                let mlen = windows
+                                    .get(m)
+                                    .map(|&(a, b)| b - a)
+                                    .unwrap_or_else(|| score.measure_ticks());
+                                ott_start.entry(sm).or_default().push((sub, 0, mlen));
+                                ott_stop_end.entry(m).or_default().push((0, -mlen));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if let Some((sm, sub)) = open_ott.take() {
+            if n_measures > 0 {
+                let last = n_measures - 1;
+                let mlen = windows
+                    .get(last)
+                    .map(|&(a, b)| b - a)
+                    .unwrap_or_else(|| score.measure_ticks());
+                let dm = last as i64 - sm as i64;
+                ott_start.entry(sm).or_default().push((sub, dm, mlen));
+                ott_stop_end.entry(last).or_default().push((-dm, -mlen));
+            }
+        }
+
+        // Pair volta / ending brackets across measures (on voice 0).
+        let mut volta_start: BTreeMap<usize, Vec<(String, i64, i64)>> = BTreeMap::new();
+        let mut volta_stop_start: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
+        let mut volta_stop_end: BTreeMap<usize, Vec<(i64, i64)>> = BTreeMap::new();
+        for m in 0..n_measures {
+            let m1 = m as u32 + 1;
+            let v_opt = part_measure_attr(part, m1)
+                .and_then(|a| a.volta.as_deref())
+                .or_else(|| measure_attr(score, m1).and_then(|a| a.volta.as_deref()));
+            if let Some(v) = v_opt {
+                if m + 1 < n_measures {
+                    volta_start
+                        .entry(m)
+                        .or_default()
+                        .push((v.to_string(), 1, 0));
+                    volta_stop_start.entry(m + 1).or_default().push((-1, 0));
+                } else {
+                    let mlen = windows
+                        .get(m)
+                        .map(|&(a, b)| b - a)
+                        .unwrap_or_else(|| score.measure_ticks());
+                    volta_start
+                        .entry(m)
+                        .or_default()
+                        .push((v.to_string(), 0, mlen));
+                    volta_stop_end.entry(m).or_default().push((0, -mlen));
+                }
             }
         }
 
@@ -3046,6 +3165,81 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                             out.push_str("            </Spanner>\n");
                         }
                     }
+                    if let Some(stops) = ott_stop_start.get(&m) {
+                        for &(dm, df) in stops {
+                            out.push_str("          <Spanner type=\"Ottava\">\n");
+                            out.push_str("            <prev>\n");
+                            write_mscx_location_xml(
+                                &mut out,
+                                "              ",
+                                dm,
+                                df,
+                                score.divisions,
+                            );
+                            out.push_str("              </prev>\n");
+                            out.push_str("            </Spanner>\n");
+                        }
+                    }
+                    if let Some(starts) = ott_start.get(&m) {
+                        for (sub, dm, df) in starts {
+                            out.push_str("          <Spanner type=\"Ottava\">\n");
+                            out.push_str("            <Ottava>\n");
+                            out.push_str("              <subtype>");
+                            write_escaped_xml(&mut out, sub);
+                            out.push_str("</subtype>\n");
+                            out.push_str("              </Ottava>\n");
+                            out.push_str("            <next>\n");
+                            write_mscx_location_xml(
+                                &mut out,
+                                "              ",
+                                *dm,
+                                *df,
+                                score.divisions,
+                            );
+                            out.push_str("              </next>\n");
+                            out.push_str("            </Spanner>\n");
+                        }
+                    }
+                    if let Some(stops) = volta_stop_start.get(&m) {
+                        for &(dm, df) in stops {
+                            out.push_str("          <Spanner type=\"Volta\">\n");
+                            out.push_str("            <prev>\n");
+                            write_mscx_location_xml(
+                                &mut out,
+                                "              ",
+                                dm,
+                                df,
+                                score.divisions,
+                            );
+                            out.push_str("              </prev>\n");
+                            out.push_str("            </Spanner>\n");
+                        }
+                    }
+                    if let Some(starts) = volta_start.get(&m) {
+                        for (v, dm, df) in starts {
+                            let hook = if v == "1" { 1 } else { 0 };
+                            out.push_str("          <Spanner type=\"Volta\">\n");
+                            out.push_str("            <Volta>\n");
+                            let _ = writeln!(out, "              <endHookType>{hook}</endHookType>");
+                            out.push_str("              <beginText>");
+                            write_escaped_xml(&mut out, v);
+                            out.push_str(".</beginText>\n");
+                            out.push_str("              <endings>");
+                            write_escaped_xml(&mut out, v);
+                            out.push_str("</endings>\n");
+                            out.push_str("              </Volta>\n");
+                            out.push_str("            <next>\n");
+                            write_mscx_location_xml(
+                                &mut out,
+                                "              ",
+                                *dm,
+                                *df,
+                                score.divisions,
+                            );
+                            out.push_str("              </next>\n");
+                            out.push_str("            </Spanner>\n");
+                        }
+                    }
                 }
 
                 // Track open <Tuplet> state: (actual, normal, written_acc, target_written).
@@ -3055,7 +3249,7 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                     let is_measure_rest =
                         item.is_rest && !item.grace && items.len() == 1 && item.dur_ticks == mlen;
                     let tup = if !item.grace && !is_measure_rest {
-                        tuplet_duration(item.dur_ticks, score.divisions)
+                        resolve_mscx_tuplet(item, score.divisions)
                     } else {
                         None
                     };
@@ -3078,7 +3272,7 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                                     continue;
                                 }
                                 let Some((_, nd, nb, na, nn)) =
-                                    tuplet_duration(next_item.dur_ticks, score.divisions)
+                                    resolve_mscx_tuplet(next_item, score.divisions)
                                 else {
                                     break;
                                 };
@@ -3167,6 +3361,17 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                         let _ = writeln!(out, "            <dots>{dots}</dots>");
                     }
                     let _ = writeln!(out, "            <durationType>{dtype}</durationType>");
+                    if item.members.iter().all(|s| s.note.cue) {
+                        out.push_str("            <small>1</small>\n");
+                    }
+                    if let Some(shift) = item
+                        .members
+                        .iter()
+                        .find_map(|s| s.note.xstaff)
+                        .filter(|&d| d != 0)
+                    {
+                        let _ = writeln!(out, "            <staffMove>{shift}</staffMove>");
+                    }
                     if item.grace {
                         out.push_str("            <appoggiatura/>\n");
                     }
@@ -3256,6 +3461,9 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                             "              <tpc>{}</tpc>",
                             tpc(s.note.step, s.note.alter)
                         );
+                        if s.note.cue {
+                            out.push_str("              <small>1</small>\n");
+                        }
                         out.push_str("              </Note>\n");
                     }
                     out.push_str("            </Chord>\n");
@@ -3277,6 +3485,36 @@ pub fn to_mscx(score: &Score, losses: &mut LossTable) -> String {
                     if let Some(stops) = hp_stop_end.get(&m) {
                         for &(dm, df) in stops {
                             out.push_str("          <Spanner type=\"HairPin\">\n");
+                            out.push_str("            <prev>\n");
+                            write_mscx_location_xml(
+                                &mut out,
+                                "              ",
+                                dm,
+                                df,
+                                score.divisions,
+                            );
+                            out.push_str("              </prev>\n");
+                            out.push_str("            </Spanner>\n");
+                        }
+                    }
+                    if let Some(stops) = ott_stop_end.get(&m) {
+                        for &(dm, df) in stops {
+                            out.push_str("          <Spanner type=\"Ottava\">\n");
+                            out.push_str("            <prev>\n");
+                            write_mscx_location_xml(
+                                &mut out,
+                                "              ",
+                                dm,
+                                df,
+                                score.divisions,
+                            );
+                            out.push_str("              </prev>\n");
+                            out.push_str("            </Spanner>\n");
+                        }
+                    }
+                    if let Some(stops) = volta_stop_end.get(&m) {
+                        for &(dm, df) in stops {
+                            out.push_str("          <Spanner type=\"Volta\">\n");
                             out.push_str("            <prev>\n");
                             write_mscx_location_xml(
                                 &mut out,
@@ -4651,5 +4889,119 @@ mod tests {
         };
         assert_eq!(s.divisions, SCORE_DIVISIONS);
         assert!(parse_score(&s).is_ok());
+    }
+
+    #[test]
+    fn to_mscx_preserves_ottava_volta_cue_xstaff_explicit_tuplet_and_enharmonic_ties() {
+        // Measure 1: C#4 and Db4 (same MIDI 61!) tied independently in voice 1,
+        // plus volta-1 and ottava 8va, plus a cue + xstaff-up note.
+        let mut csharp_start = NoteInput::note("C#4", 0.0, 1.0);
+        csharp_start.tie_start = true;
+        let mut dflat_start = NoteInput::note("Db4", 0.0, 1.0);
+        dflat_start.tie_start = true;
+
+        let mut csharp_stop = NoteInput::note("C#4", 1.0, 1.0);
+        csharp_stop.tie_stop = true;
+        let mut dflat_stop = NoteInput::note("Db4", 1.0, 1.0);
+        dflat_stop.tie_stop = true;
+
+        let mut cue_xstaff = NoteInput::note("G5", 2.0, 2.0);
+        cue_xstaff.cue = true;
+        cue_xstaff.xstaff = Some(-1);
+
+        // Measure 2: explicit 6:4 tuplet (not in the tick-guessing RATIOS table!)
+        // + ottava stop + volta-2.
+        let mut notes = vec![
+            csharp_start,
+            dflat_start,
+            csharp_stop,
+            dflat_stop,
+            cue_xstaff,
+        ];
+        for k in 0..6 {
+            let mut n = NoteInput::note("E4", 4.0 + (k as f64) * (2.0 / 3.0), 2.0 / 3.0);
+            n.tuplet = Some((6, 4));
+            notes.push(n);
+        }
+
+        let input = ScoreInput {
+            title: Some("Parity Check".to_string()),
+            divisions: SCORE_DIVISIONS,
+            time: Some(TimeSig {
+                beats: 4,
+                beat_type: 4,
+            }),
+            parts: vec![PartInput {
+                name: "Piano".to_string(),
+                notes,
+                clef_sign: Some('G'),
+                clef_line: Some(2),
+                ..Default::default()
+            }],
+            measure_attrs: vec![
+                MeasureAttr {
+                    measure: 1,
+                    volta: Some("1".to_string()),
+                    timed_events: vec![TimedEvent {
+                        onset_beats: 0.0,
+                        kind: "ottava".to_string(),
+                        value: "8va".to_string(),
+                    }],
+                    ..Default::default()
+                },
+                MeasureAttr {
+                    measure: 2,
+                    volta: Some("2".to_string()),
+                    timed_events: vec![TimedEvent {
+                        onset_beats: 0.0,
+                        kind: "ottava".to_string(),
+                        value: "stop".to_string(),
+                    }],
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+
+        let (score, mut losses) = parse_score(&input).unwrap();
+        let mscx = to_mscx(&score, &mut losses);
+
+        // Enharmonic ties: BOTH C#4 (tpc=21) and Db4 (tpc=9) must have paired Tie spanners!
+        assert_eq!(
+            mscx.matches("<Spanner type=\"Tie\">").count(),
+            4,
+            "both C#4 and Db4 ties must pair without colliding on MIDI 61:\n{mscx}"
+        );
+        // Ottava 8va + stop
+        assert!(mscx.contains("<Spanner type=\"Ottava\">"));
+        assert!(mscx.contains("<subtype>8va</subtype>"));
+        // Volta 1 and Volta 2
+        assert!(mscx.contains("<Spanner type=\"Volta\">"));
+        assert!(mscx.contains("<endings>1</endings>"));
+        assert!(mscx.contains("<endings>2</endings>"));
+        // Cue + xstaff
+        assert!(mscx.contains("<small>1</small>"));
+        assert!(mscx.contains("<staffMove>-1</staffMove>"));
+        // Explicit 6:4 tuplet preserved directly from NoteInput.tuplet
+        assert!(mscx.contains("<actualNotes>6</actualNotes>"));
+        assert!(mscx.contains("<normalNotes>4</normalNotes>"));
+
+        // And round-trip back through import_mscx!
+        let reimported = crate::mscx_import::import_mscx(&mscx).unwrap();
+        let p0 = &reimported.parts[0];
+        let tied_starts: Vec<_> = p0
+            .notes
+            .iter()
+            .filter(|n| n.tie_start)
+            .filter_map(|n| n.pitch.as_deref())
+            .collect();
+        let tied_stops: Vec<_> = p0
+            .notes
+            .iter()
+            .filter(|n| n.tie_stop)
+            .filter_map(|n| n.pitch.as_deref())
+            .collect();
+        assert_eq!(tied_starts, vec!["C#4", "Db4"]);
+        assert_eq!(tied_stops, vec!["C#4", "Db4"]);
     }
 }
