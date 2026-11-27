@@ -527,6 +527,7 @@ fn to_bekern_inner(
             .then(a.voice.cmp(&b.voice))
             .then(a.onset.partial_cmp(&b.onset).unwrap())
             .then((!a.grace).cmp(&!b.grace))
+            .then(a.grace_seq.cmp(&b.grace_seq))
             .then(midi_key(a).cmp(&midi_key(b)))
     });
     let mut measure = 0u32;
@@ -576,10 +577,12 @@ fn to_bekern_inner(
     // (without the marker the stream cannot tell chords from sequential
     // same-voice notes).
     // Previous event key: (measure, onset, staff, voice, pitched,
-    // grace). The grace bit keeps chord detection honest: a grace note
-    // and the note it ornaments share onset/staff/voice but are
-    // sequential, never a chord (only grace+grace pairs chord).
-    let mut prev: Option<(u32, f64, u32, u32, bool, bool)> = None;
+    // grace, grace_seq). The grace + grace_seq bits keep chord detection
+    // honest: a grace note and the note it ornaments share onset/staff/voice
+    // but are sequential, and two sequential grace notes have distinct
+    // `grace_seq` (only simultaneous `<grace/><chord/>` pairs share
+    // `grace_seq` and emit `chord`).
+    let mut prev: Option<(u32, f64, u32, u32, bool, bool, u32)> = None;
     // Voice segments per measure: (staff, voice) -> 1-based appearance
     // number, kept for the whole measure. A marker is emitted on EVERY
     // voice run (including reappearances with their original number):
@@ -598,7 +601,16 @@ fn to_bekern_inner(
         // parity: only grace+grace pairs chord (a grace and its
         // ornamented note share the key but are sequential).
         let continues_chord = e.pitch.is_some()
-            && prev == Some((e.measure, e.onset, e.staff, e.voice, true, e.grace));
+            && prev
+                == Some((
+                    e.measure,
+                    e.onset,
+                    e.staff,
+                    e.voice,
+                    true,
+                    e.grace,
+                    e.grace_seq,
+                ));
         // Key whose span the marker path just closed this round: the
         // marker owns that key, so the synthetic precise stop below
         // must not pop a level behind it (nested brackets).
@@ -797,7 +809,7 @@ fn to_bekern_inner(
                 }
             }
             out.push("bar-rest".to_string());
-            prev = Some((e.measure, e.onset, e.staff, e.voice, false, false));
+            prev = Some((e.measure, e.onset, e.staff, e.voice, false, false, 0));
             live.insert(key, measure);
             continue;
         }
@@ -1108,7 +1120,16 @@ fn to_bekern_inner(
             )
         })?;
         let is_chord_tone = e.pitch.is_some()
-            && prev == Some((e.measure, e.onset, e.staff, e.voice, true, e.grace));
+            && prev
+                == Some((
+                    e.measure,
+                    e.onset,
+                    e.staff,
+                    e.voice,
+                    true,
+                    e.grace,
+                    e.grace_seq,
+                ));
         // The `grace` marker leads the chord run once (chord tones
         // inherit grace from their root on decode).
         if e.grace && !is_chord_tone {
@@ -1276,6 +1297,7 @@ fn to_bekern_inner(
             e.voice,
             e.pitch.is_some(),
             e.grace,
+            e.grace_seq,
         ));
     }
     // A stop deferred past the final event's chord run flushes here.
@@ -2110,6 +2132,7 @@ mod tests {
             tie_start: false,
             tie_stop: false,
             grace: false,
+            grace_seq: 0,
             slur_start: false,
             slur_stop: false,
             articulations: Vec::new(),
@@ -2171,6 +2194,7 @@ mod tests {
                 tie_start: false,
                 tie_stop: false,
                 grace: false,
+                grace_seq: 0,
                 slur_start: false,
                 slur_stop: false,
                 articulations: Vec::new(),

@@ -143,6 +143,11 @@ pub struct NoteInput {
     pub lyric: Option<String>,
     #[serde(default)]
     pub grace: bool,
+    /// Optional grace-group ID distinguishing sequential grace notes (distinct
+    /// `Some(id)` values) from simultaneous grace-chord tones (matching
+    /// `Some(id)`). `None` preserves legacy same-onset grace-chord merging.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grace_group: Option<u32>,
     #[serde(default)]
     pub slur_start: bool,
     #[serde(default)]
@@ -176,6 +181,7 @@ impl Default for NoteInput {
             voice: default_voice(),
             lyric: None,
             grace: false,
+            grace_group: None,
             slur_start: false,
             slur_stop: false,
             articulations: Vec::new(),
@@ -415,6 +421,7 @@ pub struct ScoreNote {
     pub rest: bool,
     pub lyric: Option<String>,
     pub grace: bool,
+    pub grace_group: Option<u32>,
     pub slur_start: bool,
     pub slur_stop: bool,
     pub articulations: Vec<String>,
@@ -665,7 +672,7 @@ fn parse_pitch(s: &str) -> Result<(char, i32, i32, i32, Option<i32>), String> {
 /// written exactly and is skipped, so quantisation records real loss.
 pub fn quantize_duration(ticks: i64, divisions: u32) -> (&'static str, u8, i64) {
     // (type name, divisor of divisions for one base unit; negative = multiply)
-    const BASES: [(&str, i64); 8] = [
+    const BASES: [(&str, i64); 9] = [
         ("breve", -8),
         ("whole", -4),
         ("half", -2),
@@ -674,6 +681,7 @@ pub fn quantize_duration(ticks: i64, divisions: u32) -> (&'static str, u8, i64) 
         ("16th", 4),
         ("32nd", 8),
         ("64th", 16),
+        ("128th", 32),
     ];
     let d = divisions as i64;
     let mut best: Option<(&'static str, u8, i64)> = None;
@@ -919,6 +927,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                         rest: true,
                         lyric: n.lyric.clone(),
                         grace: n.grace,
+                        grace_group: n.grace_group,
                         slur_start: n.slur_start,
                         slur_stop: n.slur_stop,
                         articulations: n.articulations.clone(),
@@ -960,6 +969,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                     rest: false,
                     lyric: n.lyric.clone(),
                     grace: n.grace,
+                    grace_group: n.grace_group,
                     slur_start: n.slur_start,
                     slur_stop: n.slur_stop,
                     articulations: n.articulations.clone(),
@@ -978,12 +988,21 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
         // in (a grace sorted after its note would read a full note
         // later). `sort_by_key` is stable, so remaining ties keep
         // input order.
-        tick_notes.sort_by_key(|(_, n)| (n.start_ticks, n.voice, !n.grace, n.midi));
+        tick_notes.sort_by_key(|(_, n)| {
+            (
+                n.start_ticks,
+                n.voice,
+                !n.grace,
+                n.grace_group.unwrap_or(0),
+                n.midi,
+            )
+        });
 
         // Group simultaneous same-voice notes into chords; clamp overlaps.
         // Grace notes are zero-width: they never clamp, drop, or advance
         // the voice cursor, and chord-merge only with matching grace-ness
-        // (a real note sharing a grace onset is sequential, not a chord).
+        // and grace_group (sequential grace notes carry distinct `Some(id)`
+        // groups; legacy `None` merges by onset+duration as before).
         let mut groups: Vec<ChordGroup> = Vec::new();
         let mut cursor: BTreeMap<u32, i64> = BTreeMap::new();
         for (idx, mut n) in tick_notes {
@@ -995,6 +1014,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                             && g.voice == n.voice
                             && g.start_ticks == n.start_ticks
                             && g.members[0].dur_ticks == n.dur_ticks
+                            && g.members[0].grace_group == n.grace_group
                     }
                     None => false,
                 };
@@ -1224,7 +1244,14 @@ fn layout_part(
             if vi > 0 && segs.is_empty() {
                 continue;
             }
-            segs.sort_by_key(|s| (s.note.start_ticks.max(m0), s.chord));
+            segs.sort_by_key(|s| {
+                (
+                    s.note.start_ticks.max(m0),
+                    !s.note.grace,
+                    s.note.grace_group.unwrap_or(0),
+                    s.chord,
+                )
+            });
             // Fill gaps with rests (primary voice) or hidden `<forward>` skips
             // (secondary polyphonic voices) so every emitted voice sums to mlen.
             let is_secondary = vi > 0;
@@ -1246,6 +1273,7 @@ fn layout_part(
                             rest: true,
                             lyric: None,
                             grace: false,
+                            grace_group: None,
                             slur_start: false,
                             slur_stop: false,
                             articulations: Vec::new(),
@@ -1281,6 +1309,7 @@ fn layout_part(
                         rest: true,
                         lyric: None,
                         grace: false,
+                        grace_group: None,
                         slur_start: false,
                         slur_stop: false,
                         articulations: Vec::new(),

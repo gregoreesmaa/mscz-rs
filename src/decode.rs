@@ -90,6 +90,7 @@ fn mk_note(
         voice,
         lyric: None,
         grace: false,
+        grace_group: None,
         slur_start: mods.slur_start,
         slur_stop: mods.slur_stop,
         articulations: mods.articulations.clone(),
@@ -616,6 +617,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
     // tones inheriting their root's grace.
     let mut grace_pending = false;
     let mut grace_run = false;
+    let mut grace_seq: u32 = 0;
     // Whether any note or rest has been placed: mid-stream headers
     // before the first event are effectively leading headers.
     let mut seen_event = false;
@@ -661,6 +663,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                 voice,
                 lyric: None,
                 grace,
+                grace_group: None,
                 slur_start: mods.slur_start,
                 slur_stop: mods.slur_stop,
                 articulations: mods.articulations.clone(),
@@ -1007,13 +1010,16 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
         }
         seen_event = true;
         // Event-level grace: the `grace` marker is consumed by the
-        // duration token (chord tones inherit the run's grace).
+        // duration token (chord tones inherit the run's grace and group ID).
         let is_grace = if chord {
             grace_run
         } else {
             let g = grace_pending;
             grace_pending = false;
             grace_run = g;
+            if g {
+                grace_seq = grace_seq.saturating_add(1);
+            }
             g
         };
         let t = toks
@@ -1170,6 +1176,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                 note.tie_stop = tie_stop;
                 if is_grace {
                     note.grace = true;
+                    note.grace_group = Some(grace_seq);
                     note.dur = dur_written;
                     note.tuplet = None;
                 }
@@ -1216,6 +1223,7 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
                     note.tie_stop = tie_stop;
                     if is_grace {
                         note.grace = true;
+                        note.grace_group = Some(grace_seq);
                         note.dur = dur_written;
                         note.tuplet = None;
                     }
@@ -1499,10 +1507,39 @@ fn decode_inner(tokens: &str, merge_ties: bool) -> Result<ScoreInput, String> {
             .collect()
     };
 
+    // Compute exact LCM `<divisions>` from `SCORE_DIVISIONS` (480) and all
+    // rational tuplet `actual` denominators present in the score so non-triplet
+    // tuplets (e.g. 7:4, 9:8, 11:8, 13:8) convert to exact integer ticks
+    // without rounding drift or overlap clamping. Stays 480 whenever all
+    // tuplets already divide 480 (straight, 3:2, 5:4, 6:4, 4:3, 2:3).
+    const MAX_AUTO_DIVISIONS: u64 = 480_480;
+    let gcd_u64 = |mut a: u64, mut b: u64| -> u64 {
+        while b != 0 {
+            let t = a % b;
+            a = b;
+            b = t;
+        }
+        a.max(1)
+    };
+    let mut divisions = SCORE_DIVISIONS as u64;
+    for part in &parts {
+        for n in &part.notes {
+            if let Some((actual, _normal)) = n.tuplet {
+                let a = actual as u64;
+                if a > 1 && divisions % a != 0 {
+                    let next = (divisions / gcd_u64(divisions, a)).saturating_mul(a);
+                    if next <= MAX_AUTO_DIVISIONS {
+                        divisions = next;
+                    }
+                }
+            }
+        }
+    }
+
     Ok(ScoreInput {
         title: None,
         composer: None,
-        divisions: SCORE_DIVISIONS,
+        divisions: divisions as u32,
         time: Some(time),
         key_fifths,
         parts,
@@ -3419,5 +3456,102 @@ mod tests {
             !has_errors(&validate_musicxml(&out_xml)),
             "v2 round-trip MusicXML failed validation"
         );
+    }
+
+    #[test]
+    fn export_128th_note_preserves_type_without_quantization_loss() {
+        use crate::{has_errors, parse_score, quantize_duration, to_musicxml, validate_musicxml, LossTable};
+        assert_eq!(quantize_duration(15, 480), ("128th", 0, 15));
+        let tok = "clef-G-2 key+0 time-4-4 voice-1 128th C 5 128th D 5 rest 16th rest eighth rest quarter rest half bar";
+        let dec = super::decode_bekern_unmerged(tok).unwrap();
+        let (score, parse_losses) = parse_score(&dec).unwrap();
+        assert!(parse_losses.is_lossless(), "unexpected parse losses: {parse_losses:?}");
+        let mut render_losses = LossTable::default();
+        let xml = to_musicxml(&score, &mut render_losses);
+        assert!(render_losses.is_lossless(), "unexpected render losses: {render_losses:?}");
+        assert!(xml.contains("<type>128th</type>"), "expected <type>128th</type> in:\n{xml}");
+        assert!(!has_errors(&validate_musicxml(&xml)));
+    }
+
+    #[test]
+    fn sequential_grace_notes_preserve_order_and_do_not_collapse_into_chords() {
+        use crate::{
+            bekern::to_bekern_v2,
+            has_errors,
+            musicxml_import::{bekern_events, staff_headers},
+            parse_score, to_musicxml, validate_musicxml, LossTable,
+        };
+        let src_xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list><score-part id="P1"><part-name>Violin</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>480</divisions>
+        <key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>G</sign><line>2</line></clef>
+      </attributes>
+      <note><grace/><pitch><step>G</step><octave>5</octave></pitch><voice>1</voice><type>16th</type></note>
+      <note><grace/><pitch><step>F</step><octave>5</octave></pitch><voice>1</voice><type>16th</type></note>
+      <note><grace/><pitch><step>E</step><octave>5</octave></pitch><voice>1</voice><type>16th</type></note>
+      <note><grace/><pitch><step>F</step><octave>5</octave></pitch><voice>1</voice><type>16th</type></note>
+      <note><pitch><step>E</step><octave>5</octave></pitch><duration>960</duration><voice>1</voice><type>half</type></note>
+      <note><grace/><pitch><step>D</step><octave>5</octave></pitch><voice>1</voice><type>16th</type></note>
+      <note><grace/><chord/><pitch><step>F</step><octave>5</octave></pitch><voice>1</voice><type>16th</type></note>
+      <note><pitch><step>C</step><octave>5</octave></pitch><duration>960</duration><voice>1</voice><type>half</type></note>
+    </measure>
+  </part>
+</score-partwise>"#;
+        let events = bekern_events(src_xml).unwrap();
+        let headers = staff_headers(src_xml).unwrap();
+        let (toks, _) = to_bekern_v2(&events, &headers).unwrap();
+        let joined = toks.join(" ");
+        // 4 sequential grace notes must emit 4 `grace` markers in melodic order G5 F5 E5 F5,
+        // and the 2-note grace chord must emit 1 `grace` + 1 `chord`.
+        assert!(
+            joined.contains("grace 16th G 5 grace 16th F 5 grace 16th E 5 grace 16th F 5 half E 5"),
+            "sequential grace notes corrupted in bekern: {joined}"
+        );
+        assert!(
+            joined.contains("grace 16th D 5 chord 16th F 5 half C 5"),
+            "grace chord corrupted in bekern: {joined}"
+        );
+        let dec = super::decode_bekern_unmerged(&joined).unwrap();
+        let (score, _) = parse_score(&dec).unwrap();
+        let xml = to_musicxml(&score, &mut LossTable::default());
+        assert!(!has_errors(&validate_musicxml(&xml)));
+        // Exactly 1 `<chord/>` (for the grace chord D5+F5), never 4!
+        assert_eq!(xml.matches("<chord/>").count(), 1, "unexpected chords in:\n{xml}");
+        // Verify melodic order of the first 4 grace notes in the output XML.
+        let p_g = xml.find("<step>G</step>").unwrap();
+        let p_f1 = xml[p_g + 1..].find("<step>F</step>").unwrap() + p_g + 1;
+        let p_e = xml[p_f1 + 1..].find("<step>E</step>").unwrap() + p_f1 + 1;
+        let p_f2 = xml[p_e + 1..].find("<step>F</step>").unwrap() + p_e + 1;
+        assert!(p_g < p_f1 && p_f1 < p_e && p_e < p_f2);
+    }
+
+    #[test]
+    fn non_triplet_tuplet_13_8_uses_lcm_divisions_without_overlap_clamping() {
+        use crate::{has_errors, parse_score, to_musicxml, validate_musicxml, LossTable};
+        let mut toks = vec!["clef-G-2", "key+0", "time-4-4", "voice-1", "tup-open", "13", "8"];
+        for _ in 0..13 {
+            toks.extend(["16th", "C", "5"]);
+        }
+        toks.extend(["tup-close", "half", "C", "5", "bar"]);
+        let dec = super::decode_bekern_unmerged(&toks.join(" ")).unwrap();
+        assert_eq!(dec.divisions, 6240, "expected lcm(480, 13) = 6240");
+        let (score, parse_losses) = parse_score(&dec).unwrap();
+        assert!(
+            parse_losses.is_lossless(),
+            "13:8 tuplet should have zero overlap-clamping losses: {parse_losses:?}"
+        );
+        let mut render_losses = LossTable::default();
+        let xml = to_musicxml(&score, &mut render_losses);
+        assert!(render_losses.is_lossless(), "unexpected render losses: {render_losses:?}");
+        assert!(xml.contains("<divisions>6240</divisions>"));
+        // Each 13:8 16th note is exactly 0.25 * 8/13 * 6240 = 960 ticks.
+        assert_eq!(xml.matches("<duration>960</duration>").count(), 13);
+        assert!(!has_errors(&validate_musicxml(&xml)));
     }
 }

@@ -879,6 +879,10 @@ pub struct BekernNote {
     pub tie_start: bool,
     pub tie_stop: bool,
     pub grace: bool,
+    /// Monotonic per-measure sequence ID distinguishing sequential grace notes
+    /// (different `grace_seq`) from simultaneous grace-chord tones (same
+    /// `grace_seq`); `0` for non-grace events.
+    pub grace_seq: u32,
     pub slur_start: bool,
     pub slur_stop: bool,
     /// Closed-subset modifiers (`stacc`, `accent`, `tenuto`, `fermata`).
@@ -1038,6 +1042,7 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
             let mut cursor = 0i64;
             let mut last_onset = 0i64;
             let mut last_staff = 1u32;
+            let mut grace_seq = 0u32;
             for it in measure_items(meas) {
                 match it {
                     Item::Attributes(a) => {
@@ -1134,6 +1139,14 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                         } else {
                             None
                         };
+                        let note_grace_seq = if n.grace {
+                            if !n.chord {
+                                grace_seq += 1;
+                            }
+                            grace_seq
+                        } else {
+                            0
+                        };
                         let mut ev = BekernNote {
                             measure,
                             onset: round3(onset as f64 / div),
@@ -1145,6 +1158,7 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                             tie_start: n.tie_start,
                             tie_stop: n.tie_stop,
                             grace: n.grace,
+                            grace_seq: note_grace_seq,
                             slur_start: n.slur_start,
                             slur_stop: n.slur_stop,
                             articulations: n.articulations,
