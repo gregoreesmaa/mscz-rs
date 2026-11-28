@@ -738,3 +738,31 @@ fn regression_r1_15ma_15mb_close_tremolo_toggle_pickup_and_dual_accent() {
     let issues = validate_musicxml(&out_xml);
     assert!(!has_errors(&issues), "MusicXML errors: {issues:?}");
 }
+
+#[test]
+fn regression_r2_lines_zero_rejected_and_15_stop_compat() {
+    // 1. `<staff-def> lines-0` must be rejected (strict decode fails on unconsumed `lines-0`).
+    let bad_lines = "<staff-def> lines-0 clef-G-2 key0 time-4-4 quarter C 4";
+    let err = decode_bekern_unmerged(bad_lines)
+        .expect_err("`lines-0` must not be accepted as a valid staff line count");
+    assert!(
+        err.contains("lines-0"),
+        "expected error on `lines-0`, got: {err}"
+    );
+
+    // 2. `"15-stop"` compat alias decodes identically to `"15ma-close"` / `"15mb-close"`.
+    let compat_stream = "clef-G-2 key0 time-4-4 15ma-open half C 5 15-stop half E 5";
+    let input = decode_bekern_unmerged(compat_stream).expect("decode 15-stop compat stream");
+    let (score, mut losses) = parse_score(&input).expect("parse score");
+    let out_xml = to_musicxml(&score, &mut losses);
+    assert!(
+        out_xml.contains("<octave-shift type=\"down\" size=\"15\"/>"),
+        "expected 15ma open in MusicXML:\n{out_xml}"
+    );
+    assert!(
+        out_xml.contains("<octave-shift type=\"stop\" size=\"15\"/>"),
+        "expected 15-stop to emit size=15 stop in MusicXML:\n{out_xml}"
+    );
+    let issues = validate_musicxml(&out_xml);
+    assert!(!has_errors(&issues), "MusicXML errors: {issues:?}");
+}

@@ -572,17 +572,19 @@ fn to_bekern_inner(
         } else if let Some(d) = &e.dynamic {
             skipped_dyn.entry(e.measure).or_default().push(d.clone());
         }
-        if v2 && !e.extra_hairpins.is_empty() {
-            skipped_hairpin
-                .entry(e.measure)
-                .or_default()
-                .extend(e.extra_hairpins.iter().cloned());
-        }
-        if let Some(h) = &e.hairpin {
-            skipped_hairpin
-                .entry(e.measure)
-                .or_default()
-                .push(h.clone());
+        if !(full && e.full.as_deref().is_some_and(|f| !f.numbered_hairpins.is_empty())) {
+            if v2 && !e.extra_hairpins.is_empty() {
+                skipped_hairpin
+                    .entry(e.measure)
+                    .or_default()
+                    .extend(e.extra_hairpins.iter().cloned());
+            }
+            if let Some(h) = &e.hairpin {
+                skipped_hairpin
+                    .entry(e.measure)
+                    .or_default()
+                    .push(h.clone());
+            }
         }
         if let Some(o) = &e.ottava {
             skipped_ottava.insert(e.measure, o.clone());

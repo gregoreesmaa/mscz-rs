@@ -478,6 +478,7 @@ fn resolve_target_seg(toks: &[&str], idx_after: usize, current_seg: usize) -> us
                     | "15ma-close"
                     | "15mb-open"
                     | "15mb-close"
+                    | "15-stop"
                     | "<pickup>"
                     | "<multirest>"
                     | "<inst-change>"
@@ -854,6 +855,7 @@ fn decode_inner(
                 if let Some(lines) = next
                     .strip_prefix("lines-")
                     .and_then(|s| s.parse::<u32>().ok())
+                    .filter(|&n| n >= 1)
                 {
                     pending_staff_lines = Some(lines);
                     i += 1;
@@ -1923,7 +1925,10 @@ fn decode_inner(
             continue;
         }
         // Layer 2 `bekern-full` 15ma/15mb & sostenuto/una-corda pedals.
-        if matches!(t, "15ma-open" | "15ma-close" | "15mb-open" | "15mb-close") {
+        if matches!(
+            t,
+            "15ma-open" | "15ma-close" | "15mb-open" | "15mb-close" | "15-stop"
+        ) {
             let val = match t {
                 "15ma-open" => "15ma",
                 "15mb-open" => "15mb",
@@ -2156,6 +2161,15 @@ fn decode_inner(
             }
             g
         };
+        let is_grace_slash = if chord {
+            false
+        } else {
+            let gs = grace_slash_pending;
+            grace_slash_pending = false;
+            gs
+        };
+        let is_unpitched = unpitched_pending;
+        unpitched_pending = false;
         // Step + octave follow the duration token (alter, dots, ties
         // after — see below).
         let (step, octave) = if pitched {
@@ -2195,15 +2209,6 @@ fn decode_inner(
         } else {
             (None, None)
         };
-        let is_grace_slash = if chord {
-            false
-        } else {
-            let gs = grace_slash_pending;
-            grace_slash_pending = false;
-            gs
-        };
-        let is_unpitched = unpitched_pending;
-        unpitched_pending = false;
         // Encoder order: step octave [alter|microtone] [acc-caut|acc-paren] [dots] [slur-start]
         // [slur-stop] [modifiers] [tie-start] [tie-stop]; plain rests:
         // `rest` duration [dots] [modifiers]. The loops below accept any
