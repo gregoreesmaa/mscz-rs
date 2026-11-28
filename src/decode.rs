@@ -179,7 +179,12 @@ fn take_mod(toks: &[&str], i: &mut usize, mods: &mut NoteMods) -> bool {
             true
         }
         Some(s) if s.starts_with("slur-") && s.ends_with("-open") => {
-            if let Ok(n) = s["slur-".len()..s.len() - "-open".len()].parse::<u8>() {
+            if let Some(n) = s
+                .strip_prefix("slur-")
+                .and_then(|r| r.strip_suffix("-open"))
+                .and_then(|r| r.parse::<u8>().ok())
+                .filter(|&n| (1..=4).contains(&n))
+            {
                 mods.slur_start = true;
                 mods.full_mut().slur_starts.push(n);
                 *i += 1;
@@ -188,7 +193,12 @@ fn take_mod(toks: &[&str], i: &mut usize, mods: &mut NoteMods) -> bool {
             false
         }
         Some(s) if s.starts_with("slur-") && s.ends_with("-close") => {
-            if let Ok(n) = s["slur-".len()..s.len() - "-close".len()].parse::<u8>() {
+            if let Some(n) = s
+                .strip_prefix("slur-")
+                .and_then(|r| r.strip_suffix("-close"))
+                .and_then(|r| r.parse::<u8>().ok())
+                .filter(|&n| (1..=4).contains(&n))
+            {
                 mods.slur_stop = true;
                 mods.full_mut().slur_stops.push(n);
                 *i += 1;
@@ -212,7 +222,11 @@ fn take_mod(toks: &[&str], i: &mut usize, mods: &mut NoteMods) -> bool {
             true
         }
         Some(s) if s.starts_with("xstaff-") => {
-            if let Ok(n) = s["xstaff-".len()..].parse::<u32>() {
+            if let Some(n) = s["xstaff-".len()..]
+                .parse::<u32>()
+                .ok()
+                .filter(|&n| n >= 1)
+            {
                 mods.full_mut().xstaff_abs = Some(n);
                 *i += 1;
                 return true;
@@ -277,7 +291,7 @@ fn take_mod(toks: &[&str], i: &mut usize, mods: &mut NoteMods) -> bool {
             false
         }
         Some(s) if s.starts_with("str-") => {
-            if let Ok(n) = s["str-".len()..].parse::<u32>() {
+            if let Some(n) = s["str-".len()..].parse::<u32>().ok().filter(|&n| n >= 1) {
                 mods.full_mut().tab_string = Some(n);
                 *i += 1;
                 return true;
@@ -452,9 +466,27 @@ fn resolve_target_seg(toks: &[&str], idx_after: usize, current_seg: usize) -> us
             || tok.starts_with("dyn-")
             || tok.starts_with("hairpin-")
             || tok.starts_with("ottava-")
-            || tok == "bar-repeat-left"
-            || tok == "volta-1"
-            || tok == "volta-2"
+            || tok.starts_with("pedal-")
+            || tok.starts_with("multirest-")
+            || tok.starts_with("mrep-")
+            || matches!(
+                tok,
+                "bar-repeat-left"
+                    | "volta-1"
+                    | "volta-2"
+                    | "15ma-open"
+                    | "15ma-close"
+                    | "15mb-open"
+                    | "15mb-close"
+                    | "<pickup>"
+                    | "<multirest>"
+                    | "<inst-change>"
+                    | "D.C."
+                    | "D.S."
+                    | "Segno"
+                    | "Coda"
+                    | "Fine"
+            )
         {
             j += 1;
             continue;
@@ -967,6 +999,7 @@ fn decode_inner(
     // Lenient-mode span tracking for slurs, hairpins, and `<txt>...</txt>`.
     let mut open_slurs: Vec<usize> = vec![0];
     let mut open_hairpin = false;
+    let mut open_num_hairpins = [false; 3];
     let mut in_txt = false;
     // Open tie chain: ((step, octave, alter), seg, onset, dur_acc,
     // marks). Only used when `merge_ties` is set.
@@ -980,7 +1013,8 @@ fn decode_inner(
     let mut grace_seq: u32 = 0;
     let mut unpitched_pending = false;
     // Zero-based system note index -> index in `tagged_notes` for Layer 3 `@i` anchors.
-    let mut emitted_note_indices: Vec<usize> = Vec::new();
+    // `None` entries preserve 1:1 indexing across grace notes / swallowed tie links.
+    let mut emitted_note_indices: Vec<Option<usize>> = Vec::new();
     // Whether any note or rest has been placed: mid-stream headers
     // before the first event are effectively leading headers.
     let mut seen_event = false;
@@ -1041,6 +1075,7 @@ fn decode_inner(
     };
 
     let mut bar_start = 0.0f64;
+    let mut measure_bar_starts: Vec<f64> = vec![0.0];
     let initial_barlen = time.beats as f64 * 4.0 / time.beat_type.max(1) as f64;
     let mut barlen = initial_barlen;
     while i < toks.len() {
@@ -1088,6 +1123,11 @@ fn decode_inner(
                         grace_pending = false;
                         warnings.skipped_tokens += 1;
                     }
+                    grace_slash_pending = false;
+                    if unpitched_pending {
+                        unpitched_pending = false;
+                        warnings.skipped_tokens += 1;
+                    }
                     let unclosed_tups: usize =
                         spans.iter().map(Vec::len).sum::<usize>() + pending_spans.len();
                     if unclosed_tups > 0 {
@@ -1105,9 +1145,16 @@ fn decode_inner(
                         open_hairpin = false;
                         warnings.unclosed_spans += 1;
                     }
+                    for slot in &mut open_num_hairpins {
+                        if *slot {
+                            *slot = false;
+                            warnings.unclosed_spans += 1;
+                        }
+                    }
                     if voices.iter().any(|&v| v > 0.0) {
                         bar_start += barlen;
                         measure += 1;
+                        measure_bar_starts.push(bar_start);
                     }
                     cur_staff_idx = 0;
                     voices.clear();
@@ -1140,6 +1187,13 @@ fn decode_inner(
                     return Err(format!("dangling grace marker in measure {measure}"));
                 }
             }
+            grace_slash_pending = false;
+            if unpitched_pending {
+                unpitched_pending = false;
+                if lenient {
+                    warnings.skipped_tokens += 1;
+                }
+            }
             if lenient {
                 let unclosed_tups: usize =
                     spans.iter().map(Vec::len).sum::<usize>() + pending_spans.len();
@@ -1151,8 +1205,28 @@ fn decode_inner(
             if let Some(style) = barline_right_of(t) {
                 attr_for(&mut measure_attrs, measure + 1).barline_right = Some(style.to_string());
             }
-            bar_start += barlen;
+            let is_pickup = measure_attrs
+                .iter()
+                .rev()
+                .find(|a| a.measure == measure + 1)
+                .and_then(|a| a.full.as_deref())
+                .is_some_and(|f| f.pickup);
+            let advance = if is_pickup {
+                let actual = voices.iter().copied().fold(0.0f64, f64::max);
+                if actual > 1e-6 && actual < barlen {
+                    if let Some(f) = attr_for(&mut measure_attrs, measure + 1).full.as_deref_mut() {
+                        f.pickup_beats = Some(actual);
+                    }
+                    actual
+                } else {
+                    barlen
+                }
+            } else {
+                barlen
+            };
+            bar_start += advance;
             measure += 1;
+            measure_bar_starts.push(bar_start);
             cur_staff_idx = 0;
             voices.clear();
             voices.push(0.0);
@@ -1177,6 +1251,13 @@ fn decode_inner(
                     warnings.skipped_tokens += 1;
                 } else {
                     return Err(format!("dangling grace marker before <staff> in measure {measure}"));
+                }
+            }
+            grace_slash_pending = false;
+            if unpitched_pending {
+                unpitched_pending = false;
+                if lenient {
+                    warnings.skipped_tokens += 1;
                 }
             }
             if lenient {
@@ -1232,6 +1313,7 @@ fn decode_inner(
                 .get(i + 1)
                 .and_then(|s| s.strip_prefix("multirest-"))
                 .and_then(|s| s.parse::<u32>().ok())
+                .filter(|&n| n >= 1)
             {
                 attr_for(&mut measure_attrs, measure + 1)
                     .full
@@ -1250,6 +1332,7 @@ fn decode_inner(
         if let Some(n) = t
             .strip_prefix("multirest-")
             .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n >= 1)
         {
             attr_for(&mut measure_attrs, measure + 1)
                 .full
@@ -1258,7 +1341,11 @@ fn decode_inner(
             i += 1;
             continue;
         }
-        if let Some(n) = t.strip_prefix("mrep-").and_then(|s| s.parse::<u32>().ok()) {
+        if let Some(n) = t
+            .strip_prefix("mrep-")
+            .and_then(|s| s.parse::<u32>().ok())
+            .filter(|&n| n >= 1)
+        {
             attr_for(&mut measure_attrs, measure + 1)
                 .full
                 .get_or_insert_with(|| Box::new(FullMeasureExt::default()))
@@ -1287,23 +1374,48 @@ fn decode_inner(
             i += 1;
             continue;
         }
+        if t == "</text_span>" {
+            if lenient {
+                warnings.orphan_closers += 1;
+                i += 1;
+                continue;
+            }
+            return Err(format!("orphan </text_span> in measure {measure}"));
+        }
         // Layer 3 (`bekern-full`) end-of-system anchored text & lyric blocks.
-        if t == "<sys_lyr" || t.starts_with("<sys_lyr:") {
-            let verse = if t == "<sys_lyr" {
-                let v = toks
+        if t == "<sys_lyr>" || t == "<sys_lyr" || t.starts_with("<sys_lyr:") {
+            let verse = if t == "<sys_lyr>" {
+                if let Some(v) = toks
                     .get(i + 1)
                     .and_then(|s| s.strip_prefix("v="))
-                    .and_then(|s| s.strip_suffix('>'))
                     .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(1);
-                i += 2;
-                v
+                {
+                    i += 2;
+                    v.max(1)
+                } else {
+                    i += 1;
+                    1
+                }
+            } else if t == "<sys_lyr" {
+                if let Some(v) = toks
+                    .get(i + 1)
+                    .and_then(|s| s.strip_prefix("v="))
+                    .map(|s| s.strip_suffix('>').unwrap_or(s))
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    i += 2;
+                    v.max(1)
+                } else {
+                    i += 1;
+                    1
+                }
             } else {
                 let v = t
                     .strip_prefix("<sys_lyr:v=")
                     .and_then(|s| s.strip_suffix('>'))
                     .and_then(|s| s.parse::<u32>().ok())
-                    .unwrap_or(1);
+                    .unwrap_or(1)
+                    .max(1);
                 i += 1;
                 v
             };
@@ -1312,7 +1424,7 @@ fn decode_inner(
             let mut cur_ext = false;
             let mut cur_words: Vec<&str> = Vec::new();
             let flush_lyr = |tagged_notes: &mut Vec<(u32, usize, NoteInput)>,
-                             emitted_note_indices: &[usize],
+                             emitted_note_indices: &[Option<usize>],
                              anchor: Option<usize>,
                              syl: Option<&'static str>,
                              ext: bool,
@@ -1320,7 +1432,7 @@ fn decode_inner(
                 if let Some(aidx) = anchor {
                     let text = words.join(" ");
                     if !text.is_empty() {
-                        if let Some(&tn_idx) = emitted_note_indices.get(aidx) {
+                        if let Some(tn_idx) = emitted_note_indices.get(aidx).copied().flatten() {
                             if let Some((_, _, note)) = tagged_notes.get_mut(tn_idx) {
                                 if verse == 1 && note.lyric.is_none() {
                                     note.lyric = Some(text.clone());
@@ -1335,13 +1447,21 @@ fn decode_inner(
                 }
                 words.clear();
             };
+            let mut closed = false;
             while i < toks.len() {
                 let tk = toks[i];
                 if tk == "</text_span>" {
+                    closed = true;
                     i += 1;
                     break;
                 }
-                if tk == "<sys>" || tk == "<eos>" {
+                if tk == "<sys>"
+                    || tk == "<eos>"
+                    || tk == "<sys_lyr>"
+                    || tk == "<sys_lyr"
+                    || tk.starts_with("<sys_lyr:")
+                    || matches!(tk, "<harm>" | "<tempo>" | "<dir>" | "<reh>" | "<fb>")
+                {
                     break;
                 }
                 if let Some(aidx) = tk.strip_prefix('@').and_then(|s| s.parse::<usize>().ok()) {
@@ -1370,6 +1490,9 @@ fn decode_inner(
                 }
                 i += 1;
             }
+            if !closed && lenient {
+                warnings.unclosed_spans += 1;
+            }
             flush_lyr(
                 &mut tagged_notes,
                 &emitted_note_indices,
@@ -1393,7 +1516,8 @@ fn decode_inner(
             let mut cur_anchor: Option<usize> = None;
             let mut cur_words: Vec<&str> = Vec::new();
             let flush_span = |tagged_notes: &[(u32, usize, NoteInput)],
-                              emitted_note_indices: &[usize],
+                              emitted_note_indices: &[Option<usize>],
+                              measure_bar_starts: &[f64],
                               measure_attrs: &mut Vec<MeasureAttr>,
                               seg_timed: &mut Vec<(u32, Option<usize>, usize, TimedEvent)>,
                               leading_clefs_len: usize,
@@ -1403,15 +1527,11 @@ fn decode_inner(
                 let text = words.join(" ");
                 if !text.is_empty() {
                     let (m, st_idx, onset_in_meas) = anchor
-                        .and_then(|aidx| emitted_note_indices.get(aidx).copied())
+                        .and_then(|aidx| emitted_note_indices.get(aidx).copied().flatten())
                         .and_then(|tn_idx| tagged_notes.get(tn_idx))
                         .map(|(m, st, n)| {
-                            // Approximate measure-local onset via modulo barlen when barlen > 0.
-                            let local_onset = if initial_barlen > 0.0 {
-                                n.onset % initial_barlen
-                            } else {
-                                0.0
-                            };
+                            let m_start = measure_bar_starts.get(*m as usize).copied().unwrap_or(0.0);
+                            let local_onset = (n.onset - m_start).max(0.0);
                             (*m, *st, local_onset)
                         })
                         .unwrap_or((0, 0, 0.0));
@@ -1428,13 +1548,21 @@ fn decode_inner(
                 }
                 words.clear();
             };
+            let mut closed = false;
             while i < toks.len() {
                 let tk = toks[i];
                 if tk == "</text_span>" {
+                    closed = true;
                     i += 1;
                     break;
                 }
-                if tk == "<sys>" || tk == "<eos>" {
+                if tk == "<sys>"
+                    || tk == "<eos>"
+                    || tk == "<sys_lyr>"
+                    || tk == "<sys_lyr"
+                    || tk.starts_with("<sys_lyr:")
+                    || matches!(tk, "<harm>" | "<tempo>" | "<dir>" | "<reh>" | "<fb>")
+                {
                     break;
                 }
                 if let Some(aidx) = tk.strip_prefix('@').and_then(|s| s.parse::<usize>().ok()) {
@@ -1442,6 +1570,7 @@ fn decode_inner(
                         flush_span(
                             &tagged_notes,
                             &emitted_note_indices,
+                            &measure_bar_starts,
                             &mut measure_attrs,
                             &mut seg_timed,
                             leading_clefs.len(),
@@ -1456,9 +1585,13 @@ fn decode_inner(
                 }
                 i += 1;
             }
+            if !closed && lenient {
+                warnings.unclosed_spans += 1;
+            }
             flush_span(
                 &tagged_notes,
                 &emitted_note_indices,
+                &measure_bar_starts,
                 &mut measure_attrs,
                 &mut seg_timed,
                 leading_clefs.len(),
@@ -1507,6 +1640,7 @@ fn decode_inner(
             if !seen_event && measure == 0 {
                 leading_clefs.push((sign, line, oct));
                 leading_keys.push(None);
+                leading_part_ext.push(None);
                 if leading_clefs.len() <= 1 {
                     if let Some(o) = oct {
                         let a = attr_for(&mut measure_attrs, 1);
@@ -1670,6 +1804,22 @@ fn decode_inner(
                 Some((n, k))
             });
             if let Some((num, kind)) = numbered {
+                if lenient {
+                    let slot = (num as usize).saturating_sub(1);
+                    if kind == "stop" {
+                        if !open_num_hairpins[slot] {
+                            warnings.orphan_closers += 1;
+                            i += 1;
+                            continue;
+                        }
+                        open_num_hairpins[slot] = false;
+                    } else {
+                        if open_num_hairpins[slot] {
+                            warnings.unclosed_spans += 1;
+                        }
+                        open_num_hairpins[slot] = true;
+                    }
+                }
                 let target_seg = resolve_target_seg(&toks, i + 1, seg);
                 let onset_beats = voices.get(target_seg).copied().unwrap_or(0.0);
                 let explicit_st = has_explicit_staff.then_some(cur_staff_idx);
@@ -1952,6 +2102,13 @@ fn decode_inner(
                 grace_run = g;
                 g
             };
+            grace_slash_pending = false;
+            if unpitched_pending {
+                unpitched_pending = false;
+                if lenient {
+                    warnings.skipped_tokens += 1;
+                }
+            }
             if is_grace {
                 if lenient {
                     warnings.skipped_tokens += 1;
@@ -2205,9 +2362,13 @@ fn decode_inner(
                         &mods,
                         cur_tuplet,
                     ) {
-                        emitted_note_indices.push(tagged_notes.len());
+                        emitted_note_indices.push(Some(tagged_notes.len()));
                         tagged_notes.push((sm, sst, note));
+                    } else {
+                        emitted_note_indices.push(None);
                     }
+                } else {
+                    emitted_note_indices.push(None);
                 }
             } else {
                 let mut note = mk_note(pitch, onset, performed, seg as u32 + 1, &mods, cur_tuplet);
@@ -2219,7 +2380,7 @@ fn decode_inner(
                     note.dur = dur_written;
                     note.tuplet = None;
                 }
-                emitted_note_indices.push(tagged_notes.len());
+                emitted_note_indices.push(Some(tagged_notes.len()));
                 tagged_notes.push((measure, cur_staff_idx, note));
             }
             // Chord tones never advance the cursor.
@@ -2235,6 +2396,7 @@ fn decode_inner(
                 let key = (step.unwrap(), octave.unwrap_or(4), alter);
                 if merge_ties {
                     if is_grace {
+                        emitted_note_indices.push(None);
                         last_onset[seg] = Some(onset);
                     } else {
                         if let Some((sm, sst, note)) = tie_note(
@@ -2252,8 +2414,10 @@ fn decode_inner(
                             &mods,
                             cur_tuplet,
                         ) {
-                            emitted_note_indices.push(tagged_notes.len());
+                            emitted_note_indices.push(Some(tagged_notes.len()));
                             tagged_notes.push((sm, sst, note));
+                        } else {
+                            emitted_note_indices.push(None);
                         }
                         last_onset[seg] = Some(onset);
                     }
@@ -2268,7 +2432,7 @@ fn decode_inner(
                         note.dur = dur_written;
                         note.tuplet = None;
                     }
-                    emitted_note_indices.push(tagged_notes.len());
+                    emitted_note_indices.push(Some(tagged_notes.len()));
                     tagged_notes.push((measure, cur_staff_idx, note));
                     last_onset[seg] = Some(onset);
                 }
@@ -2316,6 +2480,11 @@ fn decode_inner(
         }
         if open_hairpin {
             warnings.unclosed_spans += 1;
+        }
+        for slot in open_num_hairpins {
+            if slot {
+                warnings.unclosed_spans += 1;
+            }
         }
     }
     for ((s, o, a), stack) in pending_tie {

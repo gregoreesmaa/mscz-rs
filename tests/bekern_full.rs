@@ -3,7 +3,7 @@
 
 use mscz::{
     bekern::{to_bekern, to_bekern_full, to_bekern_v2, to_bekern_with_dialect, BekernDialect},
-    decode::decode_bekern_unmerged,
+    decode::{decode_bekern, decode_bekern_lenient, decode_bekern_unmerged},
     has_errors,
     musicxml_import::{bekern_events, staff_headers},
     parse_score, to_musicxml, validate_musicxml,
@@ -425,8 +425,10 @@ fn bekern_full_layer2_lossless_expressive_split_roundtrip() {
     assert!(xml.contains("<tremolo type=\"start\">3</tremolo>"));
     assert!(xml.contains("<octave-shift type=\"down\" size=\"15\"/>"));
     assert!(xml.contains("<octave-shift type=\"up\" size=\"15\"/>"));
-    assert!(xml.contains("<pedal type=\"start\" sostenuto=\"yes\"/>"));
-    assert!(xml.contains("<pedal type=\"start\" soft=\"yes\"/>"));
+    assert!(xml.contains("<pedal type=\"sostenuto\"/>"));
+    assert!(xml.contains("<pedal type=\"start\"/>"));
+    assert!(!xml.contains("sostenuto=\"yes\""));
+    assert!(!xml.contains("soft=\"yes\""));
     assert!(xml.contains("<arpeggiate direction=\"up\"/>"));
     assert!(xml.contains("<arpeggiate direction=\"down\"/>"));
     assert!(xml.contains("<non-arpeggiate"));
@@ -500,12 +502,12 @@ fn bekern_full_layer3_anchored_lyrics_and_text_spans_roundtrip() {
     let bar_pos = s.find(" bar ").expect("bar token before end-of-system text");
     let tail = &s[bar_pos..];
     for expected in [
-        "<sys_lyr v=1>",
+        "<sys_lyr> v=1",
         "@0 lyr-beg Früh",
         "@1 lyr-mid lings",
         "@2 lyr-end lied",
         "@3 lyr-ext ah",
-        "<sys_lyr v=2>",
+        "<sys_lyr> v=2",
         "@0 lyr-ext Spring",
         "<reh> @0 A </text_span>",
         "<tempo> @0 Allegro ma non troppo </text_span>",
@@ -531,7 +533,7 @@ fn bekern_full_layer3_anchored_lyrics_and_text_spans_roundtrip() {
     assert!(xml.contains("<words>Allegro ma non troppo</words>"));
     assert!(xml.contains("<words>dolce espressivo</words>"));
     assert!(xml.contains("text=\"Cmaj7\""));
-    assert!(xml.contains("<figure-number>6/4</figure-number>"));
+    assert!(xml.contains("<figure><figure-number>6</figure-number></figure><figure><figure-number>4</figure-number></figure>"));
     let issues = validate_musicxml(&xml);
     assert!(!has_errors(&issues), "Layer 3 MusicXML errors: {issues:?}");
 }
@@ -576,4 +578,163 @@ fn bekern_v1_and_v2_strict_backward_compatibility() {
             }
         }
     }
+}
+
+#[test]
+fn regression_r1_slur_open_close_no_panic() {
+    let stream = "<schema:full> clef-G-2 key0 time-4-4 voice-1 quarter C 4 slur-open quarter D 4 slur-close bar";
+    // Strict mode returns Err rather than panicking on OOB slice.
+    assert!(decode_bekern_unmerged(stream).is_err());
+    // Lenient mode recovers cleanly without panicking.
+    let (input, warnings) = decode_bekern_lenient(stream).expect("lenient decode");
+    assert_eq!(input.parts[0].notes.len(), 2);
+    assert!(warnings.skipped_tokens >= 2);
+}
+
+#[test]
+fn regression_r1_numbered_hairpin_single_wedge() {
+    let stream = "<schema:full> clef-G-2 key0 time-4-4 hairpin-2-cresc voice-1 quarter C 4 hairpin-2-close quarter D 4 bar";
+    let input = decode_bekern_unmerged(stream).expect("decode numbered hairpin");
+    let (score, mut losses) = parse_score(&input).expect("parse score");
+    let xml = to_musicxml(&score, &mut losses);
+    assert_eq!(
+        xml.matches("<wedge ").count(),
+        2,
+        "expected exactly 2 <wedge> elements (cresc + stop), got:\n{xml}"
+    );
+    assert!(xml.contains("<wedge type=\"crescendo\" number=\"2\"/>"));
+    assert!(xml.contains("<wedge type=\"stop\" number=\"2\"/>"));
+}
+
+#[test]
+fn regression_r1_at_index_alignment_with_grace_and_merged_ties() {
+    // System notes in encoder order:
+    //   @0 = grace B4 (dropped by merge_ties=true)
+    //   @1 = C4 tie-start (swallowed by merge_ties=true)
+    //   @2 = C4 tie-stop (emitted as merged C4)
+    //   @3 = D4 (target of lyric "world")
+    let stream = "<schema:full> clef-G-2 key0 time-4-4 voice-1 grace eighth B 4 quarter C 4 tie-start quarter C 4 tie-stop quarter D 4 bar <sys_lyr> v=1 @3 world </text_span>";
+    let input = decode_bekern(stream).expect("decode with merge_ties=true");
+    let notes = &input.parts[0].notes;
+    assert_eq!(notes.len(), 2, "expected merged C4 + D4");
+    assert_eq!(notes[0].pitch.as_deref(), Some("C4"));
+    assert_eq!(notes[0].lyric, None);
+    assert_eq!(notes[1].pitch.as_deref(), Some("D4"));
+    assert_eq!(notes[1].lyric.as_deref(), Some("world"));
+}
+
+#[test]
+fn regression_r1_to_coda_stays_direction_and_xml_entities_roundtrip() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list><score-part id="P1"><part-name>Strings &amp; Winds</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>4</divisions><key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>G</sign><line>2</line></clef>
+      </attributes>
+      <direction placement="above"><direction-type><words>To Coda</words></direction-type></direction>
+      <direction placement="below"><direction-type><words>dolce &amp; espressivo</words></direction-type></direction>
+      <note>
+        <pitch><step>C</step><octave>4</octave></pitch>
+        <duration>16</duration><voice>1</voice><type>whole</type>
+        <lyric number="1"><syllabic>single</syllabic><text>A &amp; B</text></lyric>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#;
+    let headers = staff_headers(xml).unwrap();
+    let events = bekern_events(xml).unwrap();
+    let (toks, _) = to_bekern_full(&events, &headers).unwrap();
+    let s = toks.join(" ");
+    assert!(!s.contains("<inst-change>"), "To Coda must not be <inst-change>: {s}");
+    assert!(s.contains("<dir> @0 To Coda </text_span>"), "missing To Coda dir: {s}");
+    assert!(s.contains("<dir> @0 dolce & espressivo </text_span>"), "unescaped & dir: {s}");
+    assert!(s.contains("<sys_lyr> v=1 @0 A & B </text_span>"), "plain single lyric without lyr-end: {s}");
+
+    let input = decode_bekern_unmerged(&s).expect("decode entity stream");
+    let (score, mut losses) = parse_score(&input).expect("parse entity score");
+    let out_xml = to_musicxml(&score, &mut losses);
+    assert!(out_xml.contains("<words>To Coda</words>"));
+    assert!(out_xml.contains("<words>dolce &amp; espressivo</words>"));
+    assert!(out_xml.contains("<text>A &amp; B</text>"));
+    assert!(!out_xml.contains("&amp;amp;"), "double-escaped entity in:\n{out_xml}");
+}
+
+#[test]
+fn regression_r1_part_group_stop_and_distinct_part_index() {
+    // Two distinct parts (G2 Violin + F4 Cello) with explicit <part> markers must NOT
+    // merge into a single piano grand staff, and <part-group> must emit matching stop.
+    let stream = "<schema:full> <group> bracket <part> <staff-def> lines-5 clef-G-2 key0 time-4-4 <part> <staff-def> lines-5 clef-F-4 key0 time-4-4 voice-1 whole C 5 <staff> voice-1 whole C 3 bar";
+    let input = decode_bekern_unmerged(stream).expect("decode two distinct parts");
+    let (score, mut losses) = parse_score(&input).expect("parse two parts");
+    let xml = to_musicxml(&score, &mut losses);
+    assert!(xml.contains("<part-group type=\"start\" number=\"1\"><group-symbol>bracket</group-symbol></part-group>"));
+    assert!(xml.contains("<part-group type=\"stop\" number=\"1\"/>"));
+    assert!(xml.contains("<part id=\"P1\">"));
+    assert!(xml.contains("<part id=\"P2\">"));
+    assert!(!xml.contains("<staves>2</staves>"), "distinct parts must not merge into grand staff");
+    let issues = validate_musicxml(&xml);
+    assert!(!has_errors(&issues), "MusicXML errors: {issues:?}");
+}
+
+#[test]
+fn regression_r1_15ma_15mb_close_tremolo_toggle_pickup_and_dual_accent() {
+    let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="0" implicit="yes">
+      <attributes>
+        <divisions>4</divisions><key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>G</sign><line>2</line></clef>
+      </attributes>
+      <note>
+        <pitch><step>G</step><octave>4</octave></pitch>
+        <duration>4</duration><voice>1</voice><type>quarter</type>
+        <notations><articulations><accent/><strong-accent/></articulations></notations>
+      </note>
+    </measure>
+    <measure number="1">
+      <direction placement="above"><direction-type><octave-shift type="down" size="15"/></direction-type></direction>
+      <note>
+        <pitch><step>C</step><octave>5</octave></pitch>
+        <duration>8</duration><voice>1</voice><type>half</type>
+        <notations><ornaments><tremolo type="start">3</tremolo></ornaments></notations>
+      </note>
+      <direction placement="above"><direction-type><octave-shift type="stop" size="15"/></direction-type></direction>
+      <note>
+        <pitch><step>E</step><octave>5</octave></pitch>
+        <duration>8</duration><voice>1</voice><type>half</type>
+        <notations><ornaments><tremolo type="stop">3</tremolo></ornaments></notations>
+      </note>
+    </measure>
+  </part>
+</score-partwise>"#;
+    let headers = staff_headers(xml).unwrap();
+    let events = bekern_events(xml).unwrap();
+    let (toks, _) = to_bekern_full(&events, &headers).unwrap();
+    let s = toks.join(" ");
+    assert!(s.contains("15ma-open"));
+    assert!(s.contains("15ma-close"));
+    assert!(s.contains("accent") && s.contains("marcato"), "both accent and marcato must be preserved: {s}");
+
+    let input = decode_bekern_unmerged(&s).expect("decode stream");
+    let (score, mut losses) = parse_score(&input).expect("parse score");
+    let out_xml = to_musicxml(&score, &mut losses);
+    assert!(out_xml.contains("<tremolo type=\"start\">3</tremolo>"));
+    assert!(out_xml.contains("<tremolo type=\"stop\">3</tremolo>"));
+    assert!(out_xml.contains("<accent/>") && out_xml.contains("<strong-accent/>"));
+    // Pickup measure (measure 0) must NOT be padded with a trailing rest.
+    let m0_end = out_xml.find("</measure>").expect("first measure end");
+    assert!(
+        !out_xml[..m0_end].contains("<rest/>"),
+        "pickup measure must not have trailing rest padding:\n{}",
+        &out_xml[..m0_end]
+    );
+    let issues = validate_musicxml(&out_xml);
+    assert!(!has_errors(&issues), "MusicXML errors: {issues:?}");
 }

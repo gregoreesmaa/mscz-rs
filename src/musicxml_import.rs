@@ -114,13 +114,25 @@ struct Doc {
     parts: Vec<DocPart>,
 }
 
-/// Text of the first `<tag ...>text</tag>` occurrence, trimmed.
+/// Unescape standard XML character entities (`&lt;`, `&gt;`, `&quot;`, `&apos;`, `&amp;`).
+fn unescape_xml(s: &str) -> String {
+    if !s.contains('&') {
+        return s.to_string();
+    }
+    s.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", "\"")
+        .replace("&apos;", "'")
+        .replace("&amp;", "&")
+}
+
+/// Text of the first `<tag ...>text</tag>` occurrence, trimmed and XML-unescaped.
 fn tag_text(s: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}");
     let mut pos = s.find(&open)?;
     pos = s[pos..].find('>')? + pos + 1;
     let end = s[pos..].find(&format!("</{tag}>"))? + pos;
-    Some(s[pos..end].trim().to_string())
+    Some(unescape_xml(s[pos..end].trim()))
 }
 
 /// True when `<tag .../>` or `<tag ...>` opens inside `s`.
@@ -2424,7 +2436,7 @@ fn parse_note(s: &str) -> NoteEv {
                 Some("middle") => "lyr-mid",
                 Some("end") => "lyr-end",
                 _ if has_ext => "lyr-ext",
-                _ => "lyr-end",
+                _ => "",
             };
             lyrics.push((verse, syl.to_string(), txt));
         }
@@ -2619,6 +2631,9 @@ fn parse_notations(
             arts.push("accent".to_string());
         }
         if has_strong_accent {
+            if has_plain_accent {
+                full_arts.push("accent".to_string());
+            }
             full_arts.push("marcato".to_string());
         }
         if ab.contains("<tenuto") {
@@ -2877,11 +2892,14 @@ fn parse_direction(s: &str) -> DirEv {
         let tag = &s[p..];
         let end = tag.find('>').map(|q| q + 1).unwrap_or(tag.len());
         let t = &tag[..end];
-        let is_sost = t.contains("sostenuto=\"yes\"");
+        let is_sost_type = t.contains("type=\"sostenuto\"");
+        let is_sost = is_sost_type || t.contains("sostenuto=\"yes\"");
         let is_uc = t.contains("soft=\"yes\"");
         let is_start = t.contains("type=\"start\"");
         let is_stop = t.contains("type=\"stop\"");
-        if is_sost {
+        if is_sost_type {
+            pedal = Some("pedal-sost-open".to_string());
+        } else if is_sost {
             if is_start {
                 pedal = Some("pedal-sost-open".to_string());
             } else if is_stop {
@@ -2938,7 +2956,7 @@ fn parse_direction(s: &str) -> DirEv {
             if !navigation.iter().any(|n| n == "Fine") {
                 navigation.push("Fine".to_string());
             }
-        } else if wl == "inst-change" || wl.starts_with("muta in ") || wl.starts_with("to ") {
+        } else if wl == "inst-change" || wl.starts_with("muta in ") {
             inst_change = Some(wt.to_string());
         } else if !wt.is_empty() {
             let is_tempo = s.contains("<sound") && s.contains("tempo=")

@@ -534,6 +534,21 @@ fn to_bekern_inner(
         std::collections::HashMap::new();
     let mut skipped_volta: std::collections::HashMap<u32, String> =
         std::collections::HashMap::new();
+    let mut skipped_pickup: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut skipped_multirest: std::collections::HashMap<u32, u32> =
+        std::collections::HashMap::new();
+    let mut skipped_mrep: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut skipped_inst_change: std::collections::HashSet<u32> = std::collections::HashSet::new();
+    let mut skipped_nav: std::collections::HashMap<u32, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut skipped_num_hp: std::collections::HashMap<u32, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut skipped_ott15: std::collections::HashMap<u32, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut skipped_pedals: std::collections::HashMap<u32, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut skipped_text_spans: std::collections::HashMap<u32, Vec<(String, String)>> =
+        std::collections::HashMap::new();
     let mut stash_skipped = |e: &BekernNote| {
         if let Some(c) = e.clef_change {
             skipped_clef.insert(e.measure, c);
@@ -580,6 +595,52 @@ fn to_bekern_inner(
         }
         if let Some(v) = &e.volta {
             skipped_volta.insert(e.measure, v.clone());
+        }
+        if full {
+            if let Some(ef) = e.full.as_deref() {
+                if ef.pickup {
+                    skipped_pickup.insert(e.measure);
+                }
+                if let Some(mr) = ef.multirest {
+                    skipped_multirest.insert(e.measure, mr);
+                }
+                if let Some(mrep) = ef.measure_repeat {
+                    skipped_mrep.insert(e.measure, mrep);
+                }
+                if ef.inst_change.is_some() {
+                    skipped_inst_change.insert(e.measure);
+                }
+                if !ef.navigation.is_empty() {
+                    skipped_nav
+                        .entry(e.measure)
+                        .or_default()
+                        .extend(ef.navigation.iter().cloned());
+                }
+                if !ef.numbered_hairpins.is_empty() {
+                    skipped_num_hp
+                        .entry(e.measure)
+                        .or_default()
+                        .extend(ef.numbered_hairpins.iter().cloned());
+                }
+                if !ef.ottava_15.is_empty() {
+                    skipped_ott15
+                        .entry(e.measure)
+                        .or_default()
+                        .extend(ef.ottava_15.iter().cloned());
+                }
+                if !ef.pedals.is_empty() {
+                    skipped_pedals
+                        .entry(e.measure)
+                        .or_default()
+                        .extend(ef.pedals.iter().cloned());
+                }
+                if !ef.text_spans.is_empty() {
+                    skipped_text_spans
+                        .entry(e.measure)
+                        .or_default()
+                        .extend(ef.text_spans.iter().cloned());
+                }
+            }
         }
     };
     for e in events {
@@ -774,8 +835,31 @@ fn to_bekern_inner(
                 out.push(v.clone());
             }
             if full {
+                let mut emitted_pickup = false;
+                if skipped_pickup.remove(&e.measure) {
+                    out.push("<pickup>".to_string());
+                    emitted_pickup = true;
+                }
+                if let Some(mr) = skipped_multirest.remove(&e.measure) {
+                    out.push("<multirest>".to_string());
+                    out.push(format!("multirest-{mr}"));
+                }
+                if let Some(mrep) = skipped_mrep.remove(&e.measure) {
+                    let tok = match mrep {
+                        4 => "mrep-4",
+                        2 => "mrep-2",
+                        _ => "mrep-1",
+                    };
+                    out.push(tok.to_string());
+                }
+                if skipped_inst_change.remove(&e.measure) {
+                    out.push("<inst-change>".to_string());
+                }
+                if let Some(navs) = skipped_nav.remove(&e.measure) {
+                    out.extend(navs);
+                }
                 if let Some(ef) = e.full.as_deref() {
-                    if ef.pickup {
+                    if ef.pickup && !emitted_pickup {
                         out.push("<pickup>".to_string());
                     }
                     if let Some(mr) = ef.multirest {
@@ -849,6 +933,9 @@ fn to_bekern_inner(
                 out.extend(hs);
             }
             if full {
+                if let Some(nh) = skipped_num_hp.remove(&e.measure) {
+                    out.extend(nh);
+                }
                 if let Some(ef) = e.full.as_deref().filter(|f| !f.numbered_hairpins.is_empty()) {
                     out.extend(ef.numbered_hairpins.iter().cloned());
                 } else {
@@ -874,6 +961,12 @@ fn to_bekern_inner(
                 }
             }
             if full {
+                if let Some(o15) = skipped_ott15.remove(&e.measure) {
+                    out.extend(o15);
+                }
+                if let Some(peds) = skipped_pedals.remove(&e.measure) {
+                    out.extend(peds);
+                }
                 if let Some(ef) = e.full.as_deref() {
                     out.extend(ef.ottava_15.iter().cloned());
                     out.extend(ef.pedals.iter().cloned());
@@ -925,11 +1018,25 @@ fn to_bekern_inner(
                 if let Some(hs) = skipped_hairpin.remove(&e.measure) {
                     out.extend(hs);
                 }
-                if v2 {
-                    out.extend(e.extra_hairpins.iter().cloned());
-                }
-                if let Some(h) = &e.hairpin {
-                    out.push(h.clone());
+                if full {
+                    if let Some(nh) = skipped_num_hp.remove(&e.measure) {
+                        out.extend(nh);
+                    }
+                    if let Some(ef) = e.full.as_deref().filter(|f| !f.numbered_hairpins.is_empty()) {
+                        out.extend(ef.numbered_hairpins.iter().cloned());
+                    } else {
+                        out.extend(e.extra_hairpins.iter().cloned());
+                        if let Some(h) = &e.hairpin {
+                            out.push(h.clone());
+                        }
+                    }
+                } else {
+                    if v2 {
+                        out.extend(e.extra_hairpins.iter().cloned());
+                    }
+                    if let Some(h) = &e.hairpin {
+                        out.push(h.clone());
+                    }
                 }
                 if v2 {
                     if let Some(o) = skipped_ottava.remove(&e.measure) {
@@ -937,6 +1044,30 @@ fn to_bekern_inner(
                     }
                     if let Some(o) = &e.ottava {
                         out.push(o.clone());
+                    }
+                }
+                if full {
+                    if let Some(o15) = skipped_ott15.remove(&e.measure) {
+                        out.extend(o15);
+                    }
+                    if let Some(peds) = skipped_pedals.remove(&e.measure) {
+                        out.extend(peds);
+                    }
+                    if let Some(ef) = e.full.as_deref() {
+                        out.extend(ef.ottava_15.iter().cloned());
+                        out.extend(ef.pedals.iter().cloned());
+                    }
+                }
+            }
+            if full {
+                if let Some(sts) = skipped_text_spans.remove(&e.measure) {
+                    for (tag, text) in sts {
+                        sys_text_spans.push((tag, sys_note_idx, text));
+                    }
+                }
+                if let Some(ef) = e.full.as_deref() {
+                    for (tag, text) in &ef.text_spans {
+                        sys_text_spans.push((tag.clone(), sys_note_idx, text.clone()));
                     }
                 }
             }
@@ -1173,6 +1304,9 @@ fn to_bekern_inner(
                 out.extend(hs);
             }
             if full {
+                if let Some(nh) = skipped_num_hp.remove(&e.measure) {
+                    out.extend(nh);
+                }
                 if let Some(ef) = e.full.as_deref().filter(|f| !f.numbered_hairpins.is_empty()) {
                     out.extend(ef.numbered_hairpins.iter().cloned());
                 } else {
@@ -1198,6 +1332,12 @@ fn to_bekern_inner(
                 }
             }
             if full {
+                if let Some(o15) = skipped_ott15.remove(&e.measure) {
+                    out.extend(o15);
+                }
+                if let Some(peds) = skipped_pedals.remove(&e.measure) {
+                    out.extend(peds);
+                }
                 if let Some(ef) = e.full.as_deref() {
                     out.extend(ef.ottava_15.iter().cloned());
                     out.extend(ef.pedals.iter().cloned());
@@ -1443,6 +1583,18 @@ fn to_bekern_inner(
                 }
             }
         }
+        if full {
+            if let Some(sts) = skipped_text_spans.remove(&e.measure) {
+                for (tag, text) in sts {
+                    sys_text_spans.push((tag, sys_note_idx, text));
+                }
+            }
+            if let Some(f) = ef {
+                for (tag, text) in &f.text_spans {
+                    sys_text_spans.push((tag.clone(), sys_note_idx, text.clone()));
+                }
+            }
+        }
         if e.pitch.is_some() {
             if e.tie_start {
                 out.push("tie-start".to_string());
@@ -1450,16 +1602,13 @@ fn to_bekern_inner(
             if e.tie_stop {
                 out.push("tie-stop".to_string());
             }
-            // Collect Layer 3 anchored text & lyrics keyed by 0-based system note index.
+            // Collect Layer 3 anchored lyrics keyed by 0-based system note index.
             if let Some(f) = ef {
                 for (verse, syl, text) in &f.lyrics {
                     sys_lyrics
                         .entry(*verse)
                         .or_default()
                         .push((sys_note_idx, syl.clone(), text.clone()));
-                }
-                for (tag, text) in &f.text_spans {
-                    sys_text_spans.push((tag.clone(), sys_note_idx, text.clone()));
                 }
             }
             sys_note_idx += 1;
@@ -1592,10 +1741,13 @@ fn to_bekern_inner(
     // Layer 3 end-of-system anchored text & lyric blocks (`bekern-full` only).
     if full {
         for (verse, entries) in sys_lyrics {
-            out.push(format!("<sys_lyr v={verse}>"));
+            out.push("<sys_lyr>".to_string());
+            out.push(format!("v={verse}"));
             for (nidx, syl, text) in entries {
                 out.push(format!("@{nidx}"));
-                out.push(syl);
+                if !syl.is_empty() {
+                    out.push(syl);
+                }
                 for w in text.split_whitespace() {
                     out.push(w.to_string());
                 }

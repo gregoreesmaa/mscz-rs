@@ -180,10 +180,15 @@ pub struct FullPartExt {
 }
 
 /// Optional `bekern-full` (Layer 0) measure-level extensions.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct FullMeasureExt {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub pickup: bool,
+    /// Actual duration in beats of a `<pickup>` measure (when shorter than the
+    /// nominal time-signature bar length) so MusicXML round-trip avoids padding
+    /// the pickup bar with trailing rests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pickup_beats: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub multirest: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -586,7 +591,23 @@ impl Score {
                 beats = t.beats;
                 beat_type = t.beat_type;
             }
-            let mlen = (beats as i64 * self.divisions as i64 * 4 / beat_type.max(1) as i64).max(1);
+            let nominal = (beats as i64 * self.divisions as i64 * 4 / beat_type.max(1) as i64).max(1);
+            let pickup_beats = measure_attr(self, m)
+                .and_then(|a| a.full.as_deref())
+                .filter(|f| f.pickup)
+                .and_then(|f| f.pickup_beats)
+                .or_else(|| {
+                    self.parts.iter().find_map(|p| {
+                        part_measure_attr(p, m)
+                            .and_then(|a| a.full.as_deref())
+                            .filter(|f| f.pickup)
+                            .and_then(|f| f.pickup_beats)
+                    })
+                });
+            let mlen = match pickup_beats {
+                Some(pb) if pb > 1e-6 => ((pb * self.divisions as f64).round() as i64).clamp(1, nominal),
+                _ => nominal,
+            };
             windows.push((cur, cur + mlen));
             cur += mlen;
             m += 1;
@@ -1471,7 +1492,7 @@ fn tie_elements(seg: &Segment) -> (bool, bool) {
 /// slurs + articulations + fermata. Emits nothing when the segment carries
 /// none. Rests only ever carry fermatas (the corpus has no slurred/articulated
 /// rests), but the rendering is uniform.
-fn write_notations_xml(out: &mut String, seg: &Segment) {
+fn write_notations_xml(out: &mut String, seg: &Segment, tremolo_2n_open: &mut bool) {
     let (tie_start, tie_stop) = tie_elements(seg);
     let full = seg.note.full.as_deref();
     let has_num_slurs =
@@ -1601,7 +1622,15 @@ fn write_notations_xml(out: &mut String, seg: &Segment) {
                 "tremolo-1" => out.push_str("<tremolo type=\"single\">1</tremolo>"),
                 "tremolo-2" => out.push_str("<tremolo type=\"single\">2</tremolo>"),
                 "tremolo-3" => out.push_str("<tremolo type=\"single\">3</tremolo>"),
-                "tremolo-2n" => out.push_str("<tremolo type=\"start\">3</tremolo>"),
+                "tremolo-2n" => {
+                    if *tremolo_2n_open {
+                        out.push_str("<tremolo type=\"stop\">3</tremolo>");
+                        *tremolo_2n_open = false;
+                    } else {
+                        out.push_str("<tremolo type=\"start\">3</tremolo>");
+                        *tremolo_2n_open = true;
+                    }
+                }
                 "art-mordent" | "mordent-up" => out.push_str("<inverted-mordent/>"),
                 "mordent-lo" => out.push_str("<mordent/>"),
                 "art-turn" | "turn" => out.push_str("<turn/>"),
@@ -1737,6 +1766,7 @@ fn write_note_pitch_xml(out: &mut String, seg: &Segment) {
     let _ = writeln!(out, "<octave>{}</octave></pitch>", seg.note.octave);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_note_xml(
     out: &mut String,
     seg: &Segment,
@@ -1745,17 +1775,20 @@ fn push_note_xml(
     part_name: &str,
     voice_override: Option<u32>,
     staff_num: Option<u32>,
+    tremolo_2n_open: &mut bool,
 ) {
     let full = seg.note.full.as_deref();
     let voice_num = voice_override.unwrap_or(seg.note.voice);
-    let effective_staff = if let Some(abs_st) = full.and_then(|f| f.xstaff_abs) {
-        Some(abs_st)
-    } else {
-        staff_num.map(|st| match seg.note.xstaff {
-            Some(delta) => (st as i32 + delta as i32).clamp(1, 2) as u32,
-            None => st,
-        })
-    };
+    let effective_staff = staff_num.map(|st| {
+        if let Some(abs_st) = full.and_then(|f| f.xstaff_abs) {
+            abs_st
+        } else {
+            match seg.note.xstaff {
+                Some(delta) => (st as i32 + delta as i32).clamp(1, 2) as u32,
+                None => st,
+            }
+        }
+    });
     // Grace notes occupy no time: `<grace/>` plus the engraved `<type>`
     // for display, and no `<duration>` (which is also what the scorer
     // reads, so grace round-trips as zero-duration events).
@@ -1812,7 +1845,7 @@ fn push_note_xml(
         if let Some(bm) = full.and_then(|f| f.beam.as_deref()) {
             let _ = writeln!(out, "        <beam number=\"1\">{bm}</beam>");
         }
-        write_notations_xml(out, seg);
+        write_notations_xml(out, seg, tremolo_2n_open);
         out.push_str("      </note>\n");
         return;
     }
@@ -1899,7 +1932,7 @@ fn push_note_xml(
         let _ = writeln!(out, "        <beam number=\"1\">{bm}</beam>");
     }
     if !seg.note.rest {
-        write_notations_xml(out, seg);
+        write_notations_xml(out, seg, tremolo_2n_open);
         if let Some(f) = full.filter(|f| !f.lyrics.is_empty()) {
             for (verse, syl, text, ext) in &f.lyrics {
                 let _ = write!(out, "        <lyric number=\"{verse}\">");
@@ -1920,7 +1953,7 @@ fn push_note_xml(
             out.push_str("</text></lyric>\n");
         }
     } else {
-        write_notations_xml(out, seg);
+        write_notations_xml(out, seg, tremolo_2n_open);
     }
     out.push_str("      </note>\n");
 }
@@ -1987,6 +2020,13 @@ fn has_trailing_grand_staff(parts: &[Part]) -> bool {
     }
     let hi = &parts[parts.len() - 2];
     let lo = &parts[parts.len() - 1];
+    let hi_pi = hi.full.as_deref().and_then(|f| f.part_index);
+    let lo_pi = lo.full.as_deref().and_then(|f| f.part_index);
+    if let (Some(a), Some(b)) = (hi_pi, lo_pi) {
+        if a != b {
+            return false;
+        }
+    }
     hi.clef_sign == Some('G')
         && hi.clef_line.unwrap_or(2) == 2
         && hi.clef_octave_change.is_none()
@@ -2169,16 +2209,14 @@ fn write_timed_event_xml(
             out.push_str("</direction>\n");
         }
         "pedal" => {
-            let (ptype, extra) = match ev.value.as_str() {
-                "sost-open" => ("start", " sostenuto=\"yes\""),
-                "sost-close" => ("stop", " sostenuto=\"yes\""),
-                "uc-open" => ("start", " soft=\"yes\""),
-                "uc-close" => ("stop", " soft=\"yes\""),
-                _ => ("stop", ""),
+            let ptype = match ev.value.as_str() {
+                "sost-open" => "sostenuto",
+                "uc-open" => "start",
+                _ => "stop",
             };
             let _ = write!(
                 out,
-                "      <direction placement=\"below\"><direction-type><pedal type=\"{ptype}\"{extra}/></direction-type>"
+                "      <direction placement=\"below\"><direction-type><pedal type=\"{ptype}\"/></direction-type>"
             );
             if let Some(off) = offset_ticks.filter(|&o| o != 0) {
                 let _ = write!(out, "<offset>{off}</offset>");
@@ -2200,7 +2238,14 @@ fn write_timed_event_xml(
             out.push(root_step);
             out.push_str("</root-step></root><kind text=\"");
             write_escaped_xml(out, &ev.value);
-            out.push_str("\">major</kind></harmony>\n");
+            out.push_str("\">major</kind>");
+            if let Some(off) = offset_ticks.filter(|&o| o != 0) {
+                let _ = write!(out, "<offset>{off}</offset>");
+            }
+            if let Some(st) = staff_num {
+                let _ = write!(out, "<staff>{st}</staff>");
+            }
+            out.push_str("</harmony>\n");
         }
         "tempo" | "dir" => {
             let placement = if ev.kind == "tempo" { "above" } else { "below" };
@@ -2222,15 +2267,28 @@ fn write_timed_event_xml(
             out.push_str("      <direction placement=\"above\"><direction-type><rehearsal>");
             write_escaped_xml(out, &ev.value);
             out.push_str("</rehearsal></direction-type>");
+            if let Some(off) = offset_ticks.filter(|&o| o != 0) {
+                let _ = write!(out, "<offset>{off}</offset>");
+            }
             if let Some(st) = staff_num {
                 let _ = write!(out, "<staff>{st}</staff>");
             }
             out.push_str("</direction>\n");
         }
         "fb" => {
-            out.push_str("      <figured-bass><figure><figure-number>");
-            write_escaped_xml(out, &ev.value);
-            out.push_str("</figure-number></figure></figured-bass>\n");
+            out.push_str("      <figured-bass>");
+            for fig in ev.value.split('/') {
+                out.push_str("<figure><figure-number>");
+                write_escaped_xml(out, fig);
+                out.push_str("</figure-number></figure>");
+            }
+            if let Some(off) = offset_ticks.filter(|&o| o != 0) {
+                let _ = write!(out, "<offset>{off}</offset>");
+            }
+            if let Some(st) = staff_num {
+                let _ = write!(out, "<staff>{st}</staff>");
+            }
+            out.push_str("</figured-bass>\n");
         }
         "clef" | "key" | "time" => write_midbar_attr_xml(out, &ev.kind, &ev.value, staff_num),
         _ => {}
@@ -2252,6 +2310,7 @@ fn push_voice_with_timed_events(
 ) {
     let mut ti = 0usize;
     let mut cur_off = 0i64;
+    let mut tremolo_2n_open = false;
     for s in segs {
         let seg_off = s.note.start_ticks.max(m0) - m0;
         if !s.chord {
@@ -2289,7 +2348,16 @@ fn push_voice_with_timed_events(
                 ti += 1;
             }
         }
-        push_note_xml(out, s, divisions, losses, part_name, None, staff_num);
+        push_note_xml(
+            out,
+            s,
+            divisions,
+            losses,
+            part_name,
+            None,
+            staff_num,
+            &mut tremolo_2n_open,
+        );
         if !s.chord && !s.note.grace {
             cur_off = cur_off.max(seg_off + s.dur_ticks);
         }
@@ -2465,11 +2533,18 @@ pub fn to_musicxml_version(
     };
 
     out.push_str("  <part-list>\n");
+    let mut group_num = 0u32;
+    let mut group_open = false;
     for (i, part) in score.parts.iter().take(single_count).enumerate() {
         if let Some(sym) = part.full.as_deref().and_then(|f| f.group_symbol.as_deref()) {
+            if group_open {
+                let _ = writeln!(out, "    <part-group type=\"stop\" number=\"{group_num}\"/>");
+            }
+            group_num += 1;
+            group_open = true;
             let _ = writeln!(
                 out,
-                "    <part-group type=\"start\" number=\"1\"><group-symbol>{sym}</group-symbol></part-group>"
+                "    <part-group type=\"start\" number=\"{group_num}\"><group-symbol>{sym}</group-symbol></part-group>"
             );
         }
         let _ = write!(out, "    <score-part id=\"P{}\"><part-name>", i + 1);
@@ -2478,7 +2553,19 @@ pub fn to_musicxml_version(
     }
     if grand_staff {
         let p_id = single_count + 1;
-        let hi_name = &score.parts[single_count].name;
+        let hi_part = &score.parts[single_count];
+        if let Some(sym) = hi_part.full.as_deref().and_then(|f| f.group_symbol.as_deref()) {
+            if group_open {
+                let _ = writeln!(out, "    <part-group type=\"stop\" number=\"{group_num}\"/>");
+            }
+            group_num += 1;
+            group_open = true;
+            let _ = writeln!(
+                out,
+                "    <part-group type=\"start\" number=\"{group_num}\"><group-symbol>{sym}</group-symbol></part-group>"
+            );
+        }
+        let hi_name = &hi_part.name;
         let gs_name = if hi_name.starts_with("Staff ") {
             "Piano"
         } else {
@@ -2487,6 +2574,9 @@ pub fn to_musicxml_version(
         let _ = write!(out, "    <score-part id=\"P{p_id}\"><part-name>");
         write_escaped_xml(&mut out, gs_name);
         out.push_str("</part-name></score-part>\n");
+    }
+    if group_open {
+        let _ = writeln!(out, "    <part-group type=\"stop\" number=\"{group_num}\"/>");
     }
     out.push_str("  </part-list>\n");
 
@@ -2662,7 +2752,7 @@ pub fn to_musicxml_version(
                 for te in &a.timed_events {
                     if te.kind == "dynamic" {
                         s_has_timed_dyn = true;
-                    } else if te.kind == "hairpin" {
+                    } else if matches!(te.kind.as_str(), "hairpin" | "hairpin-num") {
                         s_has_timed_hp = true;
                     }
                     let tick = (te.onset_beats * score.divisions as f64).round() as i64;
@@ -2673,7 +2763,7 @@ pub fn to_musicxml_version(
                 for te in &a.timed_events {
                     if te.kind == "dynamic" {
                         p_has_timed_dyn = true;
-                    } else if te.kind == "hairpin" {
+                    } else if matches!(te.kind.as_str(), "hairpin" | "hairpin-num") {
                         p_has_timed_hp = true;
                     }
                     let tick = (te.onset_beats * score.divisions as f64).round() as i64;
@@ -2714,6 +2804,7 @@ pub fn to_musicxml_version(
                 for (vi, (_voice, segs)) in voices.iter().enumerate() {
                     if vi > 0 {
                         let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+                        let mut tremolo_2n_open = false;
                         for s in segs {
                             if s.forward {
                                 push_forward_xml(&mut out, s.dur_ticks, s.note.voice, None);
@@ -2726,6 +2817,7 @@ pub fn to_musicxml_version(
                                     &part.name,
                                     None,
                                     None,
+                                    &mut tremolo_2n_open,
                                 );
                             }
                         }
@@ -2768,11 +2860,19 @@ pub fn to_musicxml_version(
                 .get(m)
                 .map(|&(a, b)| b - a)
                 .unwrap_or_else(|| score.measure_ticks());
-            let _ = writeln!(out, "    <measure number=\"{}\">", m + 1);
             let m1 = m as u32 + 1;
             let s_attrs = measure_attr(score, m1);
             let p1_attrs = part_measure_attr(part_hi, m1);
             let p2_attrs = part_measure_attr(part_lo, m1);
+            let m_full = p1_attrs
+                .and_then(|a| a.full.as_deref())
+                .or_else(|| p2_attrs.and_then(|a| a.full.as_deref()))
+                .or_else(|| s_attrs.and_then(|a| a.full.as_deref()));
+            if m_full.is_some_and(|f| f.pickup) {
+                let _ = writeln!(out, "    <measure number=\"0\" implicit=\"yes\">");
+            } else {
+                let _ = writeln!(out, "    <measure number=\"{}\">", m + 1);
+            }
             if m == 0 {
                 let key = p1_attrs
                     .and_then(|a| a.key_fifths)
@@ -2806,6 +2906,42 @@ pub fn to_musicxml_version(
                     part_lo.clef_octave_change,
                     Some(2),
                 );
+                if let Some(lines) = part_hi.full.as_deref().and_then(|f| f.staff_lines) {
+                    let _ = writeln!(
+                        out,
+                        "        <staff-details number=\"1\"><staff-lines>{lines}</staff-lines></staff-details>"
+                    );
+                }
+                if let Some(lines) = part_lo.full.as_deref().and_then(|f| f.staff_lines) {
+                    let _ = writeln!(
+                        out,
+                        "        <staff-details number=\"2\"><staff-lines>{lines}</staff-lines></staff-details>"
+                    );
+                }
+                if let Some((dia, chr)) = part_hi
+                    .full
+                    .as_deref()
+                    .and_then(|f| f.transpose)
+                    .or_else(|| part_lo.full.as_deref().and_then(|f| f.transpose))
+                {
+                    let _ = writeln!(
+                        out,
+                        "        <transpose><diatonic>{dia}</diatonic><chromatic>{chr}</chromatic></transpose>"
+                    );
+                }
+                if let Some(mf) = m_full {
+                    if let Some(mr) = mf.multirest {
+                        let _ = writeln!(
+                            out,
+                            "        <measure-style><multiple-rest>{mr}</multiple-rest></measure-style>"
+                        );
+                    } else if let Some(mrep) = mf.measure_repeat {
+                        let _ = writeln!(
+                            out,
+                            "        <measure-style><measure-repeat type=\"start\">{mrep}</measure-repeat></measure-style>"
+                        );
+                    }
+                }
                 out.push_str("      </attributes>\n");
             } else {
                 let p1_clef = p1_attrs.filter(|a| {
@@ -2819,10 +2955,13 @@ pub fn to_musicxml_version(
                     .or_else(|| p2_attrs.and_then(|a| a.key_fifths))
                     .or_else(|| s_attrs.and_then(|a| a.key_fifths));
                 let time_change = s_attrs.and_then(|a| a.time);
+                let has_mstyle =
+                    m_full.is_some_and(|f| f.multirest.is_some() || f.measure_repeat.is_some());
                 if p1_clef.is_some()
                     || p2_clef.is_some()
                     || key_change.is_some()
                     || time_change.is_some()
+                    || has_mstyle
                 {
                     out.push_str("      <attributes>\n");
                     if let Some(k) = key_change {
@@ -2853,7 +2992,35 @@ pub fn to_musicxml_version(
                             Some(2),
                         );
                     }
+                    if let Some(mf) = m_full {
+                        if let Some(mr) = mf.multirest {
+                            let _ = writeln!(
+                                out,
+                                "        <measure-style><multiple-rest>{mr}</multiple-rest></measure-style>"
+                            );
+                        } else if let Some(mrep) = mf.measure_repeat {
+                            let _ = writeln!(
+                                out,
+                                "        <measure-style><measure-repeat type=\"start\">{mrep}</measure-repeat></measure-style>"
+                            );
+                        }
+                    }
                     out.push_str("      </attributes>\n");
+                }
+            }
+            if let Some(mf) = m_full {
+                if mf.inst_change {
+                    out.push_str("      <direction placement=\"above\"><direction-type><words>inst-change</words></direction-type></direction>\n");
+                }
+                for nav in &mf.navigation {
+                    match nav.as_str() {
+                        "Segno" => out.push_str("      <direction placement=\"above\"><direction-type><segno/></direction-type></direction>\n"),
+                        "Coda" => out.push_str("      <direction placement=\"above\"><direction-type><coda/></direction-type></direction>\n"),
+                        "D.C." => out.push_str("      <direction placement=\"above\"><direction-type><words>D.C.</words></direction-type><sound dacapo=\"yes\"/></direction>\n"),
+                        "D.S." => out.push_str("      <direction placement=\"above\"><direction-type><words>D.S.</words></direction-type><sound dalsegno=\"yes\"/></direction>\n"),
+                        "Fine" => out.push_str("      <direction placement=\"above\"><direction-type><words>Fine</words></direction-type><sound fine=\"yes\"/></direction>\n"),
+                        _ => {}
+                    }
                 }
             }
             let barline_left = s_attrs.and_then(|a| a.barline_left.as_deref());
@@ -2869,7 +3036,7 @@ pub fn to_musicxml_version(
                 for te in &a.timed_events {
                     if te.kind == "dynamic" {
                         s_has_timed_dyn = true;
-                    } else if te.kind == "hairpin" {
+                    } else if matches!(te.kind.as_str(), "hairpin" | "hairpin-num") {
                         s_has_timed_hp = true;
                     }
                     let tick = (te.onset_beats * score.divisions as f64).round() as i64;
@@ -2880,7 +3047,7 @@ pub fn to_musicxml_version(
                 for te in &a.timed_events {
                     if te.kind == "dynamic" {
                         p1_has_timed_dyn = true;
-                    } else if te.kind == "hairpin" {
+                    } else if matches!(te.kind.as_str(), "hairpin" | "hairpin-num") {
                         p1_has_timed_hp = true;
                     }
                     let tick = (te.onset_beats * score.divisions as f64).round() as i64;
@@ -2921,6 +3088,7 @@ pub fn to_musicxml_version(
                 for (vi, (_voice, segs)) in voices1.iter().enumerate() {
                     if vi > 0 {
                         let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+                        let mut tremolo_2n_open = false;
                         for s in segs {
                             if s.forward {
                                 push_forward_xml(&mut out, s.dur_ticks, s.note.voice, Some(1));
@@ -2933,6 +3101,7 @@ pub fn to_musicxml_version(
                                     &part_hi.name,
                                     None,
                                     Some(1),
+                                    &mut tremolo_2n_open,
                                 );
                             }
                         }
@@ -2961,7 +3130,7 @@ pub fn to_musicxml_version(
                 for te in &a.timed_events {
                     if te.kind == "dynamic" {
                         p2_has_timed_dyn = true;
-                    } else if te.kind == "hairpin" {
+                    } else if matches!(te.kind.as_str(), "hairpin" | "hairpin-num") {
                         p2_has_timed_hp = true;
                     }
                     let tick = (te.onset_beats * score.divisions as f64).round() as i64;
@@ -2989,6 +3158,7 @@ pub fn to_musicxml_version(
                 for (vi, (_voice, segs)) in voices2.iter().enumerate() {
                     if vi > 0 {
                         let _ = writeln!(out, "      <backup><duration>{mlen}</duration></backup>");
+                        let mut tremolo_2n_open = false;
                         for s in segs {
                             if s.forward {
                                 push_forward_xml(&mut out, s.dur_ticks, s.note.voice, Some(2));
@@ -3001,6 +3171,7 @@ pub fn to_musicxml_version(
                                     &part_lo.name,
                                     None,
                                     Some(2),
+                                    &mut tremolo_2n_open,
                                 );
                             }
                         }
@@ -4544,6 +4715,9 @@ pub fn validate_musicxml(xml: &str) -> Vec<Issue> {
             }
         };
         let body = &xml[mstart..mend];
+        let is_implicit = body
+            .find('>')
+            .is_some_and(|e| body[..e].contains("implicit=\"yes\""));
         if let Some((md, _)) = read_tag_value(body, 0, "divisions") {
             if md > 0 {
                 divisions = md;
@@ -4643,7 +4817,14 @@ pub fn validate_musicxml(xml: &str) -> Vec<Issue> {
                 k += 1;
             }
         }
-        if t != expected {
+        if is_implicit {
+            if t <= 0 || t > expected {
+                out.push(error(
+                    "xml-measure-sum",
+                    format!("measure {mnum}: implicit pickup durations sum to {t} ticks, expected 1..={expected}"),
+                ));
+            }
+        } else if t != expected {
             out.push(error(
                 "xml-measure-sum",
                 format!("measure {mnum}: durations sum to {t} ticks, expected {expected}"),
