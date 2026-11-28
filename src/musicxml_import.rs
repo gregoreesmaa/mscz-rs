@@ -575,7 +575,10 @@ pub fn staff_headers(xml: &str) -> Result<Vec<StaffHeader>, String> {
 }
 
 /// Collect [`StaffHeader`]s with clef, key and time signature changes in
-/// `measure <= start_measure` carried forward (last wins). Staff indexing
+/// `measure <= start_measure` carried forward (last wins), stopping before
+/// the first note/backup/forward in `start_measure` so mid-measure
+/// `<attributes>` (e.g. a mid-measure clef change) do not overwrite the
+/// opening header of `start_measure`. Staff indexing
 /// matches [`staff_headers`] exactly (same full-score `staff_base`
 /// accumulation), so headers line up with [`bekern_events`] `staff`
 /// fields for any measure-span slice. `start_measure` is 1-based; values
@@ -613,23 +616,33 @@ pub fn staff_headers_at_measure(xml: &str, start_measure: u32) -> Result<Vec<Sta
         let mut key: Option<i32> = None;
         let mut time: Option<TimeSig> = None;
         for (ordinal0, meas) in measures.iter().enumerate() {
-            if ordinal0 as u32 + 1 > start {
+            let meas_num = ordinal0 as u32 + 1;
+            if meas_num > start {
                 break;
             }
             for it in measure_items(meas) {
-                if let Item::Attributes(a) = it {
-                    for (n, sign, line, oct) in a.clefs {
-                        match clefs.iter_mut().find(|c| c.0 == n) {
-                            Some(slot) => *slot = (n, sign, line, oct),
-                            None => clefs.push((n, sign, line, oct)),
+                match it {
+                    Item::Attributes(a) => {
+                        for (n, sign, line, oct) in a.clefs {
+                            match clefs.iter_mut().find(|c| c.0 == n) {
+                                Some(slot) => *slot = (n, sign, line, oct),
+                                None => clefs.push((n, sign, line, oct)),
+                            }
+                        }
+                        if a.key_fifths.is_some() {
+                            key = a.key_fifths;
+                        }
+                        if a.time.is_some() {
+                            time = a.time;
                         }
                     }
-                    if a.key_fifths.is_some() {
-                        key = a.key_fifths;
+                    Item::Note(_) | Item::Backup(_) | Item::Forward(_) if meas_num == start => {
+                        // Mid-measure `<attributes>` (e.g. a clef change after
+                        // opening notes) apply inside `start`, not to its
+                        // opening staff header.
+                        break;
                     }
-                    if a.time.is_some() {
-                        time = a.time;
-                    }
+                    _ => {}
                 }
             }
         }
@@ -3074,5 +3087,39 @@ mod tests {
         assert_eq!(events[0].pitch, Some(('F', 4, 0)));
         assert_eq!(events[1].pitch, Some(('G', 5, 0)));
         assert_eq!(events[2].pitch, Some(('E', 5, 0)));
+    }
+
+    #[test]
+    fn staff_headers_at_measure_ignores_mid_measure_attributes_in_start_measure() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<score-partwise version="3.1">
+  <part-list><score-part id="P1"><part-name>Piano</part-name></score-part></part-list>
+  <part id="P1">
+    <measure number="1">
+      <attributes>
+        <divisions>4</divisions>
+        <key><fifths>0</fifths></key>
+        <time><beats>4</beats><beat-type>4</beat-type></time>
+        <clef><sign>F</sign><line>4</line></clef>
+      </attributes>
+      <note><pitch><step>G</step><octave>2</octave></pitch><duration>16</duration><voice>1</voice><type>whole</type></note>
+    </measure>
+    <measure number="2">
+      <note><pitch><step>G</step><octave>2</octave></pitch><duration>8</duration><voice>1</voice><type>half</type></note>
+      <attributes>
+        <clef><sign>G</sign><line>2</line></clef>
+      </attributes>
+      <note><pitch><step>G</step><octave>4</octave></pitch><duration>8</duration><voice>1</voice><type>half</type></note>
+    </measure>
+  </part>
+</score-partwise>"#;
+
+        let h2 = staff_headers_at_measure(xml, 2).expect("headers at measure 2");
+        assert_eq!(h2.len(), 1);
+        assert_eq!((h2[0].clef_sign, h2[0].clef_line), ('F', 4));
+
+        let h3 = staff_headers_at_measure(xml, 3).expect("headers at measure 3");
+        assert_eq!(h3.len(), 1);
+        assert_eq!((h3[0].clef_sign, h3[0].clef_line), ('G', 2));
     }
 }
