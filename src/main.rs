@@ -7,7 +7,7 @@ use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand};
 use mscz::{
-    bekern::{to_bekern, to_bekern_v2},
+    bekern::{to_bekern, to_bekern_full, to_bekern_v2},
     decode::{
         decode_bekern, decode_bekern_lenient, decode_bekern_unmerged,
         decode_bekern_unmerged_lenient,
@@ -158,6 +158,11 @@ struct BekernArgs {
     /// ottavas, extended Phase A dynamics/articulations, `tup-open`/`tup-close`).
     #[arg(long, default_value_t = false)]
     v2: bool,
+    /// Emit 4-layer `bekern-full` (`<schema:full>`, Layers 0–3: structure/
+    /// multi-part, microtones/beams/percussion/TAB, lossless expressive split,
+    /// end-of-system anchored lyrics & text spans).
+    #[arg(long, default_value_t = false)]
+    full: bool,
 }
 
 #[derive(Args, Debug)]
@@ -671,7 +676,9 @@ fn cmd_bekern(a: &BekernArgs) -> Result<(), Err> {
     } else {
         staff_headers(&xml).map_err(|e| format!("{}: {e}", a.input.display()))?
     };
-    let (toks, graces) = if a.v2 {
+    let (toks, graces) = if a.full {
+        to_bekern_full(&events, &headers)
+    } else if a.v2 {
         to_bekern_v2(&events, &headers)
     } else {
         to_bekern(&events, &headers)

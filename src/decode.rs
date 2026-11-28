@@ -16,7 +16,10 @@
 //! (its reference adapter merges too), while the MusicXML path
 //! preserves every link (the XML scorer compares tie segments).
 
-use crate::{MeasureAttr, NoteInput, PartInput, ScoreInput, TimedEvent, TimeSig, SCORE_DIVISIONS};
+use crate::{
+    FullMeasureExt, FullNoteExt, FullPartExt, MeasureAttr, NoteInput, PartInput, ScoreInput,
+    TimeSig, TimedEvent, SCORE_DIVISIONS,
+};
 
 fn written_dur(token: &str) -> Option<f64> {
     match token {
@@ -53,9 +56,15 @@ struct NoteMods {
     articulations: Vec<String>,
     cue: bool,
     xstaff: Option<i8>,
+    full: Option<Box<FullNoteExt>>,
 }
 
 impl NoteMods {
+    fn full_mut(&mut self) -> &mut FullNoteExt {
+        self.full
+            .get_or_insert_with(|| Box::new(FullNoteExt::default()))
+    }
+
     /// Union of two links' marks (merged tie chains keep every mark).
     fn union(&self, other: &NoteMods) -> NoteMods {
         let mut articulations = self.articulations.clone();
@@ -64,12 +73,65 @@ impl NoteMods {
                 articulations.push(a.clone());
             }
         }
+        let full = match (&self.full, &other.full) {
+            (Some(a), Some(b)) => {
+                let mut m = (**a).clone();
+                m.grace_slash |= b.grace_slash;
+                if m.microtone.is_none() {
+                    m.microtone = b.microtone.clone();
+                }
+                m.explicit_natural |= b.explicit_natural;
+                m.acc_cautionary |= b.acc_cautionary;
+                m.acc_parentheses |= b.acc_parentheses;
+                if m.stem.is_none() {
+                    m.stem = b.stem.clone();
+                }
+                if m.beam.is_none() {
+                    m.beam = b.beam.clone();
+                }
+                m.unpitched |= b.unpitched;
+                if m.notehead.is_none() {
+                    m.notehead = b.notehead.clone();
+                }
+                if m.tab_string.is_none() {
+                    m.tab_string = b.tab_string;
+                }
+                if m.tab_fret.is_none() {
+                    m.tab_fret = b.tab_fret;
+                }
+                m.tab_bend |= b.tab_bend;
+                m.tab_hopo |= b.tab_hopo;
+                if m.xstaff_abs.is_none() {
+                    m.xstaff_abs = b.xstaff_abs;
+                }
+                for &n in &b.slur_starts {
+                    if !m.slur_starts.contains(&n) {
+                        m.slur_starts.push(n);
+                    }
+                }
+                for &n in &b.slur_stops {
+                    if !m.slur_stops.contains(&n) {
+                        m.slur_stops.push(n);
+                    }
+                }
+                for l in &b.lyrics {
+                    if !m.lyrics.contains(l) {
+                        m.lyrics.push(l.clone());
+                    }
+                }
+                Some(Box::new(m))
+            }
+            (Some(a), None) => Some(a.clone()),
+            (None, Some(b)) => Some(b.clone()),
+            (None, None) => None,
+        };
         NoteMods {
             slur_start: self.slur_start || other.slur_start,
             slur_stop: self.slur_stop || other.slur_stop,
             articulations,
             cue: self.cue || other.cue,
             xstaff: self.xstaff.or(other.xstaff),
+            full,
         }
     }
 }
@@ -99,6 +161,7 @@ fn mk_note(
         tuplet,
         cue: mods.cue,
         xstaff: mods.xstaff,
+        full: mods.full.clone(),
     }
 }
 
@@ -115,6 +178,24 @@ fn take_mod(toks: &[&str], i: &mut usize, mods: &mut NoteMods) -> bool {
             *i += 1;
             true
         }
+        Some(s) if s.starts_with("slur-") && s.ends_with("-open") => {
+            if let Ok(n) = s["slur-".len()..s.len() - "-open".len()].parse::<u8>() {
+                mods.slur_start = true;
+                mods.full_mut().slur_starts.push(n);
+                *i += 1;
+                return true;
+            }
+            false
+        }
+        Some(s) if s.starts_with("slur-") && s.ends_with("-close") => {
+            if let Ok(n) = s["slur-".len()..s.len() - "-close".len()].parse::<u8>() {
+                mods.slur_stop = true;
+                mods.full_mut().slur_stops.push(n);
+                *i += 1;
+                return true;
+            }
+            false
+        }
         Some("cue") => {
             mods.cue = true;
             *i += 1;
@@ -127,6 +208,97 @@ fn take_mod(toks: &[&str], i: &mut usize, mods: &mut NoteMods) -> bool {
         }
         Some("xstaff-down") => {
             mods.xstaff = Some(1);
+            *i += 1;
+            true
+        }
+        Some(s) if s.starts_with("xstaff-") => {
+            if let Ok(n) = s["xstaff-".len()..].parse::<u32>() {
+                mods.full_mut().xstaff_abs = Some(n);
+                *i += 1;
+                return true;
+            }
+            false
+        }
+        Some("acc-caut") => {
+            mods.full_mut().acc_cautionary = true;
+            *i += 1;
+            true
+        }
+        Some("acc-paren") => {
+            mods.full_mut().acc_parentheses = true;
+            *i += 1;
+            true
+        }
+        Some("stem-up") => {
+            mods.full_mut().stem = Some("up".to_string());
+            *i += 1;
+            true
+        }
+        Some("stem-down") => {
+            mods.full_mut().stem = Some("down".to_string());
+            *i += 1;
+            true
+        }
+        Some("beam-start") => {
+            mods.full_mut().beam = Some("begin".to_string());
+            *i += 1;
+            true
+        }
+        Some("beam-cont") => {
+            mods.full_mut().beam = Some("continue".to_string());
+            *i += 1;
+            true
+        }
+        Some("beam-end") => {
+            mods.full_mut().beam = Some("end".to_string());
+            *i += 1;
+            true
+        }
+        Some("beam-hook-l") => {
+            mods.full_mut().beam = Some("backward hook".to_string());
+            *i += 1;
+            true
+        }
+        Some("beam-hook-r") => {
+            mods.full_mut().beam = Some("forward hook".to_string());
+            *i += 1;
+            true
+        }
+        Some(s) if s.starts_with("nh-") => {
+            let shape = &s["nh-".len()..];
+            if matches!(
+                shape,
+                "x" | "diamond" | "slash" | "triangle" | "circle-x" | "square"
+            ) {
+                mods.full_mut().notehead = Some(shape.to_string());
+                *i += 1;
+                return true;
+            }
+            false
+        }
+        Some(s) if s.starts_with("str-") => {
+            if let Ok(n) = s["str-".len()..].parse::<u32>() {
+                mods.full_mut().tab_string = Some(n);
+                *i += 1;
+                return true;
+            }
+            false
+        }
+        Some(s) if s.starts_with("fret-") => {
+            if let Ok(n) = s["fret-".len()..].parse::<u32>() {
+                mods.full_mut().tab_fret = Some(n);
+                *i += 1;
+                return true;
+            }
+            false
+        }
+        Some("bend") => {
+            mods.full_mut().tab_bend = true;
+            *i += 1;
+            true
+        }
+        Some("hopo") => {
+            mods.full_mut().tab_hopo = true;
             *i += 1;
             true
         }
@@ -146,6 +318,30 @@ fn take_mod(toks: &[&str], i: &mut usize, mods: &mut NoteMods) -> bool {
                     | "art-up-bow"
                     | "art-down-bow"
                     | "art-soft-accent"
+                    | "marcato"
+                    | "mordent-up"
+                    | "mordent-lo"
+                    | "turn"
+                    | "turn-inv"
+                    | "tremolo-1"
+                    | "tremolo-2"
+                    | "tremolo-3"
+                    | "tremolo-2n"
+                    | "arp-up"
+                    | "arp-down"
+                    | "arp-non"
+                    | "trill-line-open"
+                    | "trill-line-close"
+                    | "gliss-open"
+                    | "gliss-close"
+                    | "breath"
+                    | "caesura"
+                    | "fing-1"
+                    | "fing-2"
+                    | "fing-3"
+                    | "fing-4"
+                    | "fing-5"
+                    | "harmonics"
             ) =>
         {
             if !mods.articulations.iter().any(|a| a == s) {
@@ -584,11 +780,67 @@ fn decode_inner(
     let mut time_set = false;
     let mut leading_clefs: Vec<(char, u32, Option<i32>)> = Vec::new();
     let mut leading_keys: Vec<Option<i32>> = Vec::new();
+    let mut leading_part_ext: Vec<Option<Box<FullPartExt>>> = Vec::new();
     let mut leading_clef_oct: Option<(char, u32, i32)> = None;
+    let mut cur_part_idx: u32 = 0;
+    let mut seen_part_tok = false;
+    let mut pending_group_sym: Option<String> = None;
+    let mut pending_staff_lines: Option<u32> = None;
     let mut i = 0;
     while i < toks.len() {
         let t = toks[i];
+        if matches!(t, "<schema:full>" | "<schema:v1>" | "<schema:v2a>") {
+            i += 1;
+            continue;
+        }
         if lenient && matches!(t, "<bos>" | "<pad>") {
+            i += 1;
+            continue;
+        }
+        if t == "<group>" {
+            if let Some(&sym) = toks.get(i + 1) {
+                if matches!(sym, "brace" | "bracket" | "barline") {
+                    pending_group_sym = Some(sym.to_string());
+                    i += 2;
+                    continue;
+                }
+            }
+            i += 1;
+            continue;
+        }
+        if t == "<part>" {
+            if seen_part_tok {
+                cur_part_idx += 1;
+            }
+            seen_part_tok = true;
+            i += 1;
+            continue;
+        }
+        if t == "<staff-def>" {
+            i += 1;
+            if let Some(&next) = toks.get(i) {
+                if let Some(lines) = next
+                    .strip_prefix("lines-")
+                    .and_then(|s| s.parse::<u32>().ok())
+                {
+                    pending_staff_lines = Some(lines);
+                    i += 1;
+                }
+            }
+            continue;
+        }
+        if t == "<transpose>" {
+            if let (Some(dia), Some(chr)) = (
+                toks.get(i + 1).and_then(|s| s.parse::<i32>().ok()),
+                toks.get(i + 2).and_then(|s| s.parse::<i32>().ok()),
+            ) {
+                if let Some(slot) = leading_part_ext.last_mut() {
+                    let ext = slot.get_or_insert_with(|| Box::new(FullPartExt::default()));
+                    ext.transpose = Some((dia, chr));
+                }
+                i += 3;
+                continue;
+            }
             i += 1;
             continue;
         }
@@ -603,6 +855,20 @@ fn decode_inner(
             };
             leading_clefs.push((sign, line, oct));
             leading_keys.push(None);
+            let pext = if seen_part_tok
+                || pending_group_sym.is_some()
+                || pending_staff_lines.is_some()
+            {
+                Some(Box::new(FullPartExt {
+                    part_index: seen_part_tok.then_some(cur_part_idx),
+                    staff_lines: pending_staff_lines.take(),
+                    group_symbol: pending_group_sym.take(),
+                    transpose: None,
+                }))
+            } else {
+                None
+            };
+            leading_part_ext.push(pext);
             if let Some(o) = oct {
                 if leading_clef_oct.is_none() {
                     leading_clef_oct = Some((sign, line, o));
@@ -705,12 +971,16 @@ fn decode_inner(
     // Open tie chain: ((step, octave, alter), seg, onset, dur_acc,
     // marks). Only used when `merge_ties` is set.
     let mut pending_tie: PendingTies = std::collections::BTreeMap::new();
-    // Grace state: `grace_pending` is set by a `grace` marker and
+    // Grace state: `grace_pending` is set by a `grace` or `grace-slash` marker and
     // consumed by the next duration token; `grace_run` marks chord
     // tones inheriting their root's grace.
     let mut grace_pending = false;
+    let mut grace_slash_pending = false;
     let mut grace_run = false;
     let mut grace_seq: u32 = 0;
+    let mut unpitched_pending = false;
+    // Zero-based system note index -> index in `tagged_notes` for Layer 3 `@i` anchors.
+    let mut emitted_note_indices: Vec<usize> = Vec::new();
     // Whether any note or rest has been placed: mid-stream headers
     // before the first event are effectively leading headers.
     let mut seen_event = false;
@@ -765,6 +1035,7 @@ fn decode_inner(
                 tuplet,
                 cue: mods.cue,
                 xstaff: mods.xstaff,
+                full: mods.full.clone(),
             },
         ));
     };
@@ -854,6 +1125,7 @@ fn decode_inner(
                     open_slurs.clear();
                     open_slurs.push(0);
                     grace_run = false;
+                    emitted_note_indices.clear();
                     i += 1;
                     continue;
                 }
@@ -946,7 +1218,257 @@ fn decode_inner(
             i += 1;
             continue;
         }
-        if t == "grace" {
+        // Layer 0 (`bekern-full`) measure-level tokens.
+        if t == "<pickup>" {
+            attr_for(&mut measure_attrs, measure + 1)
+                .full
+                .get_or_insert_with(|| Box::new(FullMeasureExt::default()))
+                .pickup = true;
+            i += 1;
+            continue;
+        }
+        if t == "<multirest>" {
+            if let Some(n) = toks
+                .get(i + 1)
+                .and_then(|s| s.strip_prefix("multirest-"))
+                .and_then(|s| s.parse::<u32>().ok())
+            {
+                attr_for(&mut measure_attrs, measure + 1)
+                    .full
+                    .get_or_insert_with(|| Box::new(FullMeasureExt::default()))
+                    .multirest = Some(n);
+                i += 2;
+            } else {
+                attr_for(&mut measure_attrs, measure + 1)
+                    .full
+                    .get_or_insert_with(|| Box::new(FullMeasureExt::default()))
+                    .multirest = Some(1);
+                i += 1;
+            }
+            continue;
+        }
+        if let Some(n) = t
+            .strip_prefix("multirest-")
+            .and_then(|s| s.parse::<u32>().ok())
+        {
+            attr_for(&mut measure_attrs, measure + 1)
+                .full
+                .get_or_insert_with(|| Box::new(FullMeasureExt::default()))
+                .multirest = Some(n);
+            i += 1;
+            continue;
+        }
+        if let Some(n) = t.strip_prefix("mrep-").and_then(|s| s.parse::<u32>().ok()) {
+            attr_for(&mut measure_attrs, measure + 1)
+                .full
+                .get_or_insert_with(|| Box::new(FullMeasureExt::default()))
+                .measure_repeat = Some(n);
+            i += 1;
+            continue;
+        }
+        if t == "<inst-change>" {
+            attr_for(&mut measure_attrs, measure + 1)
+                .full
+                .get_or_insert_with(|| Box::new(FullMeasureExt::default()))
+                .inst_change = true;
+            i += 1;
+            continue;
+        }
+        if matches!(t, "D.C." | "D.S." | "Segno" | "Coda" | "Fine") {
+            attr_for(&mut measure_attrs, measure + 1)
+                .full
+                .get_or_insert_with(|| Box::new(FullMeasureExt::default()))
+                .navigation
+                .push(t.to_string());
+            i += 1;
+            continue;
+        }
+        if matches!(t, "<schema:full>" | "<schema:v1>" | "<schema:v2a>") {
+            i += 1;
+            continue;
+        }
+        // Layer 3 (`bekern-full`) end-of-system anchored text & lyric blocks.
+        if t == "<sys_lyr" || t.starts_with("<sys_lyr:") {
+            let verse = if t == "<sys_lyr" {
+                let v = toks
+                    .get(i + 1)
+                    .and_then(|s| s.strip_prefix("v="))
+                    .and_then(|s| s.strip_suffix('>'))
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(1);
+                i += 2;
+                v
+            } else {
+                let v = t
+                    .strip_prefix("<sys_lyr:v=")
+                    .and_then(|s| s.strip_suffix('>'))
+                    .and_then(|s| s.parse::<u32>().ok())
+                    .unwrap_or(1);
+                i += 1;
+                v
+            };
+            let mut cur_anchor: Option<usize> = None;
+            let mut cur_syl: Option<&'static str> = None;
+            let mut cur_ext = false;
+            let mut cur_words: Vec<&str> = Vec::new();
+            let flush_lyr = |tagged_notes: &mut Vec<(u32, usize, NoteInput)>,
+                             emitted_note_indices: &[usize],
+                             anchor: Option<usize>,
+                             syl: Option<&'static str>,
+                             ext: bool,
+                             words: &mut Vec<&str>| {
+                if let Some(aidx) = anchor {
+                    let text = words.join(" ");
+                    if !text.is_empty() {
+                        if let Some(&tn_idx) = emitted_note_indices.get(aidx) {
+                            if let Some((_, _, note)) = tagged_notes.get_mut(tn_idx) {
+                                if verse == 1 && note.lyric.is_none() {
+                                    note.lyric = Some(text.clone());
+                                }
+                                note.full
+                                    .get_or_insert_with(|| Box::new(FullNoteExt::default()))
+                                    .lyrics
+                                    .push((verse, syl.map(str::to_string), text, ext));
+                            }
+                        }
+                    }
+                }
+                words.clear();
+            };
+            while i < toks.len() {
+                let tk = toks[i];
+                if tk == "</text_span>" {
+                    i += 1;
+                    break;
+                }
+                if tk == "<sys>" || tk == "<eos>" {
+                    break;
+                }
+                if let Some(aidx) = tk.strip_prefix('@').and_then(|s| s.parse::<usize>().ok()) {
+                    flush_lyr(
+                        &mut tagged_notes,
+                        &emitted_note_indices,
+                        cur_anchor,
+                        cur_syl,
+                        cur_ext,
+                        &mut cur_words,
+                    );
+                    cur_anchor = Some(aidx);
+                    cur_syl = None;
+                    cur_ext = false;
+                } else if tk == "lyr-beg" {
+                    cur_syl = Some("begin");
+                } else if tk == "lyr-mid" {
+                    cur_syl = Some("middle");
+                } else if tk == "lyr-end" {
+                    cur_syl = Some("end");
+                } else if tk == "lyr-ext" {
+                    cur_syl = Some("single");
+                    cur_ext = true;
+                } else {
+                    cur_words.push(tk);
+                }
+                i += 1;
+            }
+            flush_lyr(
+                &mut tagged_notes,
+                &emitted_note_indices,
+                cur_anchor,
+                cur_syl,
+                cur_ext,
+                &mut cur_words,
+            );
+            continue;
+        }
+        if matches!(t, "<harm>" | "<tempo>" | "<dir>" | "<reh>" | "<fb>") {
+            let kind = match t {
+                "<harm>" => "harm",
+                "<tempo>" => "tempo",
+                "<dir>" => "dir",
+                "<reh>" => "reh",
+                "<fb>" => "fb",
+                _ => "dir",
+            };
+            i += 1;
+            let mut cur_anchor: Option<usize> = None;
+            let mut cur_words: Vec<&str> = Vec::new();
+            let flush_span = |tagged_notes: &[(u32, usize, NoteInput)],
+                              emitted_note_indices: &[usize],
+                              measure_attrs: &mut Vec<MeasureAttr>,
+                              seg_timed: &mut Vec<(u32, Option<usize>, usize, TimedEvent)>,
+                              leading_clefs_len: usize,
+                              has_explicit_staff: bool,
+                              anchor: Option<usize>,
+                              words: &mut Vec<&str>| {
+                let text = words.join(" ");
+                if !text.is_empty() {
+                    let (m, st_idx, onset_in_meas) = anchor
+                        .and_then(|aidx| emitted_note_indices.get(aidx).copied())
+                        .and_then(|tn_idx| tagged_notes.get(tn_idx))
+                        .map(|(m, st, n)| {
+                            // Approximate measure-local onset via modulo barlen when barlen > 0.
+                            let local_onset = if initial_barlen > 0.0 {
+                                n.onset % initial_barlen
+                            } else {
+                                0.0
+                            };
+                            (*m, *st, local_onset)
+                        })
+                        .unwrap_or((0, 0, 0.0));
+                    let te = TimedEvent {
+                        onset_beats: onset_in_meas,
+                        kind: kind.to_string(),
+                        value: text,
+                    };
+                    if leading_clefs_len <= 1 && !has_explicit_staff {
+                        attr_for(measure_attrs, m + 1).timed_events.push(te);
+                    } else {
+                        seg_timed.push((m, Some(st_idx), 0, te));
+                    }
+                }
+                words.clear();
+            };
+            while i < toks.len() {
+                let tk = toks[i];
+                if tk == "</text_span>" {
+                    i += 1;
+                    break;
+                }
+                if tk == "<sys>" || tk == "<eos>" {
+                    break;
+                }
+                if let Some(aidx) = tk.strip_prefix('@').and_then(|s| s.parse::<usize>().ok()) {
+                    if cur_anchor.is_some() {
+                        flush_span(
+                            &tagged_notes,
+                            &emitted_note_indices,
+                            &mut measure_attrs,
+                            &mut seg_timed,
+                            leading_clefs.len(),
+                            has_explicit_staff,
+                            cur_anchor,
+                            &mut cur_words,
+                        );
+                    }
+                    cur_anchor = Some(aidx);
+                } else {
+                    cur_words.push(tk);
+                }
+                i += 1;
+            }
+            flush_span(
+                &tagged_notes,
+                &emitted_note_indices,
+                &mut measure_attrs,
+                &mut seg_timed,
+                leading_clefs.len(),
+                has_explicit_staff,
+                cur_anchor,
+                &mut cur_words,
+            );
+            continue;
+        }
+        if t == "grace" || t == "grace-slash" {
             if grace_pending {
                 if lenient {
                     warnings.skipped_tokens += 1;
@@ -956,6 +1478,12 @@ fn decode_inner(
                 return Err(format!("double grace marker in measure {measure}"));
             }
             grace_pending = true;
+            grace_slash_pending = t == "grace-slash";
+            i += 1;
+            continue;
+        }
+        if t == "unpitched" {
+            unpitched_pending = true;
             i += 1;
             continue;
         }
@@ -1130,6 +1658,36 @@ fn decode_inner(
             continue;
         }
         if let Some(short) = t.strip_prefix("hairpin-") {
+            // Check numbered `bekern-full` hairpins: `hairpin-1..3-cresc|dim|close`.
+            let numbered = short.split_once('-').and_then(|(num_s, kind_s)| {
+                let n = num_s.parse::<u8>().ok().filter(|&n| (1..=3).contains(&n))?;
+                let k = match kind_s {
+                    "cresc" => "cresc",
+                    "dim" => "dim",
+                    "close" => "stop",
+                    _ => return None,
+                };
+                Some((n, k))
+            });
+            if let Some((num, kind)) = numbered {
+                let target_seg = resolve_target_seg(&toks, i + 1, seg);
+                let onset_beats = voices.get(target_seg).copied().unwrap_or(0.0);
+                let explicit_st = has_explicit_staff.then_some(cur_staff_idx);
+                let te = TimedEvent {
+                    onset_beats,
+                    kind: "hairpin-num".to_string(),
+                    value: format!("{num}:{kind}"),
+                };
+                if leading_clefs.len() <= 1 && !has_explicit_staff {
+                    let a = attr_for(&mut measure_attrs, measure + 1);
+                    a.push_hairpin(kind);
+                    a.timed_events.push(te);
+                } else {
+                    seg_timed.push((measure, explicit_st, target_seg, te));
+                }
+                i += 1;
+                continue;
+            }
             let hp = match short {
                 "cresc-start" => {
                     if lenient {
@@ -1214,6 +1772,52 @@ fn decode_inner(
             i += 1;
             continue;
         }
+        // Layer 2 `bekern-full` 15ma/15mb & sostenuto/una-corda pedals.
+        if matches!(t, "15ma-open" | "15ma-close" | "15mb-open" | "15mb-close") {
+            let val = match t {
+                "15ma-open" => "15ma",
+                "15mb-open" => "15mb",
+                _ => "stop",
+            };
+            let target_seg = resolve_target_seg(&toks, i + 1, seg);
+            let onset_beats = voices.get(target_seg).copied().unwrap_or(0.0);
+            let explicit_st = has_explicit_staff.then_some(cur_staff_idx);
+            let te = TimedEvent {
+                onset_beats,
+                kind: "ottava-15".to_string(),
+                value: val.to_string(),
+            };
+            if leading_clefs.len() <= 1 && !has_explicit_staff {
+                attr_for(&mut measure_attrs, measure + 1)
+                    .timed_events
+                    .push(te);
+            } else {
+                seg_timed.push((measure, explicit_st, target_seg, te));
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(ped) = t.strip_prefix("pedal-") {
+            if matches!(ped, "sost-open" | "sost-close" | "uc-open" | "uc-close") {
+                let target_seg = resolve_target_seg(&toks, i + 1, seg);
+                let onset_beats = voices.get(target_seg).copied().unwrap_or(0.0);
+                let explicit_st = has_explicit_staff.then_some(cur_staff_idx);
+                let te = TimedEvent {
+                    onset_beats,
+                    kind: "pedal".to_string(),
+                    value: ped.to_string(),
+                };
+                if leading_clefs.len() <= 1 && !has_explicit_staff {
+                    attr_for(&mut measure_attrs, measure + 1)
+                        .timed_events
+                        .push(te);
+                } else {
+                    seg_timed.push((measure, explicit_st, target_seg, te));
+                }
+                i += 1;
+                continue;
+            }
+        }
         if let Some(rest) = t.strip_prefix("voice-") {
             let n = match rest.parse::<usize>() {
                 Ok(n) if n > 0 => n,
@@ -1248,6 +1852,22 @@ fn decode_inner(
                     warnings.skipped_tokens += 1;
                 }
                 _ => return Err(format!("bad tuplet token {t:?}")),
+            }
+            i += 1;
+            continue;
+        }
+        if let Some(rest) = t.strip_prefix("tup-open-") {
+            let parsed = rest.split_once(':').and_then(|(a_s, n_s)| {
+                let a = a_s.parse::<u32>().ok().filter(|&v| v > 0)?;
+                let n = n_s.parse::<u32>().ok().filter(|&v| v > 0)?;
+                Some((a, n))
+            });
+            if let Some((a, n)) = parsed {
+                pending_spans.push((a, n));
+            } else if lenient {
+                warnings.skipped_tokens += 1;
+            } else {
+                return Err(format!("bad tup-open token {t:?} in measure {measure}"));
             }
             i += 1;
             continue;
@@ -1288,12 +1908,13 @@ fn decode_inner(
             i += 1;
             continue;
         }
-        // Note or rest event: [grace] [chord] (dur | rest [dur]) ...
+        // Note or rest event: [grace|grace-slash] [chord|<chord>] [unpitched] (dur | rest [dur]) ...
         let mut chord = false;
-        if t == "chord" {
+        if t == "chord" || t == "<chord>" {
             if grace_pending {
                 if lenient {
                     grace_pending = false;
+                    grace_slash_pending = false;
                     warnings.skipped_tokens += 1;
                 } else {
                     return Err(format!("grace without duration in measure {measure}"));
@@ -1301,6 +1922,10 @@ fn decode_inner(
             }
             chord = true;
             i += 1;
+            if toks.get(i) == Some(&"unpitched") {
+                unpitched_pending = true;
+                i += 1;
+            }
         }
         let Some(t) = toks.get(i) else {
             if lenient {
@@ -1413,20 +2038,38 @@ fn decode_inner(
         } else {
             (None, None)
         };
-        // Encoder order: step octave [alter] [dots] [slur-start]
+        let is_grace_slash = if chord {
+            false
+        } else {
+            let gs = grace_slash_pending;
+            grace_slash_pending = false;
+            gs
+        };
+        let is_unpitched = unpitched_pending;
+        unpitched_pending = false;
+        // Encoder order: step octave [alter|microtone] [acc-caut|acc-paren] [dots] [slur-start]
         // [slur-stop] [modifiers] [tie-start] [tie-stop]; plain rests:
         // `rest` duration [dots] [modifiers]. The loops below accept any
         // interleave a generator might emit (the grammar mask agrees).
         let mut alter = 0i32;
+        let mut explicit_natural = false;
+        let mut microtone: Option<String> = None;
+        let mut acc_caut = false;
+        let mut acc_paren = false;
         if pitched {
-            // Alter tokens (`a-1`, `a1`, …) share their leading `a`
-            // with the `accent` modifier: only consume the token here
-            // when the suffix parses as an accidental offset, so a
-            // following modifier falls through to the tail loop.
-            if let Some(a) = toks
+            if let Some(&mt) = toks
+                .get(i)
+                .filter(|&&s| matches!(s, "q#" | "qb" | "3q#" | "3qb"))
+            {
+                microtone = Some(mt.to_string());
+                i += 1;
+            } else if let Some(a) = toks
                 .get(i)
                 .filter(|s| s.starts_with('a') && s[1..].parse::<i32>().is_ok())
             {
+                if *a == "a0" {
+                    explicit_natural = true;
+                }
                 alter = a[1..]
                     .parse()
                     .map_err(|_| format!("bad alter token {a:?} in measure {measure}"))?;
@@ -1435,6 +2078,17 @@ fn decode_inner(
                     alter = alter.clamp(-2, 2);
                 }
                 i += 1;
+            }
+            while let Some(&tk) = toks.get(i) {
+                if tk == "acc-caut" {
+                    acc_caut = true;
+                    i += 1;
+                } else if tk == "acc-paren" {
+                    acc_paren = true;
+                    i += 1;
+                } else {
+                    break;
+                }
             }
         }
         let mut dots = 0u32;
@@ -1447,6 +2101,24 @@ fn decode_inner(
         // order is slurs, modifiers, then ties; the loop agrees with
         // the grammar mask, which admits the same set).
         let mut mods = NoteMods::default();
+        if is_grace_slash {
+            mods.full_mut().grace_slash = true;
+        }
+        if is_unpitched {
+            mods.full_mut().unpitched = true;
+        }
+        if let Some(mt) = microtone {
+            mods.full_mut().microtone = Some(mt);
+        }
+        if explicit_natural {
+            mods.full_mut().explicit_natural = true;
+        }
+        if acc_caut {
+            mods.full_mut().acc_cautionary = true;
+        }
+        if acc_paren {
+            mods.full_mut().acc_parentheses = true;
+        }
         let mut tie_start = false;
         let mut tie_stop = false;
         take_tail(&toks, &mut i, &mut mods, &mut tie_start, &mut tie_stop);
@@ -1533,6 +2205,7 @@ fn decode_inner(
                         &mods,
                         cur_tuplet,
                     ) {
+                        emitted_note_indices.push(tagged_notes.len());
                         tagged_notes.push((sm, sst, note));
                     }
                 }
@@ -1546,6 +2219,7 @@ fn decode_inner(
                     note.dur = dur_written;
                     note.tuplet = None;
                 }
+                emitted_note_indices.push(tagged_notes.len());
                 tagged_notes.push((measure, cur_staff_idx, note));
             }
             // Chord tones never advance the cursor.
@@ -1578,6 +2252,7 @@ fn decode_inner(
                             &mods,
                             cur_tuplet,
                         ) {
+                            emitted_note_indices.push(tagged_notes.len());
                             tagged_notes.push((sm, sst, note));
                         }
                         last_onset[seg] = Some(onset);
@@ -1593,6 +2268,7 @@ fn decode_inner(
                         note.dur = dur_written;
                         note.tuplet = None;
                     }
+                    emitted_note_indices.push(tagged_notes.len());
                     tagged_notes.push((measure, cur_staff_idx, note));
                     last_onset[seg] = Some(onset);
                 }
@@ -1677,6 +2353,7 @@ fn decode_inner(
             clef_octave_change,
             key_fifths: leading_keys.first().copied().flatten(),
             measure_attrs: Vec::new(),
+            full: leading_part_ext.first().cloned().flatten(),
         }]
     } else if has_explicit_staff {
         let k = leading_clefs.len().max(max_staff_idx + 1).max(1);
@@ -1755,6 +2432,7 @@ fn decode_inner(
                 clef_octave_change: o,
                 key_fifths: leading_keys.get(idx).copied().flatten(),
                 measure_attrs: p_attrs,
+                full: leading_part_ext.get(idx).cloned().flatten(),
             })
             .collect()
     } else {
@@ -1890,6 +2568,7 @@ fn decode_inner(
                 clef_octave_change: o,
                 key_fifths: leading_keys.get(idx).copied().flatten(),
                 measure_attrs: p_attrs,
+                full: leading_part_ext.get(idx).cloned().flatten(),
             })
             .collect()
     };

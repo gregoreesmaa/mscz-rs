@@ -270,7 +270,10 @@ fn parse_document(xml: &str) -> Result<Doc, String> {
                         page = n;
                     }
                     Item::NewSystem => {}
-                    Item::Direction(_) | Item::Barline(_) => {}
+                    Item::Direction(_)
+                    | Item::Barline(_)
+                    | Item::Harmony(_)
+                    | Item::FiguredBass(_) => {}
                     Item::Backup(d) => {
                         for v in ends.values_mut() {
                             v.0 = (v.0 - d).max(mstart);
@@ -412,6 +415,10 @@ struct NoteEv {
     tuplet_stop: Option<u32>,
     /// Whole-bar rest (`<rest measure="yes"/>`).
     measure_rest: bool,
+    /// Optional `bekern-full` (Layers 1–3) note-level extensions.
+    full: Option<Box<FullBekernNoteExt>>,
+    /// Instrument ID (`<instrument id="..."/>`) for mid-score `<inst-change>` detection.
+    instrument_id: Option<String>,
 }
 
 /// Measure-level dynamic mark (`dyn-pp` … `dyn-ff`, `dyn-sfz`), extended
@@ -422,6 +429,18 @@ struct DirEv {
     notation_dynamic: Option<String>,
     wedge: Option<String>,
     ottava: Option<String>,
+    /// Numbered hairpin for `bekern-full` (`hairpin-1..3-cresc|dim|close`).
+    full_hairpin: Option<String>,
+    /// 15ma / 15mb octave-shift for `bekern-full` (`15ma-open`, `15mb-open`, `15-stop`).
+    ottava_15: Option<String>,
+    /// Sostenuto / una-corda pedal for `bekern-full`.
+    pedal: Option<String>,
+    /// Navigation markers (`Segno`, `Coda`, `D.C.`, `D.S.`, `Fine`).
+    navigation: Vec<String>,
+    /// Mid-score instrument change detected from direction.
+    inst_change: Option<String>,
+    /// Layer 3 anchored text spans (`("<tempo>"|"<dir>"|"<reh>", text)`).
+    text_spans: Vec<(String, String)>,
 }
 
 /// A `<barline>` element: `left` is the `location="left"` attribute,
@@ -441,6 +460,14 @@ struct AttrEv {
     staves: Option<u32>,
     /// `(part-local staff number, sign, line, clef_octave_change)` in document order.
     clefs: Vec<(u32, char, u32, Option<i32>)>,
+    /// Staff lines count (`<staff-details><staff-lines>N</staff-lines></staff-details>`).
+    staff_lines: Option<u32>,
+    /// Transposition `(diatonic, chromatic)` from `<transpose>`.
+    transpose: Option<(i32, i32)>,
+    /// Multi-measure rest count (`<measure-style><multiple-rest>N</multiple-rest>`).
+    multirest: Option<u32>,
+    /// Measure repeat count (`<measure-style><measure-repeat type="start">N</measure-repeat>`).
+    measure_repeat: Option<u32>,
 }
 
 /// Engraved beats for a grace `<type>`; grace notes carry no duration,
@@ -503,6 +530,54 @@ pub struct ScoreEvent {
     pub alter: i32,
 }
 
+/// Optional `bekern-full` (Layer 0) staff-header metadata.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullStaffHeaderExt {
+    pub part_index: u32,
+    pub part_id: Option<String>,
+    pub part_name: Option<String>,
+    pub staff_lines: Option<u32>,
+    pub group_start: Option<String>,
+    pub transpose: Option<(i32, i32)>,
+}
+
+/// Optional `bekern-full` (Layers 0–3) note-event metadata.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FullBekernNoteExt {
+    // Layer 0
+    pub pickup: bool,
+    pub multirest: Option<u32>,
+    pub measure_repeat: Option<u32>,
+    pub inst_change: Option<String>,
+    pub navigation: Vec<String>,
+    // Layer 1
+    pub microtone: Option<String>,
+    pub explicit_natural: bool,
+    pub acc_cautionary: bool,
+    pub acc_parentheses: bool,
+    pub stem: Option<String>,
+    pub beam: Option<String>,
+    pub unpitched: bool,
+    pub notehead: Option<String>,
+    pub tab_string: Option<u32>,
+    pub tab_fret: Option<u32>,
+    pub tab_bend: bool,
+    pub tab_hopo: bool,
+    pub grace_slash: bool,
+    pub xstaff_abs: Option<u32>,
+    // Layer 2
+    pub full_articulations: Vec<String>,
+    pub numbered_slurs: Vec<String>,
+    pub numbered_hairpins: Vec<String>,
+    pub ottava_15: Vec<String>,
+    pub pedals: Vec<String>,
+    // Layer 3
+    /// `(verse, syllabic_token, text)`
+    pub lyrics: Vec<(u32, String, String)>,
+    /// `(block_tag, text)` e.g. `("<harm>", "Cmaj7")`
+    pub text_spans: Vec<(String, String)>,
+}
+
 /// First-seen header per document-global staff: initial clef, key and
 /// time signature. Later mid-score changes are ignored — bekern headers
 /// are score-initial. Missing clefs default to G/2.
@@ -515,30 +590,82 @@ pub struct StaffHeader {
     pub key_fifths: i32,
     pub beats: u32,
     pub beat_type: u32,
+    /// Optional `bekern-full` Layer 0 header metadata (ignored by `v1`/`v2`).
+    pub full: Option<Box<FullStaffHeaderExt>>,
 }
 
 /// Per-part header state while walking: global base staff, clefs keyed
-/// by part-local staff number, first key/time, highest staff seen.
+/// by part-local staff number, first key/time, highest staff seen, full ext.
 type PartHeader = (
     u32,
     Vec<(u32, char, u32, Option<i32>)>,
     Option<i32>,
     Option<TimeSig>,
     u32,
+    FullStaffHeaderExt,
 );
+
+/// Parse `<part-list>` to extract `(part_id, part_name, opening_group_symbol)` per part.
+fn parse_part_list_meta(xml: &str) -> Vec<(Option<String>, Option<String>, Option<String>)> {
+    let Some(pl) = block_inclusive(xml, "part-list") else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    let mut pending_group: Option<String> = None;
+    let mut rest = pl;
+    while let Some(p) = rest.find('<') {
+        rest = &rest[p..];
+        if rest.starts_with("<part-group") {
+            let e = rest
+                .find("</part-group>")
+                .map(|q| q + "</part-group>".len())
+                .or_else(|| rest.find('>').map(|q| q + 1))
+                .unwrap_or(rest.len());
+            let blk = &rest[..e];
+            if blk.contains("type=\"start\"") {
+                if let Some(sym) = tag_text(blk, "group-symbol") {
+                    let s = sym.to_ascii_lowercase();
+                    if matches!(s.as_str(), "brace" | "bracket" | "barline" | "line") {
+                        pending_group = Some(if s == "line" { "barline".to_string() } else { s });
+                    }
+                }
+            }
+            rest = &rest[e..];
+        } else if rest.starts_with("<score-part") {
+            let e = rest
+                .find("</score-part>")
+                .map(|q| q + "</score-part>".len())
+                .unwrap_or(rest.len());
+            let blk = &rest[..e];
+            let id = attr_value(blk, "id");
+            let name = tag_text(blk, "part-name");
+            out.push((id, name, pending_group.take()));
+            rest = &rest[e..];
+        } else {
+            match rest.find('>') {
+                Some(q) => rest = &rest[q + 1..],
+                None => break,
+            }
+        }
+    }
+    out
+}
 
 /// Collect [`StaffHeader`]s in document-global staff order. Staff
 /// indexing mirrors [`score_events`] exactly (same `staff_base`
 /// accumulation), so headers line up with event `staff` fields.
 pub fn staff_headers(xml: &str) -> Result<Vec<StaffHeader>, String> {
+    let pl_meta = parse_part_list_meta(xml);
     let mut parts: Vec<PartHeader> = Vec::new();
     let mut staff_base = 0u32;
-    for part_xml in elements(xml, "part") {
+    for (pidx, part_xml) in elements(xml, "part").into_iter().enumerate() {
         let mut clefs: Vec<(u32, char, u32, Option<i32>)> = Vec::new();
         let mut key: Option<i32> = None;
         let mut time: Option<TimeSig> = None;
         let mut part_staves = 1u32;
         let mut last_staff = 1u32;
+        let mut staff_lines: Option<u32> = None;
+        let mut transpose: Option<(i32, i32)> = None;
         for meas in elements(part_xml, "measure") {
             for it in measure_items(meas) {
                 match it {
@@ -557,6 +684,12 @@ pub fn staff_headers(xml: &str) -> Result<Vec<StaffHeader>, String> {
                         if time.is_none() {
                             time = a.time;
                         }
+                        if staff_lines.is_none() {
+                            staff_lines = a.staff_lines;
+                        }
+                        if transpose.is_none() {
+                            transpose = a.transpose;
+                        }
                     }
                     Item::Note(n) => {
                         // Same staff tracking as score_events.
@@ -568,7 +701,19 @@ pub fn staff_headers(xml: &str) -> Result<Vec<StaffHeader>, String> {
                 }
             }
         }
-        parts.push((staff_base, clefs, key, time, part_staves));
+        let (part_id, part_name, group_start) = pl_meta
+            .get(pidx)
+            .cloned()
+            .unwrap_or((None, None, None));
+        let full_ext = FullStaffHeaderExt {
+            part_index: pidx as u32,
+            part_id,
+            part_name,
+            staff_lines,
+            group_start,
+            transpose,
+        };
+        parts.push((staff_base, clefs, key, time, part_staves, full_ext));
         staff_base += part_staves;
     }
     Ok(emit_headers(&parts))
@@ -585,10 +730,11 @@ pub fn staff_headers(xml: &str) -> Result<Vec<StaffHeader>, String> {
 /// below 1 clamp to 1, values past the last measure behave like
 /// [`staff_headers`] except clefs are last-wins instead of first-wins.
 pub fn staff_headers_at_measure(xml: &str, start_measure: u32) -> Result<Vec<StaffHeader>, String> {
+    let pl_meta = parse_part_list_meta(xml);
     let start = start_measure.max(1);
     let mut parts: Vec<PartHeader> = Vec::new();
     let mut staff_base = 0u32;
-    for part_xml in elements(xml, "part") {
+    for (pidx, part_xml) in elements(xml, "part").into_iter().enumerate() {
         let measures = elements(part_xml, "measure");
         // Full-score staff count for stable global indexing (same as
         // `staff_headers`): the header walk below only *applies*
@@ -615,6 +761,8 @@ pub fn staff_headers_at_measure(xml: &str, start_measure: u32) -> Result<Vec<Sta
         let mut clefs: Vec<(u32, char, u32, Option<i32>)> = Vec::new();
         let mut key: Option<i32> = None;
         let mut time: Option<TimeSig> = None;
+        let mut staff_lines: Option<u32> = None;
+        let mut transpose: Option<(i32, i32)> = None;
         for (ordinal0, meas) in measures.iter().enumerate() {
             let meas_num = ordinal0 as u32 + 1;
             if meas_num > start {
@@ -635,6 +783,12 @@ pub fn staff_headers_at_measure(xml: &str, start_measure: u32) -> Result<Vec<Sta
                         if a.time.is_some() {
                             time = a.time;
                         }
+                        if a.staff_lines.is_some() {
+                            staff_lines = a.staff_lines;
+                        }
+                        if a.transpose.is_some() {
+                            transpose = a.transpose;
+                        }
                     }
                     Item::Note(_) | Item::Backup(_) | Item::Forward(_) if meas_num == start => {
                         // Mid-measure `<attributes>` (e.g. a clef change after
@@ -646,7 +800,19 @@ pub fn staff_headers_at_measure(xml: &str, start_measure: u32) -> Result<Vec<Sta
                 }
             }
         }
-        parts.push((staff_base, clefs, key, time, part_staves));
+        let (part_id, part_name, group_start) = pl_meta
+            .get(pidx)
+            .cloned()
+            .unwrap_or((None, None, None));
+        let full_ext = FullStaffHeaderExt {
+            part_index: pidx as u32,
+            part_id,
+            part_name,
+            staff_lines,
+            group_start,
+            transpose,
+        };
+        parts.push((staff_base, clefs, key, time, part_staves, full_ext));
         staff_base += part_staves;
     }
     Ok(emit_headers(&parts))
@@ -657,7 +823,7 @@ pub fn staff_headers_at_measure(xml: &str, start_measure: u32) -> Result<Vec<Sta
 /// index staves identically.
 fn emit_headers(parts: &[PartHeader]) -> Vec<StaffHeader> {
     let mut out = Vec::new();
-    for (base, clefs, key, time, max_staff) in parts {
+    for (base, clefs, key, time, max_staff, full_ext) in parts {
         let t = time.unwrap_or(TimeSig {
             beats: 4,
             beat_type: 4,
@@ -668,6 +834,10 @@ fn emit_headers(parts: &[PartHeader]) -> Vec<StaffHeader> {
                 .find(|c| c.0 == local)
                 .map(|c| (c.1, c.2, c.3))
                 .unwrap_or(('G', 2, None));
+            let mut ext = full_ext.clone();
+            if local > 1 {
+                ext.group_start = None;
+            }
             out.push(StaffHeader {
                 staff: base + local - 1,
                 clef_sign: sign,
@@ -676,6 +846,7 @@ fn emit_headers(parts: &[PartHeader]) -> Vec<StaffHeader> {
                 key_fifths: key.unwrap_or(0),
                 beats: t.beats,
                 beat_type: t.beat_type,
+                full: Some(Box::new(ext)),
             });
         }
     }
@@ -938,6 +1109,8 @@ pub struct BekernNote {
     pub barline_right: Option<String>,
     /// Opening volta bracket (`volta-1` | `volta-2`), if any.
     pub volta: Option<String>,
+    /// Optional `bekern-full` 4-layer metadata (ignored by `v1`/`v2`).
+    pub full: Option<Box<FullBekernNoteExt>>,
 }
 
 /// Flatten a Partwise 3.1 document to [`BekernNote`]s: same cursors,
@@ -985,6 +1158,17 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
         let mut pend_ottava: Option<String> = None;
         let mut pend_bleft: Option<String> = None;
         let mut pend_volta: Option<String> = None;
+        // `bekern-full` pending Layer 0/2/3 state for this part.
+        let mut cur_instrument: Option<String> = None;
+        let mut active_15_dir: Option<&'static str> = None; // "15ma" or "15mb"
+        let mut pend_multirest: Option<u32> = None;
+        let mut pend_mrep: Option<u32> = None;
+        let mut pend_inst_change: Option<String> = None;
+        let mut pend_nav: Vec<String> = Vec::new();
+        let mut pend_num_hairpins: Vec<String> = Vec::new();
+        let mut pend_ottava_15: Vec<String> = Vec::new();
+        let mut pend_pedals: Vec<String> = Vec::new();
+        let mut pend_text_spans: Vec<(String, String)> = Vec::new();
         // A closing barline seen before any carrier event of its measure
         // (unusual order): held until the measure's next event arrives.
         let mut held_bright: Option<(u32, String)> = None;
@@ -998,6 +1182,10 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
         for (ordinal0, meas) in elements(part_xml, "measure").into_iter().enumerate() {
             let measure = ordinal0 as u32 + 1;
             last_ordinal = measure;
+            let meas_open = meas.find('>').map(|q| &meas[..q]).unwrap_or("");
+            let is_pickup = meas_open.contains("implicit=\"yes\"")
+                || attr_value(meas_open, "number").as_deref() == Some("0");
+            let mut pend_pickup = is_pickup;
             // A held barline whose measure produced no carrier event is
             // lost (an event-free measure carries nothing by design).
             if let Some((hm, _)) = &held_bright {
@@ -1040,6 +1228,21 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                         if let Some(tok) = pend_volta.take() {
                             out[idx].volta = Some(tok);
                         }
+                        if !pend_nav.is_empty()
+                            || !pend_num_hairpins.is_empty()
+                            || !pend_ottava_15.is_empty()
+                            || !pend_pedals.is_empty()
+                            || !pend_text_spans.is_empty()
+                        {
+                            let f = out[idx]
+                                .full
+                                .get_or_insert_with(|| Box::new(FullBekernNoteExt::default()));
+                            f.navigation.append(&mut pend_nav);
+                            f.numbered_hairpins.append(&mut pend_num_hairpins);
+                            f.ottava_15.append(&mut pend_ottava_15);
+                            f.pedals.append(&mut pend_pedals);
+                            f.text_spans.append(&mut pend_text_spans);
+                        }
                     }
                 }
                 pend_dyn = None;
@@ -1050,6 +1253,14 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                 pend_ottava = None;
                 pend_bleft = None;
                 pend_volta = None;
+                pend_multirest = None;
+                pend_mrep = None;
+                pend_inst_change = None;
+                pend_nav.clear();
+                pend_num_hairpins.clear();
+                pend_ottava_15.clear();
+                pend_pedals.clear();
+                pend_text_spans.clear();
             }
             let div = divisions as f64;
             let mut cursor = 0i64;
@@ -1084,8 +1295,20 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                                 cur_time = Some(v);
                             }
                         }
+                        if let Some(mr) = a.multirest {
+                            pend_multirest = Some(mr);
+                        }
+                        if let Some(mrep) = a.measure_repeat {
+                            pend_mrep = Some(mrep);
+                        }
                     }
                     Item::NewPage(_) | Item::NewSystem => {}
+                    Item::Harmony(h) => {
+                        pend_text_spans.push(("<harm>".to_string(), h));
+                    }
+                    Item::FiguredBass(fb) => {
+                        pend_text_spans.push(("<fb>".to_string(), fb));
+                    }
                     Item::Direction(d) => {
                         if let Some(tok) = d.dynamic {
                             pend_dyn = Some(tok);
@@ -1102,6 +1325,41 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                         }
                         if let Some(tok) = d.ottava {
                             pend_ottava = Some(tok);
+                        }
+                        if let Some(tok) = d.full_hairpin {
+                            pend_num_hairpins.push(tok);
+                        }
+                        if let Some(tok) = d.ottava_15 {
+                            match tok.as_str() {
+                                "15ma-open" => {
+                                    active_15_dir = Some("15ma");
+                                    pend_ottava_15.push(tok);
+                                }
+                                "15mb-open" => {
+                                    active_15_dir = Some("15mb");
+                                    pend_ottava_15.push(tok);
+                                }
+                                "15-stop" => {
+                                    let close_tok = match active_15_dir.take() {
+                                        Some("15mb") => "15mb-close",
+                                        _ => "15ma-close",
+                                    };
+                                    pend_ottava_15.push(close_tok.to_string());
+                                }
+                                _ => {}
+                            }
+                        }
+                        if let Some(tok) = d.pedal {
+                            pend_pedals.push(tok);
+                        }
+                        if !d.navigation.is_empty() {
+                            pend_nav.extend(d.navigation);
+                        }
+                        if let Some(ic) = d.inst_change {
+                            pend_inst_change = Some(ic);
+                        }
+                        if !d.text_spans.is_empty() {
+                            pend_text_spans.extend(d.text_spans);
                         }
                     }
                     Item::Barline(b) => {
@@ -1152,6 +1410,23 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                         } else {
                             None
                         };
+                        let xstaff_abs = if local != home_staff { Some(local) } else { None };
+                        if let Some(inst_id) = n.instrument_id.as_deref() {
+                            if let Some(prev_id) = cur_instrument.as_deref() {
+                                if prev_id != inst_id {
+                                    pend_inst_change = Some(inst_id.to_string());
+                                    cur_instrument = Some(inst_id.to_string());
+                                }
+                            } else {
+                                cur_instrument = Some(inst_id.to_string());
+                            }
+                        }
+                        let mut full_ext = n.full;
+                        if let Some(abs_st) = xstaff_abs {
+                            full_ext
+                                .get_or_insert_with(|| Box::new(FullBekernNoteExt::default()))
+                                .xstaff_abs = Some(abs_st);
+                        }
                         let note_grace_seq = if n.grace {
                             if !n.chord {
                                 grace_seq += 1;
@@ -1194,6 +1469,7 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                             barline_left: None,
                             barline_right: None,
                             volta: None,
+                            full: full_ext,
                         };
                         // State changes attach to the next non-chord
                         // event, keeping chord runs token-adjacent.
@@ -1216,6 +1492,48 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                             if let Some((hm, tok)) = held_bright.take() {
                                 if hm == measure {
                                     ev.barline_right = Some(tok);
+                                }
+                            }
+                            let has_pend_full = pend_pickup
+                                || pend_multirest.is_some()
+                                || pend_mrep.is_some()
+                                || pend_inst_change.is_some()
+                                || !pend_nav.is_empty()
+                                || !pend_num_hairpins.is_empty()
+                                || !pend_ottava_15.is_empty()
+                                || !pend_pedals.is_empty()
+                                || !pend_text_spans.is_empty();
+                            if has_pend_full {
+                                let f = ev
+                                    .full
+                                    .get_or_insert_with(|| Box::new(FullBekernNoteExt::default()));
+                                if pend_pickup {
+                                    f.pickup = true;
+                                    pend_pickup = false;
+                                }
+                                if let Some(mr) = pend_multirest.take() {
+                                    f.multirest = Some(mr);
+                                }
+                                if let Some(mrep) = pend_mrep.take() {
+                                    f.measure_repeat = Some(mrep);
+                                }
+                                if let Some(ic) = pend_inst_change.take() {
+                                    f.inst_change = Some(ic);
+                                }
+                                if !pend_nav.is_empty() {
+                                    f.navigation.append(&mut pend_nav);
+                                }
+                                if !pend_num_hairpins.is_empty() {
+                                    f.numbered_hairpins.append(&mut pend_num_hairpins);
+                                }
+                                if !pend_ottava_15.is_empty() {
+                                    f.ottava_15.append(&mut pend_ottava_15);
+                                }
+                                if !pend_pedals.is_empty() {
+                                    f.pedals.append(&mut pend_pedals);
+                                }
+                                if !pend_text_spans.is_empty() {
+                                    f.text_spans.append(&mut pend_text_spans);
                                 }
                             }
                         }
@@ -1258,6 +1576,21 @@ pub fn bekern_events(xml: &str) -> Result<Vec<BekernNote>, String> {
                 }
                 if let Some(tok) = pend_volta.take() {
                     out[idx].volta = Some(tok);
+                }
+                if !pend_nav.is_empty()
+                    || !pend_num_hairpins.is_empty()
+                    || !pend_ottava_15.is_empty()
+                    || !pend_pedals.is_empty()
+                    || !pend_text_spans.is_empty()
+                {
+                    let f = out[idx]
+                        .full
+                        .get_or_insert_with(|| Box::new(FullBekernNoteExt::default()));
+                    f.navigation.append(&mut pend_nav);
+                    f.numbered_hairpins.append(&mut pend_num_hairpins);
+                    f.ottava_15.append(&mut pend_ottava_15);
+                    f.pedals.append(&mut pend_pedals);
+                    f.text_spans.append(&mut pend_text_spans);
                 }
             }
         }
@@ -1424,7 +1757,9 @@ pub fn score_events(xml: &str) -> Result<Vec<ScoreEvent>, String> {
                     | Item::NewPage(_)
                     | Item::NewSystem
                     | Item::Direction(_)
-                    | Item::Barline(_) => {}
+                    | Item::Barline(_)
+                    | Item::Harmony(_)
+                    | Item::FiguredBass(_) => {}
                     // No lower clamp: the reference lets the cursor go
                     // negative on over-long backups.
                     Item::Backup(d) => {
@@ -1541,8 +1876,12 @@ pub fn notation_events(xml: &str) -> Result<Vec<NotationEvent>, String> {
             let mut last_plain: Option<usize> = None;
             for it in items {
                 match it {
-                    Item::Attributes(_) | Item::NewPage(_) | Item::NewSystem | Item::Barline(_) => {
-                    }
+                    Item::Attributes(_)
+                    | Item::NewPage(_)
+                    | Item::NewSystem
+                    | Item::Barline(_)
+                    | Item::Harmony(_)
+                    | Item::FiguredBass(_) => {}
                     Item::Direction(d) => {
                         if let Some(tok) = d.notation_dynamic {
                             pend_dyns.push(tok);
@@ -1649,6 +1988,8 @@ enum Item {
     Note(NoteEv),
     Direction(DirEv),
     Barline(BarEv),
+    Harmony(String),
+    FiguredBass(String),
 }
 
 fn measure_items(meas: &str) -> Vec<Item> {
@@ -1754,9 +2095,36 @@ fn measure_items(meas: &str) -> Vec<Item> {
                     None => break,
                 },
             }
+        } else if rest.starts_with("<harmony") {
+            match rest.find("</harmony>") {
+                Some(q) => {
+                    let e = q + "</harmony>".len();
+                    if let Some(h) = parse_harmony(&rest[..e]) {
+                        out.push(Item::Harmony(h));
+                    }
+                    rest = &rest[e..];
+                }
+                None => match rest.find('>') {
+                    Some(q) => rest = &rest[q + 1..],
+                    None => break,
+                },
+            }
+        } else if rest.starts_with("<figured-bass") {
+            match rest.find("</figured-bass>") {
+                Some(q) => {
+                    let e = q + "</figured-bass>".len();
+                    if let Some(fb) = parse_figured_bass(&rest[..e]) {
+                        out.push(Item::FiguredBass(fb));
+                    }
+                    rest = &rest[e..];
+                }
+                None => match rest.find('>') {
+                    Some(q) => rest = &rest[q + 1..],
+                    None => break,
+                },
+            }
         } else {
-            // Unknown element (direction, harmony, figured-bass, ...):
-            // skip one tag.
+            // Unknown element: skip one tag.
             match rest.find('>') {
                 Some(q) => rest = &rest[q + 1..],
                 None => break,
@@ -1813,20 +2181,106 @@ fn parse_attributes(s: &str) -> AttrEv {
             break;
         }
     }
+    let staff_lines = tag_text(s, "staff-lines").and_then(|v| v.parse::<u32>().ok());
+    let transpose = block_inclusive(s, "transpose").and_then(|tb| {
+        let dia = tag_text(tb, "diatonic").and_then(|v| v.parse::<i32>().ok());
+        let chr = tag_text(tb, "chromatic").and_then(|v| v.parse::<i32>().ok());
+        match (dia, chr) {
+            (Some(d), Some(c)) => Some((d, c)),
+            (None, Some(c)) => Some((0, c)),
+            _ => None,
+        }
+    });
+    let multirest = tag_text(s, "multiple-rest")
+        .and_then(|v| v.parse::<u32>().ok())
+        .filter(|&n| n > 0);
+    let measure_repeat = block_inclusive(s, "measure-repeat").and_then(|mr| {
+        if mr.contains("type=\"start\"") {
+            tag_text(mr, "measure-repeat")
+                .and_then(|v| v.parse::<u32>().ok())
+                .or(Some(1))
+        } else {
+            None
+        }
+    });
     AttrEv {
         divisions,
         time,
         key_fifths,
         staves,
         clefs,
+        staff_lines,
+        transpose,
+        multirest,
+        measure_repeat,
+    }
+}
+
+fn parse_harmony(s: &str) -> Option<String> {
+    if let Some(kb) = block_inclusive(s, "kind") {
+        if let Some(txt) = attr_value(kb, "text") {
+            let trimmed = txt.trim();
+            if !trimmed.is_empty() {
+                return Some(trimmed.to_string());
+            }
+        }
+    }
+    let root = tag_text(s, "root-step")?;
+    let alter = match tag_text(s, "root-alter").and_then(|v| v.parse::<i32>().ok()) {
+        Some(1) => "#",
+        Some(-1) => "b",
+        _ => "",
+    };
+    let kind = tag_text(s, "kind").unwrap_or_default();
+    let suffix = match kind.as_str() {
+        "" | "major" => "",
+        "minor" => "m",
+        "dominant" => "7",
+        "major-seventh" => "maj7",
+        "minor-seventh" => "m7",
+        "diminished" => "dim",
+        "augmented" => "aug",
+        other => other,
+    };
+    Some(format!("{root}{alter}{suffix}"))
+}
+
+fn parse_figured_bass(s: &str) -> Option<String> {
+    let mut nums = Vec::new();
+    let mut rest = s;
+    while let Some(p) = rest.find("<figure-number") {
+        let sub = &rest[p..];
+        if let Some(num) = tag_text(sub, "figure-number") {
+            if !num.is_empty() {
+                nums.push(num);
+            }
+        }
+        match sub.find("</figure-number>") {
+            Some(q) => rest = &sub[q + "</figure-number>".len()..],
+            None => break,
+        }
+    }
+    if nums.is_empty() {
+        None
+    } else {
+        Some(nums.join("/"))
     }
 }
 
 fn parse_note(s: &str) -> NoteEv {
     let grace = has_open(s, "grace");
+    let grace_slash = match s.find("<grace") {
+        Some(p) => {
+            let t = &s[p..];
+            let e = t.find('>').map(|q| q + 1).unwrap_or(t.len());
+            t[..e].contains("slash=\"yes\"")
+        }
+        None => false,
+    };
     let cue = has_open(s, "cue");
     let chord = has_open(s, "chord");
     let rest = has_open(s, "rest");
+    let unpitched = !rest && has_open(s, "unpitched");
     // Whole-bar rest (`<rest measure="yes"/>`): a single `bar-rest`
     // token regardless of meter (4.5 beats in 9/8 has no plain token).
     let measure_rest = match s.find("<rest") {
@@ -1851,6 +2305,7 @@ fn parse_note(s: &str) -> NoteEv {
         }
         pos += p + e;
     }
+    let mut microtone: Option<String> = None;
     let pitch = if rest {
         None
     } else {
@@ -1858,15 +2313,123 @@ fn parse_note(s: &str) -> NoteEv {
             .or_else(|| tag_text(s, "display-step"))
             .and_then(|v| v.chars().next())
             .unwrap_or('C');
-        let alter = tag_text(s, "alter")
-            .and_then(|v| v.parse::<i32>().ok())
-            .unwrap_or(0);
+        let alter_raw = tag_text(s, "alter");
+        let alter = if let Some(ar) = alter_raw.as_deref() {
+            if let Ok(iv) = ar.parse::<i32>() {
+                iv
+            } else if let Ok(fv) = ar.parse::<f64>() {
+                if (fv - 0.5).abs() < 0.1 {
+                    microtone = Some("q#".to_string());
+                    0
+                } else if (fv + 0.5).abs() < 0.1 {
+                    microtone = Some("qb".to_string());
+                    0
+                } else if (fv - 1.5).abs() < 0.1 {
+                    microtone = Some("3q#".to_string());
+                    0
+                } else if (fv + 1.5).abs() < 0.1 {
+                    microtone = Some("3qb".to_string());
+                    0
+                } else {
+                    fv.round() as i32
+                }
+            } else {
+                0
+            }
+        } else {
+            0
+        };
         let octave = tag_text(s, "octave")
             .or_else(|| tag_text(s, "display-octave"))
             .and_then(|v| v.parse::<i32>().ok())
             .unwrap_or(4);
         Some((step.to_ascii_uppercase(), alter, octave))
     };
+    let mut explicit_natural = false;
+    let mut acc_cautionary = false;
+    let mut acc_parentheses = false;
+    if let Some(ab) = block_inclusive(s, "accidental") {
+        let open_end = ab.find('>').unwrap_or(ab.len());
+        let open_tag = &ab[..open_end];
+        if open_tag.contains("cautionary=\"yes\"") {
+            acc_cautionary = true;
+        }
+        if open_tag.contains("parentheses=\"yes\"") {
+            acc_parentheses = true;
+        }
+        if let Some(acc_txt) = tag_text(ab, "accidental") {
+            match acc_txt.as_str() {
+                "natural" => explicit_natural = true,
+                "quarter-sharp" if microtone.is_none() => microtone = Some("q#".to_string()),
+                "quarter-flat" if microtone.is_none() => microtone = Some("qb".to_string()),
+                "three-quarters-sharp" if microtone.is_none() => {
+                    microtone = Some("3q#".to_string())
+                }
+                "three-quarters-flat" if microtone.is_none() => {
+                    microtone = Some("3qb".to_string())
+                }
+                _ => {}
+            }
+        }
+    }
+    let stem = tag_text(s, "stem").and_then(|st| match st.as_str() {
+        "up" => Some("stem-up".to_string()),
+        "down" => Some("stem-down".to_string()),
+        _ => None,
+    });
+    let beam = block_inclusive(s, "beam").and_then(|bb| {
+        let txt = tag_text(bb, "beam")?;
+        match txt.as_str() {
+            "begin" => Some("beam-start".to_string()),
+            "continue" => Some("beam-cont".to_string()),
+            "end" => Some("beam-end".to_string()),
+            "backward hook" => Some("beam-hook-l".to_string()),
+            "forward hook" => Some("beam-hook-r".to_string()),
+            _ => None,
+        }
+    });
+    let notehead = tag_text(s, "notehead").and_then(|nh| match nh.as_str() {
+        "x" => Some("nh-x".to_string()),
+        "diamond" => Some("nh-diamond".to_string()),
+        "slash" => Some("nh-slash".to_string()),
+        "triangle" => Some("nh-triangle".to_string()),
+        "circle-x" => Some("nh-circle-x".to_string()),
+        "square" => Some("nh-square".to_string()),
+        _ => None,
+    });
+    let instrument_id = s.find("<instrument").and_then(|p| {
+        let t = &s[p..];
+        let e = t.find('>').map(|q| q + 1).unwrap_or(t.len());
+        attr_value(&t[..e], "id")
+    });
+    // Parse `<lyric>` elements for Layer 3.
+    let mut lyrics: Vec<(u32, String, String)> = Vec::new();
+    let mut lpos = 0;
+    while let Some(p) = s[lpos..].find("<lyric") {
+        let sub = &s[lpos + p..];
+        let Some(end_rel) = sub.find("</lyric>") else {
+            break;
+        };
+        let end = end_rel + "</lyric>".len();
+        let blk = &sub[..end];
+        let open_end = blk.find('>').unwrap_or(blk.len());
+        let verse = attr_value(&blk[..open_end], "number")
+            .and_then(|v| v.parse::<u32>().ok())
+            .unwrap_or(1)
+            .max(1);
+        if let Some(txt) = tag_text(blk, "text") {
+            let has_ext = has_open(blk, "extend");
+            let syl = match tag_text(blk, "syllabic").as_deref() {
+                Some("begin") => "lyr-beg",
+                Some("middle") => "lyr-mid",
+                Some("end") => "lyr-end",
+                _ if has_ext => "lyr-ext",
+                _ => "lyr-end",
+            };
+            lyrics.push((verse, syl.to_string(), txt));
+        }
+        lpos += p + end;
+    }
     let tuplet_ratio = match (
         tag_text(s, "actual-notes").and_then(|v| v.parse::<u32>().ok()),
         tag_text(s, "normal-notes").and_then(|v| v.parse::<u32>().ok()),
@@ -1898,7 +2461,18 @@ fn parse_note(s: &str) -> NoteEv {
     }
     let duration = tag_text(s, "duration").and_then(|v| v.parse::<i64>().ok());
     let grace_type = if grace { tag_text(s, "type") } else { None };
-    let (slur_start, slur_stop, articulations, v2_articulations) = parse_notations(s);
+    let (
+        slur_start,
+        slur_stop,
+        articulations,
+        v2_articulations,
+        full_arts,
+        numbered_slurs,
+        tab_string,
+        tab_fret,
+        tab_bend,
+        tab_hopo,
+    ) = parse_notations(s);
     let voice = tag_text(s, "voice")
         .and_then(|v| v.parse::<u32>().ok())
         .unwrap_or(1);
@@ -1911,6 +2485,45 @@ fn parse_note(s: &str) -> NoteEv {
             None
         }
     });
+    let has_full = grace_slash
+        || microtone.is_some()
+        || explicit_natural
+        || acc_cautionary
+        || acc_parentheses
+        || stem.is_some()
+        || beam.is_some()
+        || unpitched
+        || notehead.is_some()
+        || tab_string.is_some()
+        || tab_fret.is_some()
+        || tab_bend
+        || tab_hopo
+        || !full_arts.is_empty()
+        || !numbered_slurs.is_empty()
+        || !lyrics.is_empty();
+    let full = if has_full {
+        Some(Box::new(FullBekernNoteExt {
+            microtone,
+            explicit_natural,
+            acc_cautionary,
+            acc_parentheses,
+            stem,
+            beam,
+            unpitched,
+            notehead,
+            tab_string,
+            tab_fret,
+            tab_bend,
+            tab_hopo,
+            grace_slash,
+            full_articulations: full_arts,
+            numbered_slurs,
+            lyrics,
+            ..Default::default()
+        }))
+    } else {
+        None
+    };
     NoteEv {
         pitch,
         duration,
@@ -1930,38 +2543,83 @@ fn parse_note(s: &str) -> NoteEv {
         tuplet_start,
         tuplet_stop,
         measure_rest,
+        full,
+        instrument_id,
     }
 }
 
 /// Slur endpoints + closed-subset modifiers (`stacc`, `accent`, `tenuto`,
-/// `fermata`) + extended `bekern+v2` modifiers (`art-*`) from a note body.
-fn parse_notations(s: &str) -> (bool, bool, Vec<String>, Vec<String>) {
+/// `fermata`) + extended `bekern+v2` modifiers (`art-*`) + lossless `bekern-full`
+/// Layer 1/2 modifiers from a note body.
+#[allow(clippy::type_complexity)]
+fn parse_notations(
+    s: &str,
+) -> (
+    bool,
+    bool,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Vec<String>,
+    Option<u32>,
+    Option<u32>,
+    bool,
+    bool,
+) {
     let Some(block) = block_inclusive(s, "notations") else {
-        return (false, false, Vec::new(), Vec::new());
+        return (
+            false,
+            false,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            None,
+            None,
+            false,
+            false,
+        );
     };
     let mut start = false;
     let mut stop = false;
+    let mut numbered_slurs = Vec::new();
     let mut pos = 0;
     while let Some(p) = block[pos..].find("<slur") {
         let tag = &block[pos + p..];
         let end = tag.find('>').map(|q| q + 1).unwrap_or(tag.len());
         let t = &tag[..end];
+        let num = attr_value(t, "number")
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(1)
+            .clamp(1, 4);
         if t.contains("type=\"start\"") {
             start = true;
+            numbered_slurs.push(format!("slur-{num}-open"));
         }
         if t.contains("type=\"stop\"") {
             stop = true;
+            numbered_slurs.push(format!("slur-{num}-close"));
         }
         pos += p + end;
     }
     let mut arts = Vec::new();
     let mut v2_arts = Vec::new();
+    let mut full_arts = Vec::new();
+    let mut tab_string = None;
+    let mut tab_fret = None;
+    let mut tab_bend = false;
+    let mut tab_hopo = false;
     if let Some(ab) = block_inclusive(block, "articulations") {
         if ab.contains("<staccato") {
             arts.push("stacc".to_string());
         }
-        if ab.contains("<accent") || ab.contains("strong-accent") {
+        let has_plain_accent = ab.contains("<accent");
+        let has_strong_accent = ab.contains("<strong-accent");
+        if has_plain_accent || has_strong_accent {
             arts.push("accent".to_string());
+        }
+        if has_strong_accent {
+            full_arts.push("marcato".to_string());
         }
         if ab.contains("<tenuto") {
             arts.push("tenuto".to_string());
@@ -1972,19 +2630,59 @@ fn parse_notations(s: &str) -> (bool, bool, Vec<String>, Vec<String>) {
         if ab.contains("<soft-accent") {
             v2_arts.push("art-soft-accent".to_string());
         }
+        if ab.contains("<breath-mark") {
+            full_arts.push("breath".to_string());
+        }
+        if ab.contains("<caesura") {
+            full_arts.push("caesura".to_string());
+        }
     }
     if let Some(ob) = block_inclusive(block, "ornaments") {
         if ob.contains("<trill-mark") {
             v2_arts.push("art-trill".to_string());
         }
-        if ob.contains("<tremolo") {
+        if let Some(tr_blk) = block_inclusive(ob, "tremolo") {
             v2_arts.push("art-tremolo".to_string());
+            if tr_blk.contains("type=\"start\"") || tr_blk.contains("type=\"stop\"") {
+                full_arts.push("tremolo-2n".to_string());
+            } else {
+                let strokes = tag_text(tr_blk, "tremolo").unwrap_or_default();
+                let tok = match strokes.as_str() {
+                    "1" => "tremolo-1",
+                    "2" => "tremolo-2",
+                    _ => "tremolo-3",
+                };
+                full_arts.push(tok.to_string());
+            }
+        } else if ob.contains("<tremolo") {
+            v2_arts.push("art-tremolo".to_string());
+            full_arts.push("tremolo-3".to_string());
         }
-        if ob.contains("<mordent") || ob.contains("<inverted-mordent") {
+        if ob.contains("<inverted-mordent") {
             v2_arts.push("art-mordent".to_string());
+            full_arts.push("mordent-up".to_string());
+        } else if ob.contains("<mordent") {
+            v2_arts.push("art-mordent".to_string());
+            full_arts.push("mordent-lo".to_string());
         }
-        if ob.contains("<turn") || ob.contains("<inverted-turn") || ob.contains("<delayed-turn") {
+        if ob.contains("<inverted-turn") {
             v2_arts.push("art-turn".to_string());
+            full_arts.push("turn-inv".to_string());
+        } else if ob.contains("<turn") || ob.contains("<delayed-turn") {
+            v2_arts.push("art-turn".to_string());
+            full_arts.push("turn".to_string());
+        }
+        let mut wpos = 0;
+        while let Some(p) = ob[wpos..].find("<wavy-line") {
+            let tag = &ob[wpos + p..];
+            let end = tag.find('>').map(|q| q + 1).unwrap_or(tag.len());
+            let t = &tag[..end];
+            if t.contains("type=\"start\"") {
+                full_arts.push("trill-line-open".to_string());
+            } else if t.contains("type=\"stop\"") {
+                full_arts.push("trill-line-close".to_string());
+            }
+            wpos += p + end;
         }
     }
     if let Some(tb) = block_inclusive(block, "technical") {
@@ -1994,14 +2692,68 @@ fn parse_notations(s: &str) -> (bool, bool, Vec<String>, Vec<String>) {
         if tb.contains("<down-bow") {
             v2_arts.push("art-down-bow".to_string());
         }
+        if let Some(fing) = tag_text(tb, "fingering") {
+            if let Ok(n) = fing.parse::<u8>() {
+                if (1..=5).contains(&n) {
+                    full_arts.push(format!("fing-{n}"));
+                }
+            }
+        }
+        if tb.contains("<harmonic") {
+            full_arts.push("harmonics".to_string());
+        }
+        tab_string = tag_text(tb, "string").and_then(|v| v.parse::<u32>().ok());
+        tab_fret = tag_text(tb, "fret").and_then(|v| v.parse::<u32>().ok());
+        if tb.contains("<bend") {
+            tab_bend = true;
+        }
+        if tb.contains("<hammer-on") || tb.contains("<pull-off") {
+            tab_hopo = true;
+        }
     }
     if block.contains("<fermata") {
         arts.push("fermata".to_string());
     }
-    if block.contains("<arpeggiate") {
+    if let Some(p) = block.find("<arpeggiate") {
         v2_arts.push("art-arpeggiate".to_string());
+        let tag = &block[p..];
+        let end = tag.find('>').map(|q| q + 1).unwrap_or(tag.len());
+        let t = &tag[..end];
+        if t.contains("direction=\"up\"") {
+            full_arts.push("arp-up".to_string());
+        } else if t.contains("direction=\"down\"") {
+            full_arts.push("arp-down".to_string());
+        }
     }
-    (start, stop, arts, v2_arts)
+    if block.contains("<non-arpeggiate") {
+        full_arts.push("arp-non".to_string());
+    }
+    for g_tag in ["<glissando", "<slide"] {
+        let mut gpos = 0;
+        while let Some(p) = block[gpos..].find(g_tag) {
+            let tag = &block[gpos + p..];
+            let end = tag.find('>').map(|q| q + 1).unwrap_or(tag.len());
+            let t = &tag[..end];
+            if t.contains("type=\"start\"") {
+                full_arts.push("gliss-open".to_string());
+            } else if t.contains("type=\"stop\"") {
+                full_arts.push("gliss-close".to_string());
+            }
+            gpos += p + end;
+        }
+    }
+    (
+        start,
+        stop,
+        arts,
+        v2_arts,
+        full_arts,
+        numbered_slurs,
+        tab_string,
+        tab_fret,
+        tab_bend,
+        tab_hopo,
+    )
 }
 
 /// Closed dynamic level spellings (`<f/>` -> `dyn-f`) for legacy `bekern+`.
@@ -2069,34 +2821,145 @@ fn parse_direction(s: &str) -> DirEv {
         }
     }
     let mut wedge = None;
+    let mut full_hairpin = None;
     let mut pos = 0;
     while let Some(p) = s[pos..].find("<wedge") {
         let tag = &s[pos + p..];
         let end = tag.find('>').map(|q| q + 1).unwrap_or(tag.len());
         let t = &tag[..end];
+        let num = attr_value(t, "number")
+            .and_then(|v| v.parse::<u8>().ok())
+            .unwrap_or(1)
+            .clamp(1, 3);
         if t.contains("type=\"crescendo\"") {
             wedge = Some("hairpin-cresc-start".to_string());
+            full_hairpin = Some(format!("hairpin-{num}-cresc"));
         } else if t.contains("type=\"diminuendo\"") {
             wedge = Some("hairpin-dim-start".to_string());
+            full_hairpin = Some(format!("hairpin-{num}-dim"));
         } else if t.contains("type=\"stop\"") {
             wedge = Some("hairpin-stop".to_string());
+            full_hairpin = Some(format!("hairpin-{num}-close"));
         }
         pos += p + end;
     }
     let mut ottava = None;
+    let mut ottava_15 = None;
     let mut opos = 0;
     while let Some(p) = s[opos..].find("<octave-shift") {
         let tag = &s[opos + p..];
         let end = tag.find('>').map(|q| q + 1).unwrap_or(tag.len());
         let t = &tag[..end];
+        let is_15 = attr_value(t, "size").as_deref() == Some("15");
         if t.contains("type=\"down\"") {
-            ottava = Some("ottava-8va".to_string());
+            if is_15 {
+                ottava_15 = Some("15ma-open".to_string());
+            } else {
+                ottava = Some("ottava-8va".to_string());
+            }
         } else if t.contains("type=\"up\"") {
-            ottava = Some("ottava-8vb".to_string());
+            if is_15 {
+                ottava_15 = Some("15mb-open".to_string());
+            } else {
+                ottava = Some("ottava-8vb".to_string());
+            }
         } else if t.contains("type=\"stop\"") {
-            ottava = Some("ottava-stop".to_string());
+            if is_15 {
+                ottava_15 = Some("15-stop".to_string());
+            } else {
+                ottava = Some("ottava-stop".to_string());
+            }
         }
         opos += p + end;
+    }
+    let mut pedal = None;
+    if let Some(p) = s.find("<pedal") {
+        let tag = &s[p..];
+        let end = tag.find('>').map(|q| q + 1).unwrap_or(tag.len());
+        let t = &tag[..end];
+        let is_sost = t.contains("sostenuto=\"yes\"");
+        let is_uc = t.contains("soft=\"yes\"");
+        let is_start = t.contains("type=\"start\"");
+        let is_stop = t.contains("type=\"stop\"");
+        if is_sost {
+            if is_start {
+                pedal = Some("pedal-sost-open".to_string());
+            } else if is_stop {
+                pedal = Some("pedal-sost-close".to_string());
+            }
+        } else if is_uc {
+            if is_start {
+                pedal = Some("pedal-uc-open".to_string());
+            } else if is_stop {
+                pedal = Some("pedal-uc-close".to_string());
+            }
+        }
+    }
+    let mut navigation = Vec::new();
+    if s.contains("<segno") {
+        navigation.push("Segno".to_string());
+    }
+    if s.contains("<coda") {
+        navigation.push("Coda".to_string());
+    }
+    if s.contains("dacapo=\"yes\"") {
+        navigation.push("D.C.".to_string());
+    }
+    if s.contains("dalsegno=\"yes\"") {
+        navigation.push("D.S.".to_string());
+    }
+    if s.contains("fine=\"yes\"") {
+        navigation.push("Fine".to_string());
+    }
+    let mut inst_change = None;
+    let mut text_spans = Vec::new();
+    if let Some(reh) = tag_text(s, "rehearsal") {
+        if !reh.is_empty() {
+            text_spans.push(("<reh>".to_string(), reh));
+        }
+    }
+    if let Some(mb) = block_inclusive(s, "metronome") {
+        if let (Some(bu), Some(pm)) = (tag_text(mb, "beat-unit"), tag_text(mb, "per-minute")) {
+            text_spans.push(("<tempo>".to_string(), format!("{bu}={pm}")));
+        }
+    }
+    if let Some(w) = tag_text(s, "words") {
+        let wt = w.trim();
+        let wl = wt.to_ascii_lowercase();
+        if wt == "D.C." || wl.starts_with("d.c.") || wl == "da capo" {
+            if !navigation.iter().any(|n| n == "D.C.") {
+                navigation.push("D.C.".to_string());
+            }
+        } else if wt == "D.S." || wl.starts_with("d.s.") || wl == "dal segno" {
+            if !navigation.iter().any(|n| n == "D.S.") {
+                navigation.push("D.S.".to_string());
+            }
+        } else if wt == "Fine" || wl == "fine" {
+            if !navigation.iter().any(|n| n == "Fine") {
+                navigation.push("Fine".to_string());
+            }
+        } else if wl == "inst-change" || wl.starts_with("muta in ") || wl.starts_with("to ") {
+            inst_change = Some(wt.to_string());
+        } else if !wt.is_empty() {
+            let is_tempo = s.contains("<sound") && s.contains("tempo=")
+                || matches!(
+                    wl.split_whitespace().next().unwrap_or(""),
+                    "allegro"
+                        | "andante"
+                        | "adagio"
+                        | "largo"
+                        | "presto"
+                        | "moderato"
+                        | "vivace"
+                        | "lento"
+                        | "allegretto"
+                        | "andantino"
+                        | "grave"
+                        | "maestoso"
+                );
+            let tag = if is_tempo { "<tempo>" } else { "<dir>" };
+            text_spans.push((tag.to_string(), wt.to_string()));
+        }
     }
     DirEv {
         dynamic,
@@ -2104,6 +2967,12 @@ fn parse_direction(s: &str) -> DirEv {
         notation_dynamic,
         wedge,
         ottava,
+        full_hairpin,
+        ottava_15,
+        pedal,
+        navigation,
+        inst_change,
+        text_spans,
     }
 }
 

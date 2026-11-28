@@ -114,6 +114,86 @@ fn default_beat_type() -> u32 {
     4
 }
 
+/// Optional `bekern-full` (4-layer) note-level extensions (microtones,
+/// stems, beams, unpitched noteheads, guitar TAB, slashed grace, numbered
+/// slurs, explicit natural/cautionary/parenthesized accidentals, multi-verse
+/// lyrics). `None` for legacy `v1` and `v2` inputs.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct FullNoteExt {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub grace_slash: bool,
+    /// Quarter-tone microtone token (`"q#"`, `"qb"`, `"3q#"`, `"3qb"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub microtone: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub explicit_natural: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub acc_cautionary: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub acc_parentheses: bool,
+    /// Stem direction (`"up"` | `"down"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stem: Option<String>,
+    /// Primary beam state (`"begin"` | `"continue"` | `"end"` | `"backward hook"` | `"forward hook"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub beam: Option<String>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unpitched: bool,
+    /// Notehead shape (`"x"`, `"diamond"`, `"slash"`, `"triangle"`, `"circle-x"`, `"square"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub notehead: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_string: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tab_fret: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tab_bend: bool,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub tab_hopo: bool,
+    /// Absolute 1-based cross-staff target (`xstaff-N`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub xstaff_abs: Option<u32>,
+    /// Numbered slur starts (`slur-1..4-open`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slur_starts: Vec<u8>,
+    /// Numbered slur stops (`slur-1..4-close`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub slur_stops: Vec<u8>,
+    /// Multi-verse lyrics: `(verse, syllabic, text, extend)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub lyrics: Vec<(u32, Option<String>, String, bool)>,
+}
+
+/// Optional `bekern-full` (Layer 0) part/staff extensions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullPartExt {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub part_index: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub staff_lines: Option<u32>,
+    /// Staff-group symbol (`"brace"`, `"bracket"`, `"barline"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_symbol: Option<String>,
+    /// Transposition `(diatonic, chromatic)`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub transpose: Option<(i32, i32)>,
+}
+
+/// Optional `bekern-full` (Layer 0) measure-level extensions.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FullMeasureExt {
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub pickup: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub multirest: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub measure_repeat: Option<u32>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inst_change: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub navigation: Vec<String>,
+}
+
 /// One note (or rest) of the input list.
 ///
 /// * `pitch`: scientific pitch like `"C4"`, `"F#5"`, `"Bb3"`, `"Gx2"`
@@ -170,6 +250,9 @@ pub struct NoteInput {
     /// Relative cross-staff shift (`-1` = `xstaff-up`, `+1` = `xstaff-down`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub xstaff: Option<i8>,
+    /// Optional `bekern-full` 4-layer note extensions (`None` for legacy v1/v2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<Box<FullNoteExt>>,
 }
 
 impl Default for NoteInput {
@@ -191,6 +274,7 @@ impl Default for NoteInput {
             tuplet: None,
             cue: false,
             xstaff: None,
+            full: None,
         }
     }
 }
@@ -243,6 +327,9 @@ pub struct PartInput {
     /// Part/staff-scoped measure overrides (mid-piece clefs, dynamics, hairpins).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub measure_attrs: Vec<MeasureAttr>,
+    /// Optional `bekern-full` Layer 0 part extensions (`None` for legacy v1/v2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<Box<FullPartExt>>,
 }
 
 impl Default for PartInput {
@@ -255,6 +342,7 @@ impl Default for PartInput {
             clef_octave_change: None,
             key_fifths: None,
             measure_attrs: Vec::new(),
+            full: None,
         }
     }
 }
@@ -314,6 +402,9 @@ pub struct MeasureAttr {
     /// clef/key/time changes) placed at their exact beat offset within the measure.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub timed_events: Vec<TimedEvent>,
+    /// Optional `bekern-full` Layer 0 measure extensions (`None` for legacy v1/v2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full: Option<Box<FullMeasureExt>>,
 }
 
 impl MeasureAttr {
@@ -431,6 +522,7 @@ pub struct ScoreNote {
     pub tuplet: Option<(u32, u32)>,
     pub cue: bool,
     pub xstaff: Option<i8>,
+    pub full: Option<Box<FullNoteExt>>,
 }
 
 /// Simultaneous same-voice notes sharing one onset/duration.
@@ -453,6 +545,7 @@ pub struct Part {
     pub clef_octave_change: Option<i32>,
     pub key_fifths: Option<i32>,
     pub measure_attrs: Vec<MeasureAttr>,
+    pub full: Option<Box<FullPartExt>>,
 }
 
 /// Fully resolved score plus the loss table accumulated while building it.
@@ -832,6 +925,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
         Option<i32>,
         Option<i32>,
         &'a [MeasureAttr],
+        Option<&'a FullPartExt>,
     );
     let raw_parts: Vec<RawPart<'_>> = if !input.parts.is_empty() {
         input
@@ -850,6 +944,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                     p.clef_octave_change,
                     p.key_fifths,
                     p.measure_attrs.as_slice(),
+                    p.full.as_deref(),
                 )
             })
             .collect()
@@ -865,16 +960,25 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
             None,
             None,
             &[],
+            None,
         )]
     };
-    if raw_parts.iter().all(|(_, n, _, _, _, _, _)| n.is_empty()) {
+    if raw_parts.iter().all(|(_, n, _, _, _, _, _, _)| n.is_empty()) {
         return Err("score has no notes".to_string());
     }
 
     let mut losses = LossTable::default();
     let mut parts = Vec::new();
-    for (pname, notes, clef_sign, clef_line, clef_octave_change, part_key_fifths, part_attrs) in
-        &raw_parts
+    for (
+        pname,
+        notes,
+        clef_sign,
+        clef_line,
+        clef_octave_change,
+        part_key_fifths,
+        part_attrs,
+        part_full,
+    ) in &raw_parts
     {
         if notes.is_empty() {
             continue;
@@ -937,6 +1041,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                         tuplet: n.tuplet,
                         cue: n.cue,
                         xstaff: n.xstaff,
+                        full: n.full.clone(),
                     },
                 ));
                 continue;
@@ -979,6 +1084,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
                     tuplet: n.tuplet,
                     cue: n.cue,
                     xstaff: n.xstaff,
+                    full: n.full.clone(),
                 },
             ));
         }
@@ -1107,6 +1213,7 @@ pub fn parse_score(input: &ScoreInput) -> Result<(Score, LossTable), String> {
             clef_octave_change: *clef_octave_change,
             key_fifths: *part_key_fifths,
             measure_attrs: p_measure_attrs,
+            full: part_full.map(|f| Box::new(f.clone())),
         });
     }
 
@@ -1283,6 +1390,7 @@ fn layout_part(
                             tuplet: None,
                             cue: false,
                             xstaff: None,
+                            full: None,
                         },
                         chord: false,
                         dur_ticks: ss - cursor,
@@ -1319,6 +1427,7 @@ fn layout_part(
                         tuplet: None,
                         cue: false,
                         xstaff: None,
+                        full: None,
                     },
                     chord: false,
                     dur_ticks: m1 - cursor,
@@ -1364,38 +1473,81 @@ fn tie_elements(seg: &Segment) -> (bool, bool) {
 /// rests), but the rendering is uniform.
 fn write_notations_xml(out: &mut String, seg: &Segment) {
     let (tie_start, tie_stop) = tie_elements(seg);
+    let full = seg.note.full.as_deref();
+    let has_num_slurs =
+        full.is_some_and(|f| !f.slur_starts.is_empty() || !f.slur_stops.is_empty());
     let has_art = seg.note.articulations.iter().any(|a| {
         matches!(
             a.as_str(),
-            "stacc" | "accent" | "tenuto" | "art-staccatissimo" | "art-soft-accent"
+            "stacc"
+                | "accent"
+                | "tenuto"
+                | "art-staccatissimo"
+                | "art-soft-accent"
+                | "marcato"
+                | "breath"
+                | "caesura"
         )
     });
     let has_orn = seg.note.articulations.iter().any(|a| {
         matches!(
             a.as_str(),
-            "art-trill" | "art-tremolo" | "art-mordent" | "art-turn"
+            "art-trill"
+                | "art-tremolo"
+                | "art-mordent"
+                | "art-turn"
+                | "mordent-up"
+                | "mordent-lo"
+                | "turn"
+                | "turn-inv"
+                | "tremolo-1"
+                | "tremolo-2"
+                | "tremolo-3"
+                | "tremolo-2n"
+                | "trill-line-open"
+                | "trill-line-close"
         )
     });
-    let has_tech = seg
-        .note
-        .articulations
-        .iter()
-        .any(|a| matches!(a.as_str(), "art-up-bow" | "art-down-bow"));
+    let has_tab_tech = full.is_some_and(|f| {
+        f.tab_string.is_some() || f.tab_fret.is_some() || f.tab_bend || f.tab_hopo
+    });
+    let has_tech = has_tab_tech
+        || seg.note.articulations.iter().any(|a| {
+            matches!(
+                a.as_str(),
+                "art-up-bow"
+                    | "art-down-bow"
+                    | "fing-1"
+                    | "fing-2"
+                    | "fing-3"
+                    | "fing-4"
+                    | "fing-5"
+                    | "harmonics"
+            )
+        });
     let fermata = seg.note.articulations.iter().any(|a| a == "fermata");
-    let arpeggiate = seg
+    let arpeggiate = seg.note.articulations.iter().any(|a| {
+        matches!(
+            a.as_str(),
+            "art-arpeggiate" | "arp-up" | "arp-down" | "arp-non"
+        )
+    });
+    let has_gliss = seg
         .note
         .articulations
         .iter()
-        .any(|a| a == "art-arpeggiate");
+        .any(|a| matches!(a.as_str(), "gliss-open" | "gliss-close"));
     if !tie_start
         && !tie_stop
         && !seg.note.slur_start
         && !seg.note.slur_stop
+        && !has_num_slurs
         && !has_art
         && !has_orn
         && !has_tech
         && !fermata
         && !arpeggiate
+        && !has_gliss
     {
         return;
     }
@@ -1406,11 +1558,22 @@ fn write_notations_xml(out: &mut String, seg: &Segment) {
     if tie_stop {
         out.push_str("<tied type=\"stop\"/>");
     }
-    if seg.note.slur_start {
-        out.push_str("<slur type=\"start\" number=\"1\"/>");
-    }
-    if seg.note.slur_stop {
-        out.push_str("<slur type=\"stop\" number=\"1\"/>");
+    if has_num_slurs {
+        if let Some(f) = full {
+            for &n in &f.slur_starts {
+                let _ = write!(out, "<slur type=\"start\" number=\"{n}\"/>");
+            }
+            for &n in &f.slur_stops {
+                let _ = write!(out, "<slur type=\"stop\" number=\"{n}\"/>");
+            }
+        }
+    } else {
+        if seg.note.slur_start {
+            out.push_str("<slur type=\"start\" number=\"1\"/>");
+        }
+        if seg.note.slur_stop {
+            out.push_str("<slur type=\"stop\" number=\"1\"/>");
+        }
     }
     if has_art {
         out.push_str("<articulations>");
@@ -1418,9 +1581,12 @@ fn write_notations_xml(out: &mut String, seg: &Segment) {
             match a.as_str() {
                 "stacc" => out.push_str("<staccato/>"),
                 "accent" => out.push_str("<accent/>"),
+                "marcato" => out.push_str("<strong-accent/>"),
                 "tenuto" => out.push_str("<tenuto/>"),
                 "art-staccatissimo" => out.push_str("<staccatissimo/>"),
                 "art-soft-accent" => out.push_str("<soft-accent/>"),
+                "breath" => out.push_str("<breath-mark/>"),
+                "caesura" => out.push_str("<caesura/>"),
                 _ => {}
             }
         }
@@ -1432,8 +1598,16 @@ fn write_notations_xml(out: &mut String, seg: &Segment) {
             match a.as_str() {
                 "art-trill" => out.push_str("<trill-mark/>"),
                 "art-tremolo" => out.push_str("<tremolo>3</tremolo>"),
-                "art-mordent" => out.push_str("<inverted-mordent/>"),
-                "art-turn" => out.push_str("<turn/>"),
+                "tremolo-1" => out.push_str("<tremolo type=\"single\">1</tremolo>"),
+                "tremolo-2" => out.push_str("<tremolo type=\"single\">2</tremolo>"),
+                "tremolo-3" => out.push_str("<tremolo type=\"single\">3</tremolo>"),
+                "tremolo-2n" => out.push_str("<tremolo type=\"start\">3</tremolo>"),
+                "art-mordent" | "mordent-up" => out.push_str("<inverted-mordent/>"),
+                "mordent-lo" => out.push_str("<mordent/>"),
+                "art-turn" | "turn" => out.push_str("<turn/>"),
+                "turn-inv" => out.push_str("<inverted-turn/>"),
+                "trill-line-open" => out.push_str("<wavy-line type=\"start\"/>"),
+                "trill-line-close" => out.push_str("<wavy-line type=\"stop\"/>"),
                 _ => {}
             }
         }
@@ -1445,7 +1619,27 @@ fn write_notations_xml(out: &mut String, seg: &Segment) {
             match a.as_str() {
                 "art-up-bow" => out.push_str("<up-bow/>"),
                 "art-down-bow" => out.push_str("<down-bow/>"),
+                "fing-1" => out.push_str("<fingering>1</fingering>"),
+                "fing-2" => out.push_str("<fingering>2</fingering>"),
+                "fing-3" => out.push_str("<fingering>3</fingering>"),
+                "fing-4" => out.push_str("<fingering>4</fingering>"),
+                "fing-5" => out.push_str("<fingering>5</fingering>"),
+                "harmonics" => out.push_str("<harmonic/>"),
                 _ => {}
+            }
+        }
+        if let Some(f) = full {
+            if let Some(s) = f.tab_string {
+                let _ = write!(out, "<string>{s}</string>");
+            }
+            if let Some(fr) = f.tab_fret {
+                let _ = write!(out, "<fret>{fr}</fret>");
+            }
+            if f.tab_bend {
+                out.push_str("<bend><bend-alter>2</bend-alter></bend>");
+            }
+            if f.tab_hopo {
+                out.push_str("<hammer-on type=\"start\"/>");
             }
         }
         out.push_str("</technical>");
@@ -1454,7 +1648,24 @@ fn write_notations_xml(out: &mut String, seg: &Segment) {
         out.push_str("<fermata/>");
     }
     if arpeggiate {
-        out.push_str("<arpeggiate/>");
+        for a in &seg.note.articulations {
+            match a.as_str() {
+                "art-arpeggiate" => out.push_str("<arpeggiate/>"),
+                "arp-up" => out.push_str("<arpeggiate direction=\"up\"/>"),
+                "arp-down" => out.push_str("<arpeggiate direction=\"down\"/>"),
+                "arp-non" => out.push_str("<non-arpeggiate type=\"bottom\"/>"),
+                _ => {}
+            }
+        }
+    }
+    if has_gliss {
+        for a in &seg.note.articulations {
+            match a.as_str() {
+                "gliss-open" => out.push_str("<glissando type=\"start\" line-type=\"wavy\"/>"),
+                "gliss-close" => out.push_str("<glissando type=\"stop\"/>"),
+                _ => {}
+            }
+        }
     }
     out.push_str("</notations>\n");
 }
@@ -1470,6 +1681,62 @@ fn push_forward_xml(out: &mut String, dur_ticks: i64, voice_num: u32, staff_num:
     out.push_str("</forward>\n");
 }
 
+fn write_note_accidental_xml(out: &mut String, seg: &Segment) {
+    let full = seg.note.full.as_deref();
+    let micro_acc = full.and_then(|f| match f.microtone.as_deref() {
+        Some("q#") => Some("quarter-sharp"),
+        Some("qb") => Some("quarter-flat"),
+        Some("3q#") => Some("three-quarters-sharp"),
+        Some("3qb") => Some("three-quarters-flat"),
+        _ => None,
+    });
+    let acc_name = micro_acc.or_else(|| {
+        if full.is_some_and(|f| f.explicit_natural) && seg.note.alter == 0 {
+            Some("natural")
+        } else {
+            accidental_name(seg.note.alter)
+        }
+    });
+    if let Some(acc) = acc_name {
+        let caut = full.is_some_and(|f| f.acc_cautionary);
+        let paren = full.is_some_and(|f| f.acc_parentheses);
+        out.push_str("        <accidental");
+        if caut {
+            out.push_str(" cautionary=\"yes\"");
+        }
+        if paren {
+            out.push_str(" parentheses=\"yes\"");
+        }
+        let _ = writeln!(out, ">{acc}</accidental>");
+    }
+}
+
+fn write_note_pitch_xml(out: &mut String, seg: &Segment) {
+    let full = seg.note.full.as_deref();
+    if full.is_some_and(|f| f.unpitched) {
+        let _ = writeln!(
+            out,
+            "        <unpitched><display-step>{}</display-step><display-octave>{}</display-octave></unpitched>",
+            seg.note.step, seg.note.octave
+        );
+        return;
+    }
+    let _ = write!(out, "        <pitch><step>{}</step>", seg.note.step);
+    let micro_alter = full.and_then(|f| match f.microtone.as_deref() {
+        Some("q#") => Some("0.5"),
+        Some("qb") => Some("-0.5"),
+        Some("3q#") => Some("1.5"),
+        Some("3qb") => Some("-1.5"),
+        _ => None,
+    });
+    if let Some(ma) = micro_alter {
+        let _ = write!(out, "<alter>{ma}</alter>");
+    } else if seg.note.alter != 0 {
+        let _ = write!(out, "<alter>{}</alter>", seg.note.alter);
+    }
+    let _ = writeln!(out, "<octave>{}</octave></pitch>", seg.note.octave);
+}
+
 fn push_note_xml(
     out: &mut String,
     seg: &Segment,
@@ -1479,17 +1746,26 @@ fn push_note_xml(
     voice_override: Option<u32>,
     staff_num: Option<u32>,
 ) {
+    let full = seg.note.full.as_deref();
     let voice_num = voice_override.unwrap_or(seg.note.voice);
-    let effective_staff = staff_num.map(|st| match seg.note.xstaff {
-        Some(delta) => (st as i32 + delta as i32).clamp(1, 2) as u32,
-        None => st,
-    });
+    let effective_staff = if let Some(abs_st) = full.and_then(|f| f.xstaff_abs) {
+        Some(abs_st)
+    } else {
+        staff_num.map(|st| match seg.note.xstaff {
+            Some(delta) => (st as i32 + delta as i32).clamp(1, 2) as u32,
+            None => st,
+        })
+    };
     // Grace notes occupy no time: `<grace/>` plus the engraved `<type>`
     // for display, and no `<duration>` (which is also what the scorer
     // reads, so grace round-trips as zero-duration events).
     if seg.note.grace {
         out.push_str("      <note>\n");
-        out.push_str("        <grace/>\n");
+        if full.is_some_and(|f| f.grace_slash) {
+            out.push_str("        <grace slash=\"yes\"/>\n");
+        } else {
+            out.push_str("        <grace/>\n");
+        }
         if seg.note.cue {
             out.push_str("        <cue/>\n");
         }
@@ -1499,11 +1775,7 @@ fn push_note_xml(
         if seg.note.rest {
             out.push_str("        <rest/>\n");
         } else {
-            let _ = write!(out, "        <pitch><step>{}</step>", seg.note.step);
-            if seg.note.alter != 0 {
-                let _ = write!(out, "<alter>{}</alter>", seg.note.alter);
-            }
-            let _ = writeln!(out, "<octave>{}</octave></pitch>", seg.note.octave);
+            write_note_pitch_xml(out, seg);
         }
         let (typename, dots, shown) = quantize_duration(seg.note.dur_ticks, divisions);
         if shown != seg.note.dur_ticks {
@@ -1526,12 +1798,19 @@ fn push_note_xml(
             out.push_str("        <dot/>\n");
         }
         if !seg.note.rest {
-            if let Some(acc) = accidental_name(seg.note.alter) {
-                let _ = writeln!(out, "        <accidental>{acc}</accidental>");
-            }
+            write_note_accidental_xml(out, seg);
+        }
+        if let Some(stem) = full.and_then(|f| f.stem.as_deref()) {
+            let _ = writeln!(out, "        <stem>{stem}</stem>");
+        }
+        if let Some(nh) = full.and_then(|f| f.notehead.as_deref()) {
+            let _ = writeln!(out, "        <notehead>{nh}</notehead>");
         }
         if let Some(st) = effective_staff {
             let _ = writeln!(out, "        <staff>{st}</staff>");
+        }
+        if let Some(bm) = full.and_then(|f| f.beam.as_deref()) {
+            let _ = writeln!(out, "        <beam number=\"1\">{bm}</beam>");
         }
         write_notations_xml(out, seg);
         out.push_str("      </note>\n");
@@ -1583,11 +1862,7 @@ fn push_note_xml(
     if seg.note.rest {
         out.push_str("        <rest/>\n");
     } else {
-        let _ = write!(out, "        <pitch><step>{}</step>", seg.note.step);
-        if seg.note.alter != 0 {
-            let _ = write!(out, "<alter>{}</alter>", seg.note.alter);
-        }
-        let _ = writeln!(out, "<octave>{}</octave></pitch>", seg.note.octave);
+        write_note_pitch_xml(out, seg);
     }
     let _ = writeln!(out, "        <duration>{dur}</duration>");
     let (tie_start, tie_stop) = tie_elements(seg);
@@ -1603,9 +1878,7 @@ fn push_note_xml(
         out.push_str("        <dot/>\n");
     }
     if !seg.note.rest {
-        if let Some(acc) = accidental_name(seg.note.alter) {
-            let _ = writeln!(out, "        <accidental>{acc}</accidental>");
-        }
+        write_note_accidental_xml(out, seg);
     }
     if let Some((_, _, _, actual, normal)) = tuplet_mod {
         let _ = writeln!(
@@ -1613,12 +1886,35 @@ fn push_note_xml(
             "        <time-modification><actual-notes>{actual}</actual-notes><normal-notes>{normal}</normal-notes></time-modification>"
         );
     }
+    if let Some(stem) = full.and_then(|f| f.stem.as_deref()) {
+        let _ = writeln!(out, "        <stem>{stem}</stem>");
+    }
+    if let Some(nh) = full.and_then(|f| f.notehead.as_deref()) {
+        let _ = writeln!(out, "        <notehead>{nh}</notehead>");
+    }
     if let Some(st) = effective_staff {
         let _ = writeln!(out, "        <staff>{st}</staff>");
     }
+    if let Some(bm) = full.and_then(|f| f.beam.as_deref()) {
+        let _ = writeln!(out, "        <beam number=\"1\">{bm}</beam>");
+    }
     if !seg.note.rest {
         write_notations_xml(out, seg);
-        if let Some(ly) = &seg.note.lyric {
+        if let Some(f) = full.filter(|f| !f.lyrics.is_empty()) {
+            for (verse, syl, text, ext) in &f.lyrics {
+                let _ = write!(out, "        <lyric number=\"{verse}\">");
+                if let Some(s) = syl {
+                    let _ = write!(out, "<syllabic>{s}</syllabic>");
+                }
+                out.push_str("<text>");
+                write_escaped_xml(out, text);
+                out.push_str("</text>");
+                if *ext {
+                    out.push_str("<extend/>");
+                }
+                out.push_str("</lyric>\n");
+            }
+        } else if let Some(ly) = &seg.note.lyric {
             out.push_str("        <lyric><text>");
             write_escaped_xml(out, ly);
             out.push_str("</text></lyric>\n");
@@ -1833,7 +2129,109 @@ fn write_timed_event_xml(
     match ev.kind.as_str() {
         "dynamic" => write_dyn_direction_xml_offset(out, &ev.value, staff_num, offset_ticks),
         "hairpin" => write_hairpin_direction_xml_offset(out, &ev.value, staff_num, offset_ticks),
+        "hairpin-num" => {
+            if let Some((num, kind)) = ev.value.split_once(':') {
+                let wedge = match kind {
+                    "cresc" => "crescendo",
+                    "dim" => "diminuendo",
+                    _ => "stop",
+                };
+                let _ = write!(
+                    out,
+                    "      <direction placement=\"below\"><direction-type><wedge type=\"{wedge}\" number=\"{num}\"/></direction-type>"
+                );
+                if let Some(off) = offset_ticks.filter(|&o| o != 0) {
+                    let _ = write!(out, "<offset>{off}</offset>");
+                }
+                if let Some(st) = staff_num {
+                    let _ = write!(out, "<staff>{st}</staff>");
+                }
+                out.push_str("</direction>\n");
+            }
+        }
         "ottava" => write_ottava_direction_xml(out, &ev.value, staff_num, offset_ticks),
+        "ottava-15" => {
+            let (otype, placement) = match ev.value.as_str() {
+                "15ma" => ("down", "above"),
+                "15mb" => ("up", "below"),
+                _ => ("stop", "above"),
+            };
+            let _ = write!(
+                out,
+                "      <direction placement=\"{placement}\"><direction-type><octave-shift type=\"{otype}\" size=\"15\"/></direction-type>"
+            );
+            if let Some(off) = offset_ticks.filter(|&o| o != 0) {
+                let _ = write!(out, "<offset>{off}</offset>");
+            }
+            if let Some(st) = staff_num {
+                let _ = write!(out, "<staff>{st}</staff>");
+            }
+            out.push_str("</direction>\n");
+        }
+        "pedal" => {
+            let (ptype, extra) = match ev.value.as_str() {
+                "sost-open" => ("start", " sostenuto=\"yes\""),
+                "sost-close" => ("stop", " sostenuto=\"yes\""),
+                "uc-open" => ("start", " soft=\"yes\""),
+                "uc-close" => ("stop", " soft=\"yes\""),
+                _ => ("stop", ""),
+            };
+            let _ = write!(
+                out,
+                "      <direction placement=\"below\"><direction-type><pedal type=\"{ptype}\"{extra}/></direction-type>"
+            );
+            if let Some(off) = offset_ticks.filter(|&o| o != 0) {
+                let _ = write!(out, "<offset>{off}</offset>");
+            }
+            if let Some(st) = staff_num {
+                let _ = write!(out, "<staff>{st}</staff>");
+            }
+            out.push_str("</direction>\n");
+        }
+        "harm" => {
+            let root_step = ev
+                .value
+                .chars()
+                .next()
+                .filter(|c| "ABCDEFG".contains(c.to_ascii_uppercase()))
+                .map(|c| c.to_ascii_uppercase())
+                .unwrap_or('C');
+            out.push_str("      <harmony><root><root-step>");
+            out.push(root_step);
+            out.push_str("</root-step></root><kind text=\"");
+            write_escaped_xml(out, &ev.value);
+            out.push_str("\">major</kind></harmony>\n");
+        }
+        "tempo" | "dir" => {
+            let placement = if ev.kind == "tempo" { "above" } else { "below" };
+            let _ = write!(
+                out,
+                "      <direction placement=\"{placement}\"><direction-type><words>"
+            );
+            write_escaped_xml(out, &ev.value);
+            out.push_str("</words></direction-type>");
+            if let Some(off) = offset_ticks.filter(|&o| o != 0) {
+                let _ = write!(out, "<offset>{off}</offset>");
+            }
+            if let Some(st) = staff_num {
+                let _ = write!(out, "<staff>{st}</staff>");
+            }
+            out.push_str("</direction>\n");
+        }
+        "reh" => {
+            out.push_str("      <direction placement=\"above\"><direction-type><rehearsal>");
+            write_escaped_xml(out, &ev.value);
+            out.push_str("</rehearsal></direction-type>");
+            if let Some(st) = staff_num {
+                let _ = write!(out, "<staff>{st}</staff>");
+            }
+            out.push_str("</direction>\n");
+        }
+        "fb" => {
+            out.push_str("      <figured-bass><figure><figure-number>");
+            write_escaped_xml(out, &ev.value);
+            out.push_str("</figure-number></figure></figured-bass>\n");
+        }
         "clef" | "key" | "time" => write_midbar_attr_xml(out, &ev.kind, &ev.value, staff_num),
         _ => {}
     }
@@ -1872,7 +2270,17 @@ fn push_voice_with_timed_events(
                 && timed[ti].0 < seg_end
                 && matches!(
                     timed[ti].1.kind.as_str(),
-                    "dynamic" | "hairpin" | "ottava"
+                    "dynamic"
+                        | "hairpin"
+                        | "hairpin-num"
+                        | "ottava"
+                        | "ottava-15"
+                        | "pedal"
+                        | "harm"
+                        | "tempo"
+                        | "dir"
+                        | "reh"
+                        | "fb"
                 )
             {
                 let delta = timed[ti].0 - cur_off;
@@ -2058,6 +2466,12 @@ pub fn to_musicxml_version(
 
     out.push_str("  <part-list>\n");
     for (i, part) in score.parts.iter().take(single_count).enumerate() {
+        if let Some(sym) = part.full.as_deref().and_then(|f| f.group_symbol.as_deref()) {
+            let _ = writeln!(
+                out,
+                "    <part-group type=\"start\" number=\"1\"><group-symbol>{sym}</group-symbol></part-group>"
+            );
+        }
         let _ = write!(out, "    <score-part id=\"P{}\"><part-name>", i + 1);
         write_escaped_xml(&mut out, &part.name);
         out.push_str("</part-name></score-part>\n");
@@ -2085,10 +2499,17 @@ pub fn to_musicxml_version(
                 .get(m)
                 .map(|&(a, b)| b - a)
                 .unwrap_or_else(|| score.measure_ticks());
-            let _ = writeln!(out, "    <measure number=\"{}\">", m + 1);
             let m1 = m as u32 + 1;
             let s_attrs = measure_attr(score, m1);
             let p_attrs = part_measure_attr(part, m1);
+            let m_full = p_attrs
+                .and_then(|a| a.full.as_deref())
+                .or_else(|| s_attrs.and_then(|a| a.full.as_deref()));
+            if m_full.is_some_and(|f| f.pickup) {
+                let _ = writeln!(out, "    <measure number=\"0\" implicit=\"yes\">");
+            } else {
+                let _ = writeln!(out, "    <measure number=\"{}\">", m + 1);
+            }
             if m == 0 {
                 let (clef_s, clef_l, clef_oct) = if let Some(s) = part.clef_sign {
                     (s, part.clef_line.unwrap_or(2), part.clef_octave_change)
@@ -2122,6 +2543,33 @@ pub fn to_musicxml_version(
                     "        <time><beats>{beats}</beats><beat-type>{beat_type}</beat-type></time>"
                 );
                 write_clef_xml(&mut out, clef_s, clef_l, clef_oct, None);
+                if let Some(pf) = part.full.as_deref() {
+                    if let Some(lines) = pf.staff_lines {
+                        let _ = writeln!(
+                            out,
+                            "        <staff-details><staff-lines>{lines}</staff-lines></staff-details>"
+                        );
+                    }
+                    if let Some((dia, chr)) = pf.transpose {
+                        let _ = writeln!(
+                            out,
+                            "        <transpose><diatonic>{dia}</diatonic><chromatic>{chr}</chromatic></transpose>"
+                        );
+                    }
+                }
+                if let Some(mf) = m_full {
+                    if let Some(mr) = mf.multirest {
+                        let _ = writeln!(
+                            out,
+                            "        <measure-style><multiple-rest>{mr}</multiple-rest></measure-style>"
+                        );
+                    } else if let Some(mrep) = mf.measure_repeat {
+                        let _ = writeln!(
+                            out,
+                            "        <measure-style><measure-repeat type=\"start\">{mrep}</measure-repeat></measure-style>"
+                        );
+                    }
+                }
                 out.push_str("      </attributes>\n");
             } else {
                 let p_has_clef = p_attrs.is_some_and(|a| {
@@ -2143,7 +2591,10 @@ pub fn to_musicxml_version(
                 let time_change = p_attrs
                     .and_then(|a| a.time)
                     .or_else(|| s_attrs.and_then(|a| a.time));
-                if clef_src.is_some() || key_change.is_some() || time_change.is_some() {
+                let has_mstyle =
+                    m_full.is_some_and(|f| f.multirest.is_some() || f.measure_repeat.is_some());
+                if clef_src.is_some() || key_change.is_some() || time_change.is_some() || has_mstyle
+                {
                     out.push_str("      <attributes>\n");
                     if let Some(k) = key_change {
                         let _ = writeln!(out, "        <key><fifths>{k}</fifths></key>");
@@ -2164,7 +2615,35 @@ pub fn to_musicxml_version(
                             None,
                         );
                     }
+                    if let Some(mf) = m_full {
+                        if let Some(mr) = mf.multirest {
+                            let _ = writeln!(
+                                out,
+                                "        <measure-style><multiple-rest>{mr}</multiple-rest></measure-style>"
+                            );
+                        } else if let Some(mrep) = mf.measure_repeat {
+                            let _ = writeln!(
+                                out,
+                                "        <measure-style><measure-repeat type=\"start\">{mrep}</measure-repeat></measure-style>"
+                            );
+                        }
+                    }
                     out.push_str("      </attributes>\n");
+                }
+            }
+            if let Some(mf) = m_full {
+                if mf.inst_change {
+                    out.push_str("      <direction placement=\"above\"><direction-type><words>inst-change</words></direction-type></direction>\n");
+                }
+                for nav in &mf.navigation {
+                    match nav.as_str() {
+                        "Segno" => out.push_str("      <direction placement=\"above\"><direction-type><segno/></direction-type></direction>\n"),
+                        "Coda" => out.push_str("      <direction placement=\"above\"><direction-type><coda/></direction-type></direction>\n"),
+                        "D.C." => out.push_str("      <direction placement=\"above\"><direction-type><words>D.C.</words></direction-type><sound dacapo=\"yes\"/></direction>\n"),
+                        "D.S." => out.push_str("      <direction placement=\"above\"><direction-type><words>D.S.</words></direction-type><sound dalsegno=\"yes\"/></direction>\n"),
+                        "Fine" => out.push_str("      <direction placement=\"above\"><direction-type><words>Fine</words></direction-type><sound fine=\"yes\"/></direction>\n"),
+                        _ => {}
+                    }
                 }
             }
             let barline_left = p_attrs
@@ -4183,7 +4662,9 @@ pub fn validate_musicxml(xml: &str) -> Vec<Issue> {
             let nb = &body[ns..ne];
             note_count += 1;
             if !nb.contains("<rest") && !nb.contains("<rest/>") {
-                if !(nb.contains("<step>") && nb.contains("<octave>")) {
+                if !(nb.contains("<step>") && nb.contains("<octave>"))
+                    && !(nb.contains("<display-step>") && nb.contains("<display-octave>"))
+                {
                     out.push(error(
                         "xml-pitch",
                         format!("measure {mnum}: pitched note without step+octave"),

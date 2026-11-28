@@ -837,6 +837,7 @@ pub fn import_mscx(xml: &str) -> Result<ScoreInput, String> {
                                 tuplet: cur_tup,
                                 cue: false,
                                 xstaff,
+                                full: None,
                             });
                             cursor += dur;
                         }
@@ -966,6 +967,7 @@ pub fn import_mscx(xml: &str) -> Result<ScoreInput, String> {
                                     tuplet: cur_tup,
                                     cue: note_cue,
                                     xstaff,
+                                    full: None,
                                 });
                                 first_in_chord = false;
                             }
@@ -993,6 +995,7 @@ pub fn import_mscx(xml: &str) -> Result<ScoreInput, String> {
             clef_octave_change,
             key_fifths: part_key,
             measure_attrs: p_measure_attrs,
+            full: None,
         });
     }
 
@@ -1088,6 +1091,7 @@ mod tests {
                 clef_octave_change: None,
                 key_fifths: Some(2),
                 measure_attrs: Vec::new(),
+                full: None,
             }],
             notes: Vec::new(),
             part_name: None,

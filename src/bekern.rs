@@ -328,21 +328,48 @@ fn span_scale_an(open: &TupletSpans, key: (u32, u32)) -> f64 {
     })
 }
 
-fn emit_tuplet_start(out: &mut Vec<String>, ratio: (u32, u32), v2: bool) {
-    if v2 {
-        out.push("tup-open".to_string());
-        out.push(ratio.0.to_string());
-        out.push(ratio.1.to_string());
-    } else {
-        out.push(format!("tuplet-start-{}-{}", ratio.0, ratio.1));
+/// Output dialect for `bekern` token emission.
+///
+/// - [`BekernDialect::V1`]: canonical legacy `bekern+` (byte-identical default).
+/// - [`BekernDialect::V2`]: `bekern+v2` (`<staff>`, cursor-anchored dynamics,
+///   extended dynamics/articulations, `tup-open A N` / `tup-close`).
+/// - [`BekernDialect::Full`]: 4-layer `bekern-full` (`<schema:full>`, Layer 0
+///   structure/multi-part/navigation, Layer 1 microtones/beams/percussion/TAB/
+///   `tup-open-N:M`/`<chord>`/`xstaff-N`, Layer 2 lossless expressive split &
+///   numbered spanners, Layer 3 end-of-system anchored text/lyrics blocks).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BekernDialect {
+    #[default]
+    V1,
+    V2,
+    Full,
+}
+
+fn emit_tuplet_start(out: &mut Vec<String>, ratio: (u32, u32), dialect: BekernDialect) {
+    match dialect {
+        BekernDialect::V1 => out.push(format!("tuplet-start-{}-{}", ratio.0, ratio.1)),
+        BekernDialect::V2 => {
+            out.push("tup-open".to_string());
+            out.push(ratio.0.to_string());
+            out.push(ratio.1.to_string());
+        }
+        BekernDialect::Full => {
+            out.push(format!("tup-open-{}:{}", ratio.0, ratio.1));
+        }
     }
 }
 
-fn emit_tuplet_stop(out: &mut Vec<String>, v2: bool) {
-    out.push(if v2 { "tup-close" } else { "tuplet-stop" }.to_string());
+fn emit_tuplet_stop(out: &mut Vec<String>, dialect: BekernDialect) {
+    out.push(
+        match dialect {
+            BekernDialect::V1 => "tuplet-stop",
+            BekernDialect::V2 | BekernDialect::Full => "tup-close",
+        }
+        .to_string(),
+    );
 }
 
-/// Emit a deferred `tuplet-stop` (or `tup-close` in `v2`): pop the key's span
+/// Emit a deferred `tuplet-stop` (or `tup-close` in `v2`/`full`): pop the key's span
 /// (validating the number the stop was deferred with) and push the token. Decode
 /// sees the token while positioned in the stopped note's chord-run segment, so
 /// the pop routes to the right stack.
@@ -352,11 +379,11 @@ fn flush_stop(
     key: (u32, u32),
     num: u32,
     measure: u32,
-    v2: bool,
+    dialect: BekernDialect,
 ) -> Result<(), String> {
     match open.get_mut(&key).and_then(|s| s.pop()) {
         Some((_, open_num)) if open_num == num => {
-            emit_tuplet_stop(out, v2);
+            emit_tuplet_stop(out, dialect);
             Ok(())
         }
         _ => Err(format!(
@@ -375,7 +402,7 @@ pub fn to_bekern(
     events: &[BekernNote],
     headers: &[StaffHeader],
 ) -> Result<(Vec<String>, usize), String> {
-    to_bekern_inner(events, headers, false)
+    to_bekern_inner(events, headers, BekernDialect::V1)
 }
 
 /// Flatten events + headers to `bekern+v2` tokens: explicit `<staff>`
@@ -387,21 +414,79 @@ pub fn to_bekern_v2(
     events: &[BekernNote],
     headers: &[StaffHeader],
 ) -> Result<(Vec<String>, usize), String> {
-    to_bekern_inner(events, headers, true)
+    to_bekern_inner(events, headers, BekernDialect::V2)
+}
+
+/// Flatten events + headers to 4-layer `bekern-full` tokens (`<schema:full>`).
+pub fn to_bekern_full(
+    events: &[BekernNote],
+    headers: &[StaffHeader],
+) -> Result<(Vec<String>, usize), String> {
+    to_bekern_inner(events, headers, BekernDialect::Full)
+}
+
+/// Flatten events + headers using the selected [`BekernDialect`].
+pub fn to_bekern_with_dialect(
+    events: &[BekernNote],
+    headers: &[StaffHeader],
+    dialect: BekernDialect,
+) -> Result<(Vec<String>, usize), String> {
+    to_bekern_inner(events, headers, dialect)
 }
 
 fn to_bekern_inner(
     events: &[BekernNote],
     headers: &[StaffHeader],
-    v2: bool,
+    dialect: BekernDialect,
 ) -> Result<(Vec<String>, usize), String> {
+    let v2 = matches!(dialect, BekernDialect::V2 | BekernDialect::Full);
+    let full = dialect == BekernDialect::Full;
     let mut heads: Vec<&StaffHeader> = headers.iter().collect();
     heads.sort_by_key(|h| h.staff);
     let mut out = Vec::with_capacity(events.len() * 4 + heads.len() * 3 + 16);
-    for h in &heads {
-        out.push(clef_token(h.clef_sign, h.clef_line, h.clef_octave_change));
-        out.push(key_token(h.key_fifths));
-        out.push(format!("time-{}-{}", h.beats, h.beat_type));
+    if full {
+        out.push("<schema:full>".to_string());
+        let mut cur_part: Option<u32> = None;
+        for h in &heads {
+            if let Some(hf) = h.full.as_deref() {
+                if let Some(gs) = &hf.group_start {
+                    out.push("<group>".to_string());
+                    out.push(gs.clone());
+                }
+                if cur_part != Some(hf.part_index) {
+                    out.push("<part>".to_string());
+                    cur_part = Some(hf.part_index);
+                }
+                out.push("<staff-def>".to_string());
+                if let Some(lines) = hf.staff_lines {
+                    if lines != 5 {
+                        out.push(format!("lines-{lines}"));
+                    }
+                }
+            } else {
+                if cur_part.is_none() {
+                    out.push("<part>".to_string());
+                    cur_part = Some(0);
+                }
+                out.push("<staff-def>".to_string());
+            }
+            out.push(clef_token(h.clef_sign, h.clef_line, h.clef_octave_change));
+            out.push(key_token(h.key_fifths));
+            out.push(format!("time-{}-{}", h.beats, h.beat_type));
+            if let Some(hf) = h.full.as_deref() {
+                if let Some((dia, chr)) = hf.transpose {
+                    out.push("<transpose>".to_string());
+                    out.push(dia.to_string());
+                    out.push(chr.to_string());
+                }
+            }
+        }
+    } else {
+        for h in &heads {
+            out.push(clef_token(h.clef_sign, h.clef_line, h.clef_octave_change));
+            out.push(key_token(h.key_fifths));
+            out.push(format!("time-{}-{}", h.beats, h.beat_type));
+        }
     }
     // Nominal bar capacity in beats per measure: the score-initial
     // signature, overridden from each mid-stream time change's carrier
@@ -595,6 +680,11 @@ fn to_bekern_inner(
     // Closing barline style of the measure being built (last-wins
     // across its events): emitted instead of `bar` at the close.
     let mut pending_right: Option<String> = None;
+    // Layer 3 end-of-system anchored text/lyrics collectors (only populated in `Full`).
+    let mut sys_note_idx: usize = 0;
+    let mut sys_lyrics: std::collections::BTreeMap<u32, Vec<(usize, String, String)>> =
+        std::collections::BTreeMap::new();
+    let mut sys_text_spans: Vec<(String, usize, String)> = Vec::new();
     for e in evs {
         // Flush a deferred stop at the first event that is not a
         // same-onset chord continuation of the stopped note. Grace
@@ -617,7 +707,7 @@ fn to_bekern_inner(
         let mut flushed_key: Option<(u32, u32)> = None;
         if !continues_chord {
             if let Some((dkey, dnum)) = deferred_stop.take() {
-                flush_stop(&mut out, &mut open, dkey, dnum, e.measure, v2)?;
+                flush_stop(&mut out, &mut open, dkey, dnum, e.measure, dialect)?;
                 flushed_key = Some(dkey);
             }
             // A new chord-run root ends visual-marker idempotence for the
@@ -638,7 +728,7 @@ fn to_bekern_inner(
                 if let Some(stack) = open.remove(&pk) {
                     if !stack.is_empty() {
                         for _ in &stack {
-                            emit_tuplet_stop(&mut out, v2);
+                            emit_tuplet_stop(&mut out, dialect);
                         }
                         reopen.insert(pk, stack);
                     }
@@ -682,6 +772,31 @@ fn to_bekern_inner(
             }
             if let Some(v) = &e.volta {
                 out.push(v.clone());
+            }
+            if full {
+                if let Some(ef) = e.full.as_deref() {
+                    if ef.pickup {
+                        out.push("<pickup>".to_string());
+                    }
+                    if let Some(mr) = ef.multirest {
+                        out.push("<multirest>".to_string());
+                        out.push(format!("multirest-{mr}"));
+                    }
+                    if let Some(mrep) = ef.measure_repeat {
+                        let tok = match mrep {
+                            4 => "mrep-4",
+                            2 => "mrep-2",
+                            _ => "mrep-1",
+                        };
+                        out.push(tok.to_string());
+                    }
+                    if ef.inst_change.is_some() {
+                        out.push("<inst-change>".to_string());
+                    }
+                    for nav in &ef.navigation {
+                        out.push(nav.clone());
+                    }
+                }
             }
             if heads.len() > 1 {
                 let target_slot = heads
@@ -733,11 +848,22 @@ fn to_bekern_inner(
             if let Some(hs) = skipped_hairpin.remove(&e.measure) {
                 out.extend(hs);
             }
-            if v2 {
-                out.extend(e.extra_hairpins.iter().cloned());
-            }
-            if let Some(h) = &e.hairpin {
-                out.push(h.clone());
+            if full {
+                if let Some(ef) = e.full.as_deref().filter(|f| !f.numbered_hairpins.is_empty()) {
+                    out.extend(ef.numbered_hairpins.iter().cloned());
+                } else {
+                    out.extend(e.extra_hairpins.iter().cloned());
+                    if let Some(h) = &e.hairpin {
+                        out.push(h.clone());
+                    }
+                }
+            } else {
+                if v2 {
+                    out.extend(e.extra_hairpins.iter().cloned());
+                }
+                if let Some(h) = &e.hairpin {
+                    out.push(h.clone());
+                }
             }
             if v2 {
                 if let Some(o) = skipped_ottava.remove(&e.measure) {
@@ -745,6 +871,12 @@ fn to_bekern_inner(
                 }
                 if let Some(o) = &e.ottava {
                     out.push(o.clone());
+                }
+            }
+            if full {
+                if let Some(ef) = e.full.as_deref() {
+                    out.extend(ef.ottava_15.iter().cloned());
+                    out.extend(ef.pedals.iter().cloned());
                 }
             }
         }
@@ -872,7 +1004,7 @@ fn to_bekern_inner(
                 if !stale {
                     for (ratio, num) in &stack {
                         open.entry(key).or_default().push((*ratio, *num));
-                        emit_tuplet_start(&mut out, *ratio, v2);
+                        emit_tuplet_start(&mut out, *ratio, dialect);
                     }
                     restored_this_event = true;
                 }
@@ -959,7 +1091,7 @@ fn to_bekern_inner(
                                 ));
                             }
                         };
-                        emit_tuplet_start(&mut out, r, v2);
+                        emit_tuplet_start(&mut out, r, dialect);
                         open.entry(key).or_default().push((r, n));
                         // Round from the unrounded gap (0.667 x 3/2 is
                         // exactly a quarter; rounding `written` first
@@ -975,7 +1107,7 @@ fn to_bekern_inner(
                         )
                         .map_err(|inner_err| format!("{inner_err} | {}", emit_ctx()));
                         open.get_mut(&key).and_then(|s| s.pop());
-                        emit_tuplet_stop(&mut out, v2);
+                        emit_tuplet_stop(&mut out, dialect);
                         inner?;
                     }
                 }
@@ -1001,7 +1133,7 @@ fn to_bekern_inner(
                 && open.get(&key).is_some_and(|s| !s.is_empty())
             {
                 open.get_mut(&key).and_then(|s| s.pop());
-                emit_tuplet_stop(&mut out, v2);
+                emit_tuplet_stop(&mut out, dialect);
             }
         }
         // Inline cursor-anchored notation state (clef/key/time changes,
@@ -1040,11 +1172,22 @@ fn to_bekern_inner(
             if let Some(hs) = skipped_hairpin.remove(&e.measure) {
                 out.extend(hs);
             }
-            if v2 {
-                out.extend(e.extra_hairpins.iter().cloned());
-            }
-            if let Some(h) = &e.hairpin {
-                out.push(h.clone());
+            if full {
+                if let Some(ef) = e.full.as_deref().filter(|f| !f.numbered_hairpins.is_empty()) {
+                    out.extend(ef.numbered_hairpins.iter().cloned());
+                } else {
+                    out.extend(e.extra_hairpins.iter().cloned());
+                    if let Some(h) = &e.hairpin {
+                        out.push(h.clone());
+                    }
+                }
+            } else {
+                if v2 {
+                    out.extend(e.extra_hairpins.iter().cloned());
+                }
+                if let Some(h) = &e.hairpin {
+                    out.push(h.clone());
+                }
             }
             if v2 {
                 if let Some(o) = skipped_ottava.remove(&e.measure) {
@@ -1052,6 +1195,12 @@ fn to_bekern_inner(
                 }
                 if let Some(o) = &e.ottava {
                     out.push(o.clone());
+                }
+            }
+            if full {
+                if let Some(ef) = e.full.as_deref() {
+                    out.extend(ef.ottava_15.iter().cloned());
+                    out.extend(ef.pedals.iter().cloned());
                 }
             }
         }
@@ -1081,12 +1230,12 @@ fn to_bekern_inner(
                         Some(((a, n), 1)) if (a, n) != ratio)
                 {
                     open.get_mut(&key).and_then(|s| s.pop());
-                    emit_tuplet_stop(&mut out, v2);
+                    emit_tuplet_stop(&mut out, dialect);
                 }
                 let top = open.get(&key).and_then(|s| s.last().copied());
                 if top != Some((ratio, num)) {
                     open.entry(key).or_default().push((ratio, num));
-                    emit_tuplet_start(&mut out, ratio, v2);
+                    emit_tuplet_start(&mut out, ratio, dialect);
                 }
             } else {
                 // Visual-only bracket start (no time-modification): the
@@ -1107,7 +1256,7 @@ fn to_bekern_inner(
             let top = open.get(&key).and_then(|s| s.last().map(|t| t.0));
             if top != Some(ratio) {
                 open.entry(key).or_default().push((ratio, 1));
-                emit_tuplet_start(&mut out, ratio, v2);
+                emit_tuplet_start(&mut out, ratio, dialect);
             }
         }
         // NOTE: no fallback decomposition (e.g. breve = 2 x whole):
@@ -1130,21 +1279,41 @@ fn to_bekern_inner(
                     e.grace,
                     e.grace_seq,
                 ));
+        let ef = if full { e.full.as_deref() } else { None };
         // The `grace` marker leads the chord run once (chord tones
         // inherit grace from their root on decode).
         if e.grace && !is_chord_tone {
-            out.push("grace".to_string());
+            if ef.is_some_and(|f| f.grace_slash) {
+                out.push("grace-slash".to_string());
+            } else {
+                out.push("grace".to_string());
+            }
         }
         if is_chord_tone {
-            out.push("chord".to_string());
+            out.push(if full { "<chord>" } else { "chord" }.to_string());
         }
         match e.pitch {
             Some((step, octave, alter)) => {
+                if ef.is_some_and(|f| f.unpitched) {
+                    out.push("unpitched".to_string());
+                }
                 out.push(typ.to_string());
                 out.push(step.to_string());
                 out.push(octave.to_string());
-                if alter != 0 {
+                if let Some(micro) = ef.and_then(|f| f.microtone.as_deref()) {
+                    out.push(micro.to_string());
+                } else if alter != 0 {
                     out.push(format!("a{alter}"));
+                } else if ef.is_some_and(|f| f.explicit_natural) {
+                    out.push("a0".to_string());
+                }
+                if let Some(f) = ef {
+                    if f.acc_cautionary {
+                        out.push("acc-caut".to_string());
+                    }
+                    if f.acc_parentheses {
+                        out.push("acc-paren".to_string());
+                    }
                 }
             }
             None => {
@@ -1155,29 +1324,122 @@ fn to_bekern_inner(
         for _ in 0..dots {
             out.push("dot".to_string());
         }
+        // Layer 1 engraving tokens (full mode only): stem, beam, notehead, TAB.
+        if let Some(f) = ef {
+            if let Some(st) = &f.stem {
+                out.push(st.clone());
+            }
+            if let Some(bm) = &f.beam {
+                out.push(bm.clone());
+            }
+            if let Some(nh) = &f.notehead {
+                out.push(nh.clone());
+            }
+            if let Some(s) = f.tab_string {
+                out.push(format!("str-{s}"));
+            }
+            if let Some(fr) = f.tab_fret {
+                out.push(format!("fret-{fr}"));
+            }
+            if f.tab_bend {
+                out.push("bend".to_string());
+            }
+            if f.tab_hopo {
+                out.push("hopo".to_string());
+            }
+        }
         // Modifiers precede ties (decode's pitch-tail consumes them in
         // this order); rests carry them too (fermatas over rests).
-        if e.slur_start {
-            out.push("slur-start".to_string());
-        }
-        if e.slur_stop {
-            out.push("slur-stop".to_string());
-        }
-        for a in &e.articulations {
-            out.push(a.clone());
-        }
-        if v2 {
-            for a in &e.v2_articulations {
+        if full {
+            if let Some(f) = ef.filter(|f| !f.numbered_slurs.is_empty()) {
+                for s in &f.numbered_slurs {
+                    out.push(s.clone());
+                }
+            } else {
+                if e.slur_start {
+                    out.push("slur-1-open".to_string());
+                }
+                if e.slur_stop {
+                    out.push("slur-1-close".to_string());
+                }
+            }
+            let has_marcato = ef.is_some_and(|f| f.full_articulations.iter().any(|a| a == "marcato"));
+            for a in &e.articulations {
+                if has_marcato && a == "accent" {
+                    continue;
+                }
                 out.push(a.clone());
+            }
+            let has_full_trem = ef.is_some_and(|f| {
+                f.full_articulations
+                    .iter()
+                    .any(|a| a.starts_with("tremolo-"))
+            });
+            let has_full_mord = ef.is_some_and(|f| {
+                f.full_articulations
+                    .iter()
+                    .any(|a| a.starts_with("mordent-"))
+            });
+            let has_full_turn = ef.is_some_and(|f| {
+                f.full_articulations
+                    .iter()
+                    .any(|a| a == "turn" || a == "turn-inv")
+            });
+            let has_full_arp = ef.is_some_and(|f| {
+                f.full_articulations
+                    .iter()
+                    .any(|a| a == "arp-up" || a == "arp-down" || a == "arp-non")
+            });
+            for a in &e.v2_articulations {
+                if (has_full_trem && a == "art-tremolo")
+                    || (has_full_mord && a == "art-mordent")
+                    || (has_full_turn && a == "art-turn")
+                    || (has_full_arp && a == "art-arpeggiate")
+                {
+                    continue;
+                }
+                out.push(a.clone());
+            }
+            if let Some(f) = ef {
+                for a in &f.full_articulations {
+                    out.push(a.clone());
+                }
             }
             if e.cue {
                 out.push("cue".to_string());
             }
-            if let Some(delta) = e.xstaff {
+            if let Some(abs_st) = ef.and_then(|f| f.xstaff_abs) {
+                out.push(format!("xstaff-{abs_st}"));
+            } else if let Some(delta) = e.xstaff {
                 if delta < 0 {
                     out.push("xstaff-up".to_string());
                 } else if delta > 0 {
                     out.push("xstaff-down".to_string());
+                }
+            }
+        } else {
+            if e.slur_start {
+                out.push("slur-start".to_string());
+            }
+            if e.slur_stop {
+                out.push("slur-stop".to_string());
+            }
+            for a in &e.articulations {
+                out.push(a.clone());
+            }
+            if v2 {
+                for a in &e.v2_articulations {
+                    out.push(a.clone());
+                }
+                if e.cue {
+                    out.push("cue".to_string());
+                }
+                if let Some(delta) = e.xstaff {
+                    if delta < 0 {
+                        out.push("xstaff-up".to_string());
+                    } else if delta > 0 {
+                        out.push("xstaff-down".to_string());
+                    }
                 }
             }
         }
@@ -1188,6 +1450,19 @@ fn to_bekern_inner(
             if e.tie_stop {
                 out.push("tie-stop".to_string());
             }
+            // Collect Layer 3 anchored text & lyrics keyed by 0-based system note index.
+            if let Some(f) = ef {
+                for (verse, syl, text) in &f.lyrics {
+                    sys_lyrics
+                        .entry(*verse)
+                        .or_default()
+                        .push((sys_note_idx, syl.clone(), text.clone()));
+                }
+                for (tag, text) in &f.text_spans {
+                    sys_text_spans.push((tag.clone(), sys_note_idx, text.clone()));
+                }
+            }
+            sys_note_idx += 1;
         }
         // Advance this voice's cursor by the note's performed duration
         // (written undo-scaled by the still-open spans — the stop below
@@ -1236,11 +1511,11 @@ fn to_bekern_inner(
                     if let Some(ratio) = e.tuplet_ratio {
                         if deferred_stop != Some((key, num)) {
                             if let Some((dkey, dnum)) = deferred_stop.take() {
-                                flush_stop(&mut out, &mut open, dkey, dnum, e.measure, v2)?;
+                                flush_stop(&mut out, &mut open, dkey, dnum, e.measure, dialect)?;
                             }
                             debug_assert!(deferred_stop.is_none());
                             open.entry(key).or_default().push((ratio, num));
-                            emit_tuplet_start(&mut out, ratio, v2);
+                            emit_tuplet_start(&mut out, ratio, dialect);
                             deferred_stop = Some((key, num));
                         }
                     } else {
@@ -1272,7 +1547,7 @@ fn to_bekern_inner(
                     // stop, so skip instead of flushing mid-chord.
                     if deferred_stop != Some((key, num)) {
                         if let Some((dkey, dnum)) = deferred_stop.take() {
-                            flush_stop(&mut out, &mut open, dkey, dnum, e.measure, v2)?;
+                            flush_stop(&mut out, &mut open, dkey, dnum, e.measure, dialect)?;
                         }
                         // Single-slot invariant: the take above cleared
                         // any pending stop, so two keys never have stops
@@ -1302,7 +1577,7 @@ fn to_bekern_inner(
     }
     // A stop deferred past the final event's chord run flushes here.
     if let Some((dkey, dnum)) = deferred_stop.take() {
-        flush_stop(&mut out, &mut open, dkey, dnum, measure, v2)?;
+        flush_stop(&mut out, &mut open, dkey, dnum, measure, dialect)?;
     }
     // Page-cut leftovers stay open: no stops are emitted here. A stop
     // would need the key's current segment for routing, but keys with
@@ -1313,6 +1588,28 @@ fn to_bekern_inner(
     // page's implicit-member rule reopens the span by ratio.
     if started {
         out.push(pending_right.take().unwrap_or_else(|| "bar".to_string()));
+    }
+    // Layer 3 end-of-system anchored text & lyric blocks (`bekern-full` only).
+    if full {
+        for (verse, entries) in sys_lyrics {
+            out.push(format!("<sys_lyr v={verse}>"));
+            for (nidx, syl, text) in entries {
+                out.push(format!("@{nidx}"));
+                out.push(syl);
+                for w in text.split_whitespace() {
+                    out.push(w.to_string());
+                }
+            }
+            out.push("</text_span>".to_string());
+        }
+        for (tag, nidx, text) in sys_text_spans {
+            out.push(tag);
+            out.push(format!("@{nidx}"));
+            for w in text.split_whitespace() {
+                out.push(w.to_string());
+            }
+            out.push("</text_span>".to_string());
+        }
     }
     Ok((out, graces))
 }
@@ -2155,6 +2452,7 @@ mod tests {
             barline_left: None,
             barline_right: None,
             volta: None,
+            full: None,
         }
     }
 
@@ -2169,6 +2467,7 @@ mod tests {
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
+                full: None,
             },
             StaffHeader {
                 staff: 0,
@@ -2178,6 +2477,7 @@ mod tests {
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
+                full: None,
             },
         ];
         let mut tied = note(1, 0.0, 'C', 4, 0, 1.0, 1, 0);
@@ -2217,6 +2517,7 @@ mod tests {
                 barline_left: None,
                 barline_right: None,
                 volta: None,
+                full: None,
             },
             note(1, 0.0, 'E', 4, 1, 0.5, 1, 0),
             tied,
@@ -2276,6 +2577,7 @@ mod tests {
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
+                full: None,
             },
             StaffHeader {
                 staff: 1,
@@ -2285,6 +2587,7 @@ mod tests {
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
+                full: None,
             },
         ];
         let mut e4b = note(1, 0.0, 'E', 4, -1, 0.5, 1, 0);
@@ -2548,6 +2851,7 @@ mod tests {
             key_fifths: 0,
             beats: 4,
             beat_type: 4,
+            full: None,
         }]
     }
 
@@ -2897,6 +3201,7 @@ mod tests {
             key_fifths: 0,
             beats: 4,
             beat_type: 4,
+            full: None,
         }];
         let events = vec![
             note(1, 0.0, 'C', 4, 0, 1.0, 1, 0),
@@ -3255,6 +3560,7 @@ mod tests {
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
+                full: None,
             },
             StaffHeader {
                 staff: 1,
@@ -3264,6 +3570,7 @@ mod tests {
                 key_fifths: 0,
                 beats: 4,
                 beat_type: 4,
+                full: None,
             },
         ];
         let mut tup_m1 = note(1, 3.0, 'G', 4, 0, 1.5, 1, 0);
